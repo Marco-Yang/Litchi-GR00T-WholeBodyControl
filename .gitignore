@@ -216,6 +216,28 @@ logs_eval/
 # Model checkpoints directory
 models/
 
+# Local robot model data (generated or downloaded)
+decoupled_wbc/control/robot_model/model_data/
+
 # Downloaded from HuggingFace (hf download)
 sample_data/
 sonic_release/
+
+## Large generated asset files
+*.STL
+*.stl
+*.obj
+*.png
+*.jpg
+*.jpeg
+*.dae
+*.pt
+*.onnx
+*.pkl
+*.usd
+*.usda
+*.safetensors
+*.hdf5
+*.parquet
+*.so
+*.so.*

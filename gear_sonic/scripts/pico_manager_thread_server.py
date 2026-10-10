@@ -892,8 +892,11 @@ def _pose_stream_common(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     reader=None,
+    robot: str = "g1",
 ):
     """Shared pose streaming loop used by run_pico."""
+    from gear_sonic.data.robot_model.instantiation import instantiate_robot_model
+
     if reader is None:
         if xrt is None:
             raise ImportError(
@@ -911,6 +914,7 @@ def _pose_stream_common(
         enable_waist_tracking=enable_waist_tracking,
         enable_smpl_vis=enable_smpl_vis,
         log_prefix=log_prefix,
+        robot_model=instantiate_robot_model(robot),
     )
 
     streamer = PoseStreamer(
@@ -1609,6 +1613,7 @@ def run_pico(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    robot: str = "g1",
 ):
     """Run body tracking with real-time visualization and ZMQ streaming."""
     reader = _init_input_source(input_source, buffer_size)
@@ -1639,6 +1644,7 @@ def run_pico(
             enable_waist_tracking=enable_waist_tracking,
             enable_smpl_vis=enable_smpl_vis,
             reader=reader,
+            robot=robot,
         )
     finally:
         socket.close()
@@ -1912,6 +1918,7 @@ def run_pico_manager(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    robot: str = "g1",
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1919,6 +1926,8 @@ def run_pico_manager(
       A+X: Toggle between planner and pose mode
       A+B+X+Y: Toggle policy start/stop
     """
+    from gear_sonic.data.robot_model.instantiation import instantiate_robot_model
+
     reader = _init_input_source(input_source, buffer_size)
 
     context = zmq.Context()
@@ -1941,6 +1950,7 @@ def run_pico_manager(
         enable_waist_tracking=enable_waist_tracking,
         enable_smpl_vis=enable_smpl_vis,
         log_prefix="PoseLoop",
+        robot_model=instantiate_robot_model(robot),
     )
 
     pose_streamer = PoseStreamer(
@@ -2251,6 +2261,13 @@ if __name__ == "__main__":
             "'isaac-teleop' for in-process IsaacTeleop / CloudXR DeviceIO"
         ),
     )
+    parser.add_argument(
+        "--robot",
+        type=str,
+        default="g1",
+        choices=["g1", "a3_ultra", "h2"],
+        help="Which robot's IK/FK model to use for pose calibration (default: g1).",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2292,6 +2309,7 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
+            robot=args.robot,
         )
     else:
         # Run legacy single-thread pose streaming
@@ -2308,4 +2326,5 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
+            robot=args.robot,
         )

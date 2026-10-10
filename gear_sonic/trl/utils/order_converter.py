@@ -202,6 +202,87 @@ class H2Converter(IsaacLabMuJoCoConverter):
     FOOT_BODY_NAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
 
 
+class A3UltraConverter(IsaacLabMuJoCoConverter):
+    """A3 Ultra (T3D0) ordering converter.
+
+    Imports A3 Ultra body/DOF/joint mappings from
+    gear_sonic.envs.manager_env.robots.a3_ultra. Note the 63 DOF / 64 bodies
+    include the (unactuated) 32 finger joints, since those are real movable
+    DOF in the URDF/MJCF even though they're excluded from the RL action
+    space (see a3_ultra.py for why).
+    """
+
+    def __init__(self):
+        # Lazy import to avoid circular dependency:
+        # order_converter -> a3_ultra -> mdp/__init__ -> commands -> order_converter
+        from gear_sonic.envs.manager_env.robots.a3_ultra import (
+            A3ULTRA_ISAACLAB_JOINTS,
+            A3ULTRA_ISAACLAB_TO_MUJOCO_BODY,
+            A3ULTRA_ISAACLAB_TO_MUJOCO_DOF,
+            A3ULTRA_MUJOCO_TO_ISAACLAB_BODY,
+            A3ULTRA_MUJOCO_TO_ISAACLAB_DOF,
+        )
+
+        self.JOINT_NAMES = A3ULTRA_ISAACLAB_JOINTS
+        self.DOF_MAPPINGS = {
+            ("isaaclab", "mujoco"): A3ULTRA_ISAACLAB_TO_MUJOCO_DOF,
+            ("mujoco", "isaaclab"): A3ULTRA_MUJOCO_TO_ISAACLAB_DOF,
+        }
+        self.BODY_MAPPINGS = {
+            ("isaaclab", "mujoco"): A3ULTRA_ISAACLAB_TO_MUJOCO_BODY,
+            ("mujoco", "isaaclab"): A3ULTRA_MUJOCO_TO_ISAACLAB_BODY,
+        }
+
+    # left/right_wrist_yaw_Link are the most distal pre-hand body (same role as
+    # G1's wrist_yaw_link). Names are MuJoCo body names (capital "_Link", matching
+    # a3_ultra_t3d0.xml) -- see a3_ultra.py's module docstring for why A3 Ultra's
+    # naming differs from G1/H2's all-lowercase convention.
+    VR_3POINTS_BODY_NAMES = ["torso_Link", "left_wrist_yaw_Link", "right_wrist_yaw_Link"]
+    FOOT_BODY_NAMES = ["left_ankle_roll_Link", "right_ankle_roll_Link"]
+
+    @property
+    def vr_3points_mujoco_indices(self):
+        """VR 3-point body indices in full (64-body) MuJoCo body order."""
+        mj_names = [self.JOINT_NAMES[i] for i in self.isaaclab_to_mujoco_body]
+        return [mj_names.index(n) for n in self.VR_3POINTS_BODY_NAMES]
+
+    @property
+    def foot_mujoco_indices(self):
+        """Foot body indices in full (64-body) MuJoCo body order."""
+        mj_names = [self.JOINT_NAMES[i] for i in self.isaaclab_to_mujoco_body]
+        return [mj_names.index(n) for n in self.FOOT_BODY_NAMES]
+
+    @property
+    def isaaclab_to_mujoco_dof(self):
+        """DOF reorder indices: IsaacLab -> MuJoCo."""
+        return self.DOF_MAPPINGS[("isaaclab", "mujoco")]
+
+    @property
+    def mujoco_to_isaaclab_dof(self):
+        """DOF reorder indices: MuJoCo -> IsaacLab."""
+        return self.DOF_MAPPINGS[("mujoco", "isaaclab")]
+
+    @property
+    def isaaclab_to_mujoco_body(self):
+        """Body reorder indices: IsaacLab -> MuJoCo."""
+        return self.BODY_MAPPINGS[("isaaclab", "mujoco")]
+
+    @property
+    def mujoco_to_isaaclab_body(self):
+        """Body reorder indices: MuJoCo -> IsaacLab."""
+        return self.BODY_MAPPINGS[("mujoco", "isaaclab")]
+
+    def get_isaaclab_to_mujoco_mapping(self):
+        """Return the full mapping dict for body/DOF reordering."""
+        return {
+            "isaaclab_joints": self.JOINT_NAMES,
+            "isaaclab_to_mujoco_dof": self.isaaclab_to_mujoco_dof,
+            "mujoco_to_isaaclab_dof": self.mujoco_to_isaaclab_dof,
+            "isaaclab_to_mujoco_body": self.isaaclab_to_mujoco_body,
+            "mujoco_to_isaaclab_body": self.mujoco_to_isaaclab_body,
+        }
+
+
 def load_qpos_from_csv(csv_path: str) -> torch.Tensor:
     """Load qpos [T, D] from CSV."""
     import pandas as pd

@@ -46,6 +46,16 @@ class CMakeBuild(build_ext):
             "-DPYTHON_EXECUTABLE=" + sys.executable,
             "-DCMAKE_BUILD_TYPE=Release",
         ]
+        # Paths with spaces break CMAKE_PREFIX_PATH; pass pybind11_DIR as a CMake
+        # cache variable instead so find_package(pybind11) succeeds.
+        try:
+            import pybind11
+
+            cmake_args.append("-Dpybind11_DIR=" + pybind11.get_cmake_dir())
+        except Exception:
+            pybind11_dir = os.environ.get("pybind11_DIR")
+            if pybind11_dir:
+                cmake_args.append("-Dpybind11_DIR=" + pybind11_dir)
 
         cfg = "Debug" if self.debug else "Release"
         build_args = ["--config", cfg]

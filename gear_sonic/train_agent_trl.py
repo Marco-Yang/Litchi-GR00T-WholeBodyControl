@@ -476,6 +476,26 @@ def main(config: OmegaConf):
         os._exit(0)
 
 
+# Shorthand for `+exp=manager/universal_token/all_modes/sonic_<robot>` so users don't
+# need to remember the full Hydra exp path per robot. Add an entry here once that
+# robot's sonic_<robot>.yaml exists (see docs/source/user_guide/new_embodiments.md).
+ROBOT_EXP_MAP = {
+    "g1": "manager/universal_token/all_modes/sonic_v1_1",
+    "h2": "manager/universal_token/all_modes/sonic_h2",
+    "a3_ultra": "manager/universal_token/all_modes/sonic_a3_ultra",
+}
+
+
 if __name__ == "__main__":
+    # Translate `--robot <name>` into the corresponding Hydra `+exp=...` override before
+    # Hydra parses sys.argv, so the rest of the Hydra CLI (num_envs=.., headless=.., etc.)
+    # keeps working unchanged.
+    if "--robot" in sys.argv:
+        idx = sys.argv.index("--robot")
+        robot = sys.argv.pop(idx + 1)
+        sys.argv.pop(idx)
+        if robot not in ROBOT_EXP_MAP:
+            raise SystemExit(f"Unknown --robot '{robot}'. Choices: {list(ROBOT_EXP_MAP)}")
+        sys.argv.insert(1, f"+exp={ROBOT_EXP_MAP[robot]}")
 
     main()

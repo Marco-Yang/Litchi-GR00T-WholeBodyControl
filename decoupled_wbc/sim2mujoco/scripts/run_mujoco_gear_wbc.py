@@ -1,3 +1,4 @@
+import argparse
 import collections
 import os
 import threading
@@ -13,10 +14,17 @@ import yaml
 
 
 class GearWbcController:
-    def __init__(self, config_path):
+    def __init__(self, config_path, robot="g1"):
         self.CONFIG_PATH = config_path
         self.cmd_lock = threading.Lock()
-        self.config = self.load_config(os.path.join(self.CONFIG_PATH, "g1_gear_wbc.yaml"))
+        yaml_path = os.path.join(self.CONFIG_PATH, f"{robot}_gear_wbc.yaml")
+        if not os.path.exists(yaml_path):
+            raise FileNotFoundError(
+                f"No deployment config found for robot='{robot}' (expected {yaml_path}). "
+                "This robot likely doesn't have a trained policy / wbc yaml yet. "
+                "See docs/source/user_guide/new_embodiments.md."
+            )
+        self.config = self.load_config(yaml_path)
 
         self.control_dict = {
             "loco_cmd": self.config["cmd_init"],
@@ -308,8 +316,21 @@ class GearWbcController:
 
 
 if __name__ == "__main__":
-    CONFIG_PATH = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "resources", "robots", "g1"
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--robot",
+        type=str,
+        default="g1",
+        choices=["g1", "a3_ultra", "h2"],
+        help="Which robot to deploy (default: g1). Only 'g1' has a trained policy today.",
     )
-    controller = GearWbcController(CONFIG_PATH)
+    args = parser.parse_args()
+
+    CONFIG_PATH = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "resources",
+        "robots",
+        args.robot,
+    )
+    controller = GearWbcController(CONFIG_PATH, robot=args.robot)
     controller.run()

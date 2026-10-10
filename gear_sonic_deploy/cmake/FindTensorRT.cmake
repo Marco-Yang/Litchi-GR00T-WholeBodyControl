@@ -28,7 +28,8 @@
 # ~~~
 
 if(NOT TensorRT_FIND_COMPONENTS)
-  set(TensorRT_FIND_COMPONENTS nvinfer nvinfer_plugin nvonnxparser nvparsers)
+  # nvparsers was removed in TensorRT 10; keep the remaining runtime components.
+  set(TensorRT_FIND_COMPONENTS nvinfer nvinfer_plugin nvonnxparser)
 endif()
 set(TensorRT_LIBRARIES)
 

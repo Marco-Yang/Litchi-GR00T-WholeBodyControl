@@ -17,6 +17,13 @@ from gear_sonic.utils.network.network_utils import resolve_interface
 
 WBC_VERSIONS = ["sonic_model12"]
 
+# Map --robot to the wbc yaml filename under gear_sonic/utils/mujoco_sim/wbc_configs/.
+# Add an entry here once a robot has a wbc yaml (and a trained policy to go with it).
+# See docs/source/user_guide/new_embodiments.md.
+ROBOT_WBC_YAML = {
+    "g1": "g1_29dof_sonic_model12.yaml",
+}
+
 @dataclass
 class ArgsConfigTemplate:
     """Args Config for running the data collection loop."""
@@ -112,6 +119,12 @@ class BaseConfig(ArgsConfigTemplate):
     """Base config inherited by all G1 control loops"""
 
     dataset_version: str = "sonic_model12"
+
+    # Robot Selection
+    robot: Literal["g1", "a3_ultra", "h2"] = "g1"
+    """Which robot to load (urdf/mjcf, wbc yaml, and IK robot model). Only "g1" has a
+    wbc yaml + trained policy today; the others raise a clear error until added
+    (see docs/source/user_guide/new_embodiments.md)."""
 
     # WBC Configuration
     wbc_version: Literal[tuple(WBC_VERSIONS)] = "sonic_model12"
@@ -313,13 +326,20 @@ class BaseConfig(ArgsConfigTemplate):
         gear_sonic_path = Path(os.path.dirname(gear_sonic.__file__))
         configs_dir = gear_sonic_path / "utils" / "mujoco_sim" / "wbc_configs"
 
-        if self.wbc_version == "sonic_model12":
-            config_path = str(configs_dir / "g1_29dof_sonic_model12.yaml")
-        else:
+        if self.wbc_version != "sonic_model12":
             raise ValueError(
                 f"Invalid wbc_version: {self.wbc_version}, please use one of: "
                 f"sonic_model12"
             )
+
+        yaml_name = ROBOT_WBC_YAML.get(self.robot)
+        if yaml_name is None:
+            raise ValueError(
+                f"No wbc yaml configured for robot='{self.robot}'. "
+                f"Available: {list(ROBOT_WBC_YAML)}. "
+                "See docs/source/user_guide/new_embodiments.md to add one."
+            )
+        config_path = str(configs_dir / yaml_name)
 
         with open(config_path) as file:
             wbc_config = yaml.load(file, Loader=yaml.FullLoader)
