@@ -215,6 +215,7 @@ logs_eval/
 
 # Model checkpoints directory
 models/
+videos/
 
 # Local robot model data (generated or downloaded)
 decoupled_wbc/control/robot_model/model_data/

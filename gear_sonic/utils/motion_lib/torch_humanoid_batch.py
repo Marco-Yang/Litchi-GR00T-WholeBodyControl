@@ -275,6 +275,15 @@ class Humanoid_Batch:
         joints_range = []
         body_to_joint = OrderedDict()
 
+        # Build set of actuated joint names so unactuated joints (e.g. finger distal
+        # phalanges without motors) are excluded from joints_range.
+        actuator_node = xml_doc_root.find("actuator")
+        _motors_set = (
+            {m.attrib["name"] for m in actuator_node}
+            if actuator_node is not None
+            else set()
+        )
+
         # recursively adding all nodes into the skel_tree
         def _add_xml_node(xml_node, parent_index, node_index):
             node_name = xml_node.attrib.get("name")
@@ -292,6 +301,10 @@ class Humanoid_Batch:
                 all_joints = all_joints[6:]
 
             for joint in all_joints:
+                jname = joint.attrib.get("name", "")
+                # Skip joints that have no motor (unactuated, e.g. finger dip joints)
+                if _motors_set and jname not in _motors_set:
+                    continue
                 if joint.attrib.get("range") is not None:
                     joints_range.append(
                         np.fromstring(joint.attrib.get("range"), dtype=float, sep=" ")
