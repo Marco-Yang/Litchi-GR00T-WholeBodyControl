@@ -366,6 +366,7 @@ class TokenizerCfg(ObsGroup):
 
     encoder_index = None
     command_multi_future_nonflat = None
+    command_multi_future_a3_fast_nonflat = None
     motion_anchor_ori_w = None
     command_z_multi_future_nonflat = None
     command_z = None
@@ -373,6 +374,7 @@ class TokenizerCfg(ObsGroup):
     motion_anchor_ori_heading_b = None
     motion_anchor_ori_b_nonflat = None
     motion_anchor_ori_b_mf_nonflat = None
+    motion_anchor_ori_a3_fast_b_mf_nonflat = None
     motion_anchor_ori_w_mf_nonflat = None
     command_multi_future_egocentric_joint_transforms = None
     command_multi_future_egocentric_joint_transforms_nonflat = None
@@ -439,6 +441,7 @@ class TokenizerCfg(ObsGroup):
     object_pos_delta_multi_future = None
     object_ori_delta_multi_future_6d = None
     command_multi_future = None
+    height_map_z_flat = None
 
 
 @configclass
@@ -446,6 +449,7 @@ class HeightMapCfg(ObsGroup):
     """Height map observation group for terrain-aware locomotion."""
 
     height_map = None
+    height_map_z_flat = None
 
 
 @configclass
@@ -585,6 +589,19 @@ def command_multi_future(
         return command.command_multi_future.reshape(command.num_envs, command.num_future_frames, -1)
     else:
         return command.command_multi_future
+
+
+def command_multi_future_a3_fast(
+    env: ManagerBasedEnv, command_name: str, non_flatten=False
+) -> torch.Tensor:
+    """Get A3-fast reference joint positions and velocities for its own future window."""
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    if non_flatten:
+        return command.command_multi_future_a3_fast.reshape(
+            command.num_envs, command.a3_fast_num_future_frames, -1
+        )
+    else:
+        return command.command_multi_future_a3_fast
 
 
 def command_multi_future_joint_pos(
@@ -1041,6 +1058,19 @@ def motion_anchor_ori_b_mf(
         )
     else:
         return command.root_rot_dif_l_multi_future.reshape(env.num_envs, -1)
+
+
+def motion_anchor_ori_a3_fast_b_mf(
+    env: ManagerBasedEnv, command_name: str, non_flatten=False
+) -> torch.Tensor:
+    """Get reference-vs-robot root orientation difference for A3-fast frames."""
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    if non_flatten:
+        return command.root_rot_dif_l_a3_fast_multi_future.reshape(
+            env.num_envs, command.a3_fast_num_future_frames, -1
+        )
+    else:
+        return command.root_rot_dif_l_a3_fast_multi_future.reshape(env.num_envs, -1)
 
 
 def motion_anchor_ori_w_mf(
@@ -2193,6 +2223,12 @@ def height_map_flat(env: ManagerBasedEnv, command_name="motion", random=False) -
     """Flattened height map for concatenation with 1D policy observations."""
     hmap = height_map(env, command_name=command_name, random=random)
     return hmap.reshape(hmap.shape[0], -1)  # (B, n*n*3)
+
+
+def height_map_z_flat(env: ManagerBasedEnv, command_name="motion", random=False) -> torch.Tensor:
+    """Return robot-yaw-frame terrain heights as a flattened square grid."""
+    hmap = height_map(env, command_name=command_name, random=random)
+    return hmap[..., 2].reshape(hmap.shape[0], -1)
 
 
 def residual_joint_pos_action(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:

@@ -321,8 +321,11 @@ if __name__ == "__main__":
         "--robot",
         type=str,
         default="g1",
-        choices=["g1", "a3_ultra", "h2"],
-        help="Which robot to deploy (default: g1). Only 'g1' has a trained policy today.",
+        choices=["g1", "a3", "a3_ultra", "h2"],
+        help=(
+            "Which robot to deploy (default: g1). Only 'g1' has a gear-wbc yaml here; "
+            "A3/A3 Ultra use gear_sonic/scripts/sim2sim_a3_mujoco.py."
+        ),
     )
     args = parser.parse_args()
 

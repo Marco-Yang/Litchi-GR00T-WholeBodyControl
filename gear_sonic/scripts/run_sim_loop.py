@@ -31,7 +31,20 @@ class SimWrapper:
         )
 
 
+# A3 / A3 Ultra are simulated with the AimRT-contract MuJoCo sim2sim runner, not this
+# Unitree-SDK2 loop (the C++ deploy side talks AimRT, see gear_sonic_deploy/deploy.sh).
+A3_SIM_ROBOTS = ("a3", "a3_ultra")
+
+
 def main(config: ArgsConfig):
+    if config.robot in A3_SIM_ROBOTS:
+        raise SystemExit(
+            f"--robot {config.robot}: this loop is the G1 Unitree-SDK2 simulator. "
+            "Use the A3 sim2sim runner instead:\n"
+            "  python gear_sonic/scripts/sim2sim_a3_mujoco.py --checkpoint "
+            "checkpoints/035_step200000/model_step_200000.pt [--motion ...]\n"
+            "and deploy with: gear_sonic_deploy/deploy.sh --robot a3"
+        )
     wbc_config = config.load_wbc_yaml()
     # NOTE: we will override the interface to local if it is not specified
     wbc_config["ENV_NAME"] = config.env_name

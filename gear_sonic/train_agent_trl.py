@@ -16,12 +16,16 @@
 # Fix sys.path: when running as `python gear_sonic/train_agent_trl.py`, Python adds
 # gear_sonic/ to sys.path[0], causing `from trl import ...` to resolve to our local
 # gear_sonic/trl/ instead of the HuggingFace trl package. Replace with repo root.
-import sys
 import os
+import sys
+
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 _repo_root = os.path.dirname(_script_dir)
-if _script_dir in sys.path:
-    sys.path.remove(_script_dir)
+# sys.path[0] holds the symlink-resolved script directory, so strip both the
+# logical and the real path (otherwise a symlinked checkout keeps shadowing `trl`).
+for _p in {_script_dir, os.path.realpath(_script_dir)}:
+    while _p in sys.path:
+        sys.path.remove(_p)
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
@@ -41,26 +45,32 @@ except ImportError:
     )
     sys.exit(1)
 
+import dataclasses
 import glob
 import logging
+import math
 import os
 from pathlib import Path
 import re
 import sys
+import time
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 import hydra
 from hydra.core.hydra_config import HydraConfig
 from hydra.utils import instantiate
 from loguru import logger
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 import wandb
 import yaml
 
+from gear_sonic.trl.utils import logger_utils
 from gear_sonic.trl.utils.common import (
     custom_instantiate,
+    distributed_stage,
     get_filtered_state_dict,
     materialize_lazy_params,
+    verify_distributed_model_signatures,
     wandb_run_exists,
 )
 from gear_sonic.utils.common import seeding
@@ -69,9 +79,119 @@ from gear_sonic.utils.obs_utils import get_group_term_obs_shape
 
 register_rl_resolvers()
 
+DEFAULT_APP_LAUNCHER_LOCK_TIMEOUT_SECONDS = 1800.0
+DEFAULT_DISTRIBUTED_TIMEOUT_SECONDS = 600.0
+
+
+def _get_app_launcher_lock_timeout_seconds():
+    raw_timeout = os.environ.get(
+        "ISAACLAB_APP_LAUNCHER_LOCK_TIMEOUT_SECONDS",
+        str(DEFAULT_APP_LAUNCHER_LOCK_TIMEOUT_SECONDS),
+    )
+    try:
+        timeout_seconds = float(raw_timeout)
+    except ValueError as exc:
+        raise ValueError(
+            "ISAACLAB_APP_LAUNCHER_LOCK_TIMEOUT_SECONDS must be a positive number, "
+            f"got {raw_timeout!r}"
+        ) from exc
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError(
+            "ISAACLAB_APP_LAUNCHER_LOCK_TIMEOUT_SECONDS must be a positive finite number, "
+            f"got {raw_timeout!r}"
+        )
+    return timeout_seconds
+
+
+def _get_distributed_timeout_seconds():
+    raw_timeout = os.environ.get(
+        "SONIC_DISTRIBUTED_TIMEOUT_SECONDS",
+        str(DEFAULT_DISTRIBUTED_TIMEOUT_SECONDS),
+    )
+    try:
+        timeout_seconds = float(raw_timeout)
+    except ValueError as exc:
+        raise ValueError(
+            "SONIC_DISTRIBUTED_TIMEOUT_SECONDS must be a positive number, "
+            f"got {raw_timeout!r}"
+        ) from exc
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError(
+            "SONIC_DISTRIBUTED_TIMEOUT_SECONDS must be a positive finite number, "
+            f"got {raw_timeout!r}"
+        )
+    return timeout_seconds
+
+
+def launch_isaac_app_with_lock(
+    app_launcher_cls,
+    args_cli,
+    *,
+    global_rank,
+    local_rank,
+    lock_path="/tmp/isaaclab_app_launcher.lock",
+    timeout_seconds=None,
+    log_fn=None,
+):
+    """Serialize AppLauncher startup per node and fail fast on a stuck peer."""
+
+    if timeout_seconds is None:
+        timeout_seconds = _get_app_launcher_lock_timeout_seconds()
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError(f"AppLauncher lock timeout must be positive, got {timeout_seconds!r}")
+
+    def emit(message):
+        if log_fn is None:
+            print(message, flush=True)
+        else:
+            log_fn(message)
+
+    rank_context = (
+        f"global_rank={global_rank} local_rank={local_rank} pid={os.getpid()} "
+        f"lock={lock_path} timeout_seconds={timeout_seconds:g}"
+    )
+    wait_started = time.monotonic()
+    emit(f"[AppLauncherLock] waiting {rank_context}")
+    try:
+        with FileLock(lock_path, timeout=timeout_seconds):
+            acquired_at = time.monotonic()
+            emit(
+                f"[AppLauncherLock] acquired {rank_context} "
+                f"wait_seconds={acquired_at - wait_started:.3f}"
+            )
+            try:
+                app_launcher = app_launcher_cls(args_cli)
+            except Exception as exc:
+                emit(
+                    f"[AppLauncherLock] launcher_failed {rank_context} "
+                    f"exception={type(exc).__name__}"
+                )
+                raise
+            initialized_at = time.monotonic()
+            emit(
+                f"[AppLauncherLock] initialized {rank_context} "
+                f"wait_seconds={acquired_at - wait_started:.3f} "
+                f"init_seconds={initialized_at - acquired_at:.3f}"
+            )
+            return app_launcher
+    except Timeout as exc:
+        waited_seconds = time.monotonic() - wait_started
+        message = (
+            "Timed out waiting for a peer process to finish Isaac AppLauncher startup: "
+            f"{rank_context} waited_seconds={waited_seconds:.3f}"
+        )
+        emit(f"[AppLauncherLock] timeout {message}")
+        raise RuntimeError(message) from exc
+
 
 def resume_training(config):
-    if config.get("checkpoint", None) is not None:
+    explicit_checkpoint = config.get("checkpoint", None)
+    resume_in_place = bool(config.get("resume_in_place", True))
+    requested_experiment_dir = config.get("experiment_dir", None)
+    if not resume_in_place and explicit_checkpoint is None:
+        raise ValueError("resume_in_place=false requires an explicit checkpoint path")
+
+    if explicit_checkpoint is not None:
         last_existing_checkpoint = config.checkpoint
     elif config.get("experiment_dir", None) is not None:
         last_existing_checkpoint = os.path.join(config.experiment_dir, "last.pt")
@@ -84,10 +204,22 @@ def resume_training(config):
             print(f"No checkpoint found matching {experiment_dir_base}-*/last.pt, starting fresh")
             return
         last_existing_checkpoint = checkpoints[-1]
-    experiment_dir = os.path.dirname(last_existing_checkpoint)
-    config.experiment_dir = experiment_dir
+    checkpoint_experiment_dir = os.path.dirname(last_existing_checkpoint)
+    if resume_in_place:
+        config.experiment_dir = checkpoint_experiment_dir
+    elif requested_experiment_dir is None:
+        raise ValueError("resume_in_place=false requires an explicit experiment_dir")
+    elif os.path.abspath(requested_experiment_dir) == os.path.abspath(
+        checkpoint_experiment_dir
+    ):
+        raise ValueError(
+            "resume_in_place=false requires experiment_dir to differ from the checkpoint directory"
+        )
     config.checkpoint = last_existing_checkpoint
-    print(f"Resuming training from {last_existing_checkpoint}")
+    print(  # noqa: T201
+        f"Resuming training from {last_existing_checkpoint}; "
+        f"outputs={config.experiment_dir}; in_place={resume_in_place}"
+    )
 
 
 def resume_checkpoint(config):
@@ -167,9 +299,21 @@ def main(config: OmegaConf):
     elif config.get("checkpoint", None) is not None:
         resume_checkpoint(config)
 
-    config.algo.trl.output_dir = str(Path(config.experiment_dir))
+    requested_report_to = config.algo.trl.get("report_to", None)
+    use_tensorboard = logger_utils.report_to_contains(requested_report_to, "tensorboard")
+    with open_dict(config.algo.trl):
+        config.algo.trl.output_dir = str(Path(config.experiment_dir))
+        if config.algo.trl.get("logging_dir", None) is None:
+            config.algo.trl.logging_dir = str(Path(config.experiment_dir) / "tensorboard")
 
-    script_args, training_args, model_args = parser.parse_dict(config.algo.trl)
+    trl_parser_config = OmegaConf.to_container(config.algo.trl, resolve=True)
+    trl_parser_config["report_to"] = logger_utils.trainer_report_to(requested_report_to)
+    # transformers>=5 removed TrainingArguments.logging_dir; keep the value for the
+    # TensorBoard callback and only forward it when the installed version accepts it.
+    tensorboard_log_dir = trl_parser_config.get("logging_dir")
+    if "logging_dir" not in {f.name for f in dataclasses.fields(PPOConfig)}:
+        trl_parser_config.pop("logging_dir", None)
+    script_args, training_args, model_args = parser.parse_dict(trl_parser_config)
 
     # Add exp_name from main config to training_args
     training_args.exp_name = config.experiment_name
@@ -177,13 +321,39 @@ def main(config: OmegaConf):
     from datetime import timedelta
 
     from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
+    from accelerate.utils import DDPCommunicationHookType
     import torch  # noqa: E402
 
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
-    kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=6000))
+    # Optional experiment: halve FP32 DDP gradient payloads while keeping model
+    # and optimizer state in FP32. This changes reduction numerics, so 032 keeps
+    # it disabled until a long-horizon quality/eval comparison is complete.
+    use_fp16_ddp_comm_hook = bool(
+        config.algo.config.get("use_fp16_ddp_comm_hook", False)
+    )
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=False,
+        comm_hook=(
+            DDPCommunicationHookType.FP16
+            if use_fp16_ddp_comm_hook
+            else DDPCommunicationHookType.NO
+        ),
+    )
+    distributed_timeout_seconds = _get_distributed_timeout_seconds()
+    kwargs = InitProcessGroupKwargs(
+        timeout=timedelta(seconds=distributed_timeout_seconds)
+    )
     accelerator = Accelerator(
         gradient_accumulation_steps=training_args.gradient_accumulation_steps,
         kwargs_handlers=[ddp_kwargs, kwargs],
+    )
+    print(
+        "[DistributedStage] accelerator_ready "
+        f"global_rank={accelerator.process_index} "
+        f"local_rank={accelerator.local_process_index} "
+        f"world_size={accelerator.num_processes} pid={os.getpid()} "
+        f"timeout_seconds={distributed_timeout_seconds:g} "
+        f"fp16_ddp_comm_hook={use_fp16_ddp_comm_hook}",
+        flush=True,
     )
 
     device = str(accelerator.device)
@@ -200,8 +370,10 @@ def main(config: OmegaConf):
     meta_path = Path(config.experiment_dir) / "meta.yaml"
     if meta_path.exists():
         meta = yaml.safe_load(open(meta_path))
-        config.wandb.wandb_id = meta["wandb_run"]
-        print(f"resume wandb from run: {config.wandb.wandb_id}")
+        wandb_run_id = meta.get("wandb_run") if meta else None
+        if wandb_run_id is not None:
+            config.wandb.wandb_id = wandb_run_id
+            print(f"resume wandb from run: {config.wandb.wandb_id}")
 
     unresolved_conf = OmegaConf.to_container(config, resolve=False)
     if config.use_wandb and accelerator.is_main_process:
@@ -215,7 +387,7 @@ def main(config: OmegaConf):
             project=project_name,
             entity=config.wandb.wandb_entity,
             name=run_name,
-            sync_tensorboard=True,
+            sync_tensorboard=False,
             config=unresolved_conf,
             dir=wandb_dir,
             id=config.wandb.wandb_id,
@@ -270,11 +442,23 @@ def main(config: OmegaConf):
             "--/log/level=error --/log/fileLogLevel=error --/log/outputStreamLevel=error"
         )
 
-        # AppLauncher can't handle multiple processes creating it at the same time so we need a lock
-        _lock_path = "/tmp/isaaclab_app_launcher.lock"
+        # AppLauncher can't handle multiple processes creating it at the same time. Keep the
+        # per-node serialization, but do not let a stuck cold-cache startup block every rank forever.
         _local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        with FileLock(_lock_path):
-            app_launcher = AppLauncher(args_cli)
+        _global_rank = accelerator.process_index
+        _rank_cache_path = Path.cwd() / ".isaacsim" / "registry-cache" / f"rank_{_global_rank}"
+        print(
+            f"[AppLauncherLock] cache_probe global_rank={_global_rank} "
+            f"local_rank={_local_rank} path={_rank_cache_path} "
+            f"exists={_rank_cache_path.is_dir()}",
+            flush=True,
+        )
+        app_launcher = launch_isaac_app_with_lock(
+            AppLauncher,
+            args_cli,
+            global_rank=_global_rank,
+            local_rank=_local_rank,
+        )
 
         simulation_app = app_launcher.app
 
@@ -420,6 +604,13 @@ def main(config: OmegaConf):
 
     materialize_lazy_params(policy, env)
 
+    if config.get("checkpoint", None) is None:
+        backbone = getattr(policy, "actor_module", None)
+        if backbone is None:
+            backbone = getattr(policy, "backbone", None)
+        if hasattr(backbone, "apply_encoder_init_from"):
+            backbone.apply_encoder_init_from(None)
+
     if config.algo.config.get("pretrained_model", None) is not None:
         pretrained_cfg = config.algo.config.pretrained_model
         sd_key = pretrained_cfg.get("state_dict_key", "state_dict")
@@ -439,38 +630,72 @@ def main(config: OmegaConf):
             if unexpected:
                 logger.info(f"Pretrained loading '{module_name}': unexpected keys: {unexpected}")
 
-    accelerator.wait_for_everyone()
+    model_modules = {
+        "policy": policy,
+        "value_model": value_model,
+        "disc_model": disc_model,
+        "ref_model": ref_model,
+    }
+    distributed_stage(
+        "model_signature_check",
+        lambda: verify_distributed_model_signatures(model_modules, accelerator),
+        accelerator=accelerator,
+    )
+    distributed_stage(
+        "pre_trainer_barrier",
+        accelerator.wait_for_everyone,
+        accelerator=accelerator,
+    )
 
     callbacks = []
     for callback in config.callbacks.values():
         callbacks.append(instantiate(callback))
+    if use_tensorboard:
+        from gear_sonic.trl.callbacks.tensorboard_callback import SonicTensorBoardCallback
+
+        callbacks.append(
+            SonicTensorBoardCallback(
+                log_dir=tensorboard_log_dir or getattr(training_args, "logging_dir", None),
+                flush_every_n_steps=config.algo.config.get(
+                    "tensorboard_flush_every_n_steps", 1
+                ),
+            )
+        )
 
     ################
     # Training
     ################
-    trainer = custom_instantiate(
-        config.trainer,
-        args=training_args,
-        config=config.algo.config,
-        env=env,
-        model=policy,
-        disc_model=disc_model,
-        value_model=value_model,
-        ref_model=ref_model,
-        use_ref_model=getattr(config.algo.config, "use_dagger", False),
-        train_dataset=None,
-        eval_dataset=None,
-        callbacks=callbacks,
-        checkpoint=config.checkpoint,
-        resume=config.get("resume", False),
-        local_seed=config.seed,
-        log_dir=experiment_save_dir,
+    trainer = distributed_stage(
+        "trainer_init",
+        lambda: custom_instantiate(
+            config.trainer,
+            args=training_args,
+            config=config.algo.config,
+            env=env,
+            model=policy,
+            disc_model=disc_model,
+            value_model=value_model,
+            ref_model=ref_model,
+            use_ref_model=getattr(config.algo.config, "use_dagger", False),
+            train_dataset=None,
+            eval_dataset=None,
+            callbacks=callbacks,
+            checkpoint=config.checkpoint,
+            resume=config.get("resume", False),
+            local_seed=config.seed,
+            log_dir=experiment_save_dir,
+            accelerator=accelerator,
+            _resolve=False,
+        ),
         accelerator=accelerator,
-        _resolve=False,
     )
 
     # Training loop
-    trainer.train()
+    distributed_stage(
+        "training_loop",
+        trainer.train,
+        accelerator=accelerator,
+    )
 
     if simulator_type == "IsaacSim":
         os._exit(0)
@@ -482,6 +707,14 @@ def main(config: OmegaConf):
 ROBOT_EXP_MAP = {
     "g1": "manager/universal_token/all_modes/sonic_v1_1",
     "h2": "manager/universal_token/all_modes/sonic_h2",
+    # "a3" trains the AgiBot A3 (T2D5) contract ported from Litchi_sonic_for_a3
+    # (see docs/workflow/a3_integration_plan.md) -- A3 and A3 Ultra share the
+    # same mechanical platform (worklog #37), so this is the CLI name going
+    # forward for both training and sim/deploy selection.
+    "a3": "manager/universal_token/all_modes/sonic_a3_035",
+    # Kept for this project's own from-scratch A3 Ultra training contract
+    # (separate PD gains/joint limits tuned for A3 Ultra specifically -- do
+    # not mix with the "a3" contract above when deploying either checkpoint).
     "a3_ultra": "manager/universal_token/all_modes/sonic_a3_ultra",
 }
 

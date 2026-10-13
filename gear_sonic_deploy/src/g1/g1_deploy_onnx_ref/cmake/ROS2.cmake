@@ -15,12 +15,55 @@ message(STATUS "Configuring ROS2 support...")
 # ROS2 Library Discovery
 # =============================================================================
 
-# Auto-discover ROS2 include directories dynamically
+# Auto-discover ROS2 include directories dynamically. Keep this list at the
+# ROS package include-root level; adding every subdirectory under
+# /opt/ros/<distro>/include can shadow C/POSIX headers such as <string.h> and
+# and keeps the deployment include namespace isolated from DDS headers.
 set(ROS2_INCLUDE_DIRS "")
 
 # Common ROS2 distributions in order of preference (newest first)  
 set(ROS2_DISTROS "jazzy" "iron" "humble" "galactic" "foxy" "eloquent" "dashing" "crystal")
 set(ROS2_INSTALL_PATHS "/opt/ros" "/usr/local/ros")
+
+set(_ros2_include_packages
+    action_msgs
+    builtin_interfaces
+    geometry_msgs
+    libstatistics_collector
+    lifecycle_msgs
+    rcl
+    rcl_action
+    rcl_interfaces
+    rcl_logging_interface
+    rcl_yaml_param_parser
+    rclcpp
+    rclcpp_action
+    rclcpp_components
+    rclcpp_lifecycle
+    rcpputils
+    rcutils
+    rmw
+    rmw_dds_common
+    rmw_fastrtps_cpp
+    rmw_fastrtps_shared_cpp
+    rosgraph_msgs
+    rosidl_dynamic_typesupport
+    rosidl_runtime_c
+    rosidl_runtime_cpp
+    rosidl_typesupport_c
+    rosidl_typesupport_cpp
+    rosidl_typesupport_fastrtps_c
+    rosidl_typesupport_fastrtps_cpp
+    rosidl_typesupport_interface
+    rosidl_typesupport_introspection_c
+    rosidl_typesupport_introspection_cpp
+    sensor_msgs
+    service_msgs
+    statistics_msgs
+    std_msgs
+    tracetools
+    type_description_interfaces
+    unique_identifier_msgs)
 
 set(ROS2_DISTRO_FOUND "")
 foreach(install_path ${ROS2_INSTALL_PATHS})
@@ -31,11 +74,10 @@ foreach(install_path ${ROS2_INSTALL_PATHS})
   foreach(distro ${ROS2_DISTROS})
     set(ros2_include_path "${install_path}/${distro}/include")
     if(EXISTS "${ros2_include_path}")
-      set(ROS2_INCLUDE_DIRS "${ros2_include_path}")
-      file(GLOB ROS2_INCLUDE_SUBDIRS "${ros2_include_path}/*")
-      foreach(subdir ${ROS2_INCLUDE_SUBDIRS})
-        if(IS_DIRECTORY ${subdir})
-          list(APPEND ROS2_INCLUDE_DIRS ${subdir})
+      foreach(_ros2_pkg ${_ros2_include_packages})
+        set(_ros2_pkg_include "${ros2_include_path}/${_ros2_pkg}")
+        if(IS_DIRECTORY "${_ros2_pkg_include}")
+          list(APPEND ROS2_INCLUDE_DIRS "${_ros2_pkg_include}")
         endif()
       endforeach()
       set(ROS2_DISTRO_FOUND "${distro}")
@@ -45,6 +87,22 @@ foreach(install_path ${ROS2_INSTALL_PATHS})
     endif()
   endforeach()
 endforeach()
+
+# conda/robostack ROS2 (e.g. the isolated `a3_deploy_verify` env): headers live
+# directly under $CONDA_PREFIX/include/<pkg>/ and libraries under $CONDA_PREFIX/lib.
+if(NOT ROS2_DISTRO_FOUND AND DEFINED ENV{CONDA_PREFIX}
+   AND IS_DIRECTORY "$ENV{CONDA_PREFIX}/include/rclcpp")
+  set(ros2_include_path "$ENV{CONDA_PREFIX}/include")
+  foreach(_ros2_pkg ${_ros2_include_packages})
+    set(_ros2_pkg_include "${ros2_include_path}/${_ros2_pkg}")
+    if(IS_DIRECTORY "${_ros2_pkg_include}")
+      list(APPEND ROS2_INCLUDE_DIRS "${_ros2_pkg_include}")
+    endif()
+  endforeach()
+  set(ROS2_DISTRO_FOUND "conda")
+  set(ROS2_INSTALL_BASE "$ENV{CONDA_PREFIX}")
+  message(STATUS "📦 Found ROS2 (conda) at $ENV{CONDA_PREFIX}")
+endif()
 
 if(NOT ROS2_DISTRO_FOUND)
   message(WARNING "❌ No ROS2 installation found in common locations")
@@ -106,7 +164,7 @@ target_link_libraries(${TEST_EXECUTABLE_NAME} PRIVATE ${ROS2_LIBS} pthread)
 target_compile_definitions(${TEST_EXECUTABLE_NAME} PRIVATE HAS_ROS2=1)
 
 set_target_properties(${TEST_EXECUTABLE_NAME} PROPERTIES 
-  RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+  RUNTIME_OUTPUT_DIRECTORY "${GS_RUNTIME_OUTPUT_DIR}"
   OUTPUT_NAME ${TEST_EXECUTABLE_NAME}
 )
 
@@ -116,10 +174,10 @@ message(STATUS "✅ ROS2 test executable configured")
 # Test Configuration Files
 # =============================================================================
 
-file(MAKE_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/config")
+file(MAKE_DIRECTORY "${GS_RUNTIME_OUTPUT_DIR}/config")
 configure_file(
   "${CMAKE_CURRENT_SOURCE_DIR}/config/fastrtps_profile.xml"
-  "${PROJECT_SOURCE_DIR}/target/release/config/fastrtps_profile.xml"
+  "${GS_RUNTIME_OUTPUT_DIR}/config/fastrtps_profile.xml"
   COPYONLY
 )
 

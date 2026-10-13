@@ -62,15 +62,12 @@ class RunningMeanStd(nn.Module):
             ]
         )  # shape = (2D + C,)
 
-        # Gather stats from all processes
-        gathered = accelerator.gather(flat_stats[None])  # shape = (world_size, 2D + C)
-
-        # Reshape
-        world_size = gathered.shape[0]
+        # Averaging needs only an all-reduce; gathering every rank's full
+        # normalizer state creates a larger temporary for the same result.
+        reduced = accelerator.reduce(flat_stats, reduction="mean")
         D = self.running_mean.numel()
-
-        means_ = gathered[:, :D].reshape(world_size, *self.running_mean.shape).mean(dim=0)
-        vars_ = gathered[:, D : 2 * D].reshape(world_size, *self.running_var.shape).mean(dim=0)
+        means_ = reduced[:D].reshape_as(self.running_mean)
+        vars_ = reduced[D : 2 * D].reshape_as(self.running_var)
 
         # Update local stats
         self.running_mean.copy_(means_)
@@ -127,8 +124,7 @@ class RunningMeanStd(nn.Module):
 
         # update After normalization, so that the values used for training and testing are the same.
         if self.training and not self.frozen:
-            mean = input.mean(self.axis)  # along channel axis
-            var = input.var(self.axis)
+            var, mean = torch.var_mean(input, dim=self.axis)
 
             new_mean, new_var, new_count = self._update_mean_var_count_from_moments(
                 self.running_mean, self.running_var, self.count, mean, var, input.size()[0]

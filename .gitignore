@@ -242,3 +242,23 @@ sonic_release/
 *.parquet
 *.so
 *.so.*
+
+# --- A3 / A3 Ultra (inherited from Litchi_sonic_for_a3) ---
+# RKNN models and converter metadata are downloaded from Hugging Face
+# (python download_from_hf.py --robot a3 --component rknn).
+*.rknn
+*.rknn.json
+# Local agent planning artifacts / development-only tests
+docs/superpowers/
+tests/local/
+# Local C++ build trees for the A3 deploy stack
+gear_sonic_deploy/build_verify_*/
+gear_sonic_deploy/dist/
+gear_sonic_deploy/thirdparty/rockchip_sysroot/*.tar.gz
+
+# --- Motion data / CMake files are not uploaded to git (user request) ---
+# Downloaded motion datasets (e.g. Bones-SEED G1 CSVs) stay local.
+# NOTE: .gitignore only affects untracked files; files already tracked
+# (78 .csv, 4 .cmake at the time of writing) remain tracked.
+*.csv
+*.cmake

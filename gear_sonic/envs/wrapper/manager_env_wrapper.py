@@ -24,6 +24,74 @@ except ImportError:
     VISUALIZATION_AVAILABLE = False
 
 
+def _collect_adaptive_sampling_metrics(motion_lib, motion_command):
+    """Build adaptive-sampling diagnostics without host synchronization.
+
+    The sampler arrays cover the complete motion corpus and can contain
+    millions of bins. Reuse reductions within a snapshot and keep the zero
+    episode-count edge case on-device.
+    """
+    metrics = {}
+
+    num_episodes = motion_lib.adp_samp_num_episodes
+    episodes_min, episodes_max = torch.aminmax(num_episodes)
+    episodes_mean = num_episodes.mean()
+    metrics["adp_samp/num_episodes_min"] = episodes_min
+    metrics["adp_samp/num_episodes_max"] = episodes_max
+    metrics["adp_samp/num_episodes_mean"] = episodes_mean
+
+    num_failures = motion_lib.adp_samp_num_failures
+    failures_min, failures_max = torch.aminmax(num_failures)
+    metrics["adp_samp/num_failures_min"] = failures_min
+    metrics["adp_samp/num_failures_max"] = failures_max
+    metrics["adp_samp/num_failures_mean"] = num_failures.mean()
+
+    failure_rate = motion_lib.adp_samp_failure_rate_raw
+    failure_rate_min, failure_rate_max = torch.aminmax(failure_rate)
+    metrics["adp_samp/failure_rate_min"] = failure_rate_min
+    metrics["adp_samp/failure_rate_max"] = failure_rate_max
+    metrics["adp_samp/failure_rate_mean"] = failure_rate.mean()
+
+    if hasattr(motion_lib, "adp_sampling_active_prob"):
+        prob = motion_lib.adp_sampling_active_prob
+        uniform_prob = 1.0 / len(prob) if len(prob) > 0 else 1.0
+        prob_min, prob_max = torch.aminmax(prob)
+        metrics["adp_samp/prob_max"] = prob_max
+        metrics["adp_samp/prob_min"] = prob_min
+        metrics["adp_samp/prob_mean"] = prob.mean()
+        metrics["adp_samp/prob_max_over_uniform"] = prob_max / uniform_prob
+        metrics["adp_samp/effective_num_bins"] = 1.0 / prob.square().sum()
+        metrics["adp_samp/num_concentrated_bins"] = (
+            (prob > 10 * uniform_prob).sum().float()
+        )
+
+    if (
+        motion_command is not None
+        and motion_command._use_paired_motions  # noqa: SLF001
+        and hasattr(motion_lib, "adp_sampling_conditioned_prob")
+    ):
+        conditioned = motion_lib.adp_sampling_conditioned_prob
+        valid = motion_lib.adp_samp_motion_bin_ids >= 0
+        num_bins = valid.sum(dim=1)
+        metrics["adp_samp/paired_time_bin_mode"] = conditioned.new_tensor(1.0)
+        metrics["adp_samp/cross_gpu_sync_enabled"] = conditioned.new_tensor(
+            float(motion_lib.adaptive_sampling_sync_across_gpus)
+        )
+        metrics["adp_samp/conditioned_prob_max_over_uniform"] = (
+            conditioned * num_bins[:, None]
+        )[valid].max()
+        metrics["adp_samp/conditioned_effective_bins_mean"] = (
+            1.0 / conditioned.square().sum(dim=1)
+        ).mean()
+
+    metrics["adp_samp/episodes_max_over_mean"] = torch.where(
+        episodes_mean > 0,
+        episodes_max / episodes_mean.clamp_min(torch.finfo(episodes_mean.dtype).tiny),
+        torch.zeros_like(episodes_mean),
+    )
+    return metrics
+
+
 class ManagerEnvWrapper:
     def __init__(self, env: "ManagerBasedEnv", config):
         env.wrapper = self
@@ -69,6 +137,19 @@ class ManagerEnvWrapper:
         self._action_lines = None
         self._action_hist = None
         self._hist_idx = 0
+
+        # These extras are intended for diagnostics/callbacks, not policy or
+        # reward semantics. Keep legacy defaults and let throughput-sensitive
+        # experiments opt out or sample them less frequently.
+        self.store_env_actions_in_extras = bool(
+            self.config.get("store_env_actions_in_extras", True)
+        )
+        self.adaptive_sampling_log_every_n_steps = int(
+            self.config.get("adaptive_sampling_log_every_n_steps", 1)
+        )
+        if self.adaptive_sampling_log_every_n_steps <= 0:
+            raise ValueError("adaptive_sampling_log_every_n_steps must be positive")
+        self._adaptive_sampling_log_step = 0
 
         self._blit_background = None
         self._blit_supported = True
@@ -865,7 +946,7 @@ class ManagerEnvWrapper:
         # This prevents a false large rate penalty on the first step of a new episode
         # Only applies when action_transform_module is used (buffers created in reset())
         reset_mask = dones.bool()
-        if reset_mask.any() and hasattr(self.env, "_prev_meta_action"):
+        if hasattr(self.env, "_prev_meta_action") and reset_mask.any():
             self.env._prev_meta_action[reset_mask] = 0.0  # noqa: SLF001
             self.env._last_meta_action[reset_mask] = 0.0  # noqa: SLF001
             self.env._prev_full_latent[reset_mask] = 0.0  # noqa: SLF001
@@ -924,67 +1005,31 @@ class ManagerEnvWrapper:
                 extras["to_log"][k] = v
             else:
                 extras["to_log"][k] = torch.tensor(v, dtype=torch.float)
-        if self._motion_lib is not None and self._motion_lib.use_adaptive_sampling:
-            extras["to_log"][
-                "adp_samp/num_episodes_min"
-            ] = self._motion_lib.adp_samp_num_episodes.min()
-            extras["to_log"][
-                "adp_samp/num_episodes_max"
-            ] = self._motion_lib.adp_samp_num_episodes.max()
-            extras["to_log"][
-                "adp_samp/num_episodes_mean"
-            ] = self._motion_lib.adp_samp_num_episodes.mean()
-            extras["to_log"][
-                "adp_samp/num_failures_min"
-            ] = self._motion_lib.adp_samp_num_failures.min()
-            extras["to_log"][
-                "adp_samp/num_failures_max"
-            ] = self._motion_lib.adp_samp_num_failures.max()
-            extras["to_log"][
-                "adp_samp/num_failures_mean"
-            ] = self._motion_lib.adp_samp_num_failures.mean()
-            extras["to_log"][
-                "adp_samp/failure_rate_min"
-            ] = self._motion_lib.adp_samp_failure_rate_raw.min()
-            extras["to_log"][
-                "adp_samp/failure_rate_max"
-            ] = self._motion_lib.adp_samp_failure_rate_raw.max()
-            extras["to_log"][
-                "adp_samp/failure_rate_mean"
-            ] = self._motion_lib.adp_samp_failure_rate_raw.mean()
-
-            if hasattr(self._motion_lib, "adp_sampling_active_prob"):
-                prob = self._motion_lib.adp_sampling_active_prob
-                uniform_prob = 1.0 / len(prob) if len(prob) > 0 else 1.0
-                extras["to_log"]["adp_samp/prob_max"] = prob.max()
-                extras["to_log"]["adp_samp/prob_min"] = prob.min()
-                extras["to_log"]["adp_samp/prob_mean"] = prob.mean()
-                extras["to_log"]["adp_samp/prob_max_over_uniform"] = prob.max() / uniform_prob
-                extras["to_log"]["adp_samp/effective_num_bins"] = 1.0 / (prob**2).sum()
-                # How many bins have prob > 10x uniform (significantly concentrated)
-                # Note: max allowed is 50x uniform, so 10x is 20% of the cap
-                extras["to_log"]["adp_samp/num_concentrated_bins"] = (
-                    (prob > 10 * uniform_prob).sum().float()
-                )
-
-            eps_mean = self._motion_lib.adp_samp_num_episodes.mean()
-            if eps_mean > 0:
-                extras["to_log"]["adp_samp/episodes_max_over_mean"] = (
-                    self._motion_lib.adp_samp_num_episodes.max() / eps_mean
-                )
+        self._adaptive_sampling_log_step += 1
+        if (
+            self._motion_lib is not None
+            and self._motion_lib.use_adaptive_sampling
+            and self._adaptive_sampling_log_step
+            % self.adaptive_sampling_log_every_n_steps
+            == 0
+        ):
+            extras["to_log"].update(
+                _collect_adaptive_sampling_metrics(self._motion_lib, self.motion_command)
+            )
         new_obs = self.process_raw_obs(obs_dict, flatten_dict_obs=True)
         # Store obs for action_transform_module when obs_dict is not provided in next step()
         self._last_obs_dict = new_obs
         self.extras = extras
-        # Store env_actions for callbacks (e.g., MultiLatentSaveCallback)
-        extras["env_actions"] = env_actions.detach().cpu()
+        # Store env_actions only when a callback explicitly needs the host copy.
+        if self.store_env_actions_in_extras:
+            extras["env_actions"] = env_actions.detach().cpu()
         return new_obs, rew, dones, extras
 
     def get_env_data(self, key):
         if key == "ref_body_pos_extend":
-            return self.motion_command.robot_body_pos_w
-        elif key == "rigid_body_pos_extend":
             return self.motion_command.body_pos_w
+        elif key == "rigid_body_pos_extend":
+            return self.motion_command.robot_body_pos_w
         else:
             return self.env.get_env_data(key)
 
@@ -1086,6 +1131,11 @@ class ManagerEnvWrapper:
             "motion_lib": self._motion_lib.get_state_dict(),
         }
         return state_dict
+
+    def get_adaptive_sampling_report(self):
+        if self._motion_lib is None:
+            return None
+        return self._motion_lib.get_adaptive_sampling_report()
 
     def reinit_dr(self, **_kwargs):
         pass
@@ -1339,7 +1389,7 @@ class ManagerEnvWrapper:
                 # Position camera BEFORE rendering (if recording)
                 if video_writer is not None and "eval_camera" in self.env.scene.sensors:
                     root_pos = self.motion_command.robot.data.body_pos_w[:, 0]
-                    camera_offset = self.config.get("eval_camera_offset", [-2, -2, 1])
+                    camera_offset = self.config.get("eval_camera_offset", [4.0, 4.0, 1.8])
                     eye = root_pos + torch.tensor(camera_offset, device=self.device)
                     self.env.scene["eval_camera"].set_world_poses_from_view(eye, root_pos)
 

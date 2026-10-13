@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from gear_sonic.trl.modules.input_projectors import build_projector_from_config
 from gear_sonic.trl.utils import common
 
 
@@ -85,6 +86,7 @@ class UniversalTokenModule(nn.Module):
         aux_loss_coef={},
         encoder_sample_probs=None,
         reencode_smpl_g1_recon=False,
+        reencode_a3_fast_g1_recon=False,
         meta_action_dim=None,  # For hierarchical policies with split actions
         body_action_dim=None,  # For separate body decoder (e.g., 29 body joints)
         hand_action_dim=None,  # For separate hand decoder (e.g., 14 hand joints)
@@ -95,6 +97,9 @@ class UniversalTokenModule(nn.Module):
         optimize_encoders_ratio_for_CHIP=False,  # CHIP compliance training optimization
         active_encoders=None,  # Optional list of encoder names to activate (None = all)
         active_decoders=None,  # Optional list of decoder names to activate (None = all)
+        rollout_decoders=None,  # Optional decoder subset for action-only forwards
+        rollout_encoder_exclusions=None,  # Skip overwritten co-activated rows
+        cache_encoded_cpu=True,  # Preserve legacy callback/debug caches when requested
         **kwargs,  # noqa: ARG002
     ):
         """Initialise encoders, FSQ quantizer, decoders, and auxiliary losses.
@@ -136,6 +141,9 @@ class UniversalTokenModule(nn.Module):
                 tokenizer observations.
             reencode_smpl_g1_recon: When ``True``, re-encode the G1 kinematic
                 decoder output to compute cycle-consistency auxiliary losses.
+            reencode_a3_fast_g1_recon: When ``True``, re-encode the G1 kinematic
+                decoder output for A3-fast samples to compute cycle-consistency
+                auxiliary losses.
             meta_action_dim: Action dimensionality for hierarchical policies
                 where the top-level action differs from the full joint count.
             body_action_dim: Dimensionality of body joints for split
@@ -155,6 +163,16 @@ class UniversalTokenModule(nn.Module):
                 run.  All encoders are active when ``None``.
             active_decoders: Optional list of decoder names to run during
                 forward.  All decoders are run when ``None``.
+            rollout_decoders: Optional subset of active decoders needed for an
+                action-only forward. Auxiliary-loss and rich-dict forwards
+                continue to run every active decoder.
+            rollout_encoder_exclusions: Optional mapping from a lower-priority
+                encoder to co-activated encoders that overwrite its tokens.
+                The redundant rows are skipped only for plain action rollout;
+                auxiliary and rich forwards retain the full paired masks.
+            cache_encoded_cpu: Copy per-encoder tokens and latents to CPU after
+                every forward for external debugging callbacks. Disable this in
+                throughput-sensitive training when those caches are unused.
             **kwargs: Absorbed for forward-compatibility.
         """
         super().__init__()
@@ -165,6 +183,7 @@ class UniversalTokenModule(nn.Module):
         self.stiff_compliance_threshold = stiff_compliance_threshold
         self.freeze_quantizer = freeze_quantizer
         self.optimize_encoders_ratio_for_CHIP = optimize_encoders_ratio_for_CHIP
+        self.cache_encoded_cpu = bool(cache_encoded_cpu)
 
         if self.optimize_encoders_ratio_for_CHIP:
             logger.info(
@@ -184,6 +203,7 @@ class UniversalTokenModule(nn.Module):
         self.decoders_cfg = decoders
         self.encoder_sample_probs = encoder_sample_probs
         self.reencode_smpl_g1_recon = reencode_smpl_g1_recon
+        self.reencode_a3_fast_g1_recon = reencode_a3_fast_g1_recon
         self.tokenizer_obs_dims = self.env_config.obs.group_obs_dims["tokenizer"]
         self.tokenizer_obs_names = self.env_config.obs.group_obs_names["tokenizer"]
         # The tokenizer observation schema is fixed after module construction.
@@ -257,6 +277,8 @@ class UniversalTokenModule(nn.Module):
         self.encoders = nn.ModuleDict()
         self.sub_encoders = {}
         self.encoder_input_features = {}
+        self.encoder_input_projectors = nn.ModuleDict()
+        self.encoder_checkpoint_input_expansion = {}
         self.encoder_mask_features = {}
         self.encoders_to_iterate = []
         self.additive_encoders = {}  # Map: base_encoder_name -> list of additive encoder names
@@ -284,7 +306,27 @@ class UniversalTokenModule(nn.Module):
 
             input_features = encoder_config.get("inputs", [])
             output_features = encoder_config.get("outputs", [])
-            input_feature_dim = sum([self.tokenizer_obs_dims[key][-1] for key in input_features])
+            input_projectors_config = encoder_config.get("input_projectors", {})
+            if input_projectors_config:
+                projector_dict = nn.ModuleDict()
+                for feature_name, projector_config in input_projectors_config.items():
+                    feature_dim = int(np.prod(self.tokenizer_obs_dims[feature_name]))
+                    projector, description = build_projector_from_config(
+                        projector_config, feat_dim=feature_dim
+                    )
+                    projector_dict[feature_name] = projector
+                    logger.info(
+                        f"Initialized input projector for {encoder_name}.{feature_name}: "
+                        f"{description}"
+                    )
+                self.encoder_input_projectors[encoder_name] = projector_dict
+
+            input_feature_dim = sum(
+                input_projectors_config[key]["output_dim"]
+                if key in input_projectors_config
+                else self.tokenizer_obs_dims[key][-1]
+                for key in input_features
+            )
             if len(output_features) > 0:
                 output_feature_dim = sum(
                     [self.tokenizer_obs_dims[key][-1] for key in output_features]
@@ -292,6 +334,9 @@ class UniversalTokenModule(nn.Module):
             else:
                 output_feature_dim = self.token_dim
             self.encoder_input_features[encoder_name] = input_features
+            self.encoder_checkpoint_input_expansion[encoder_name] = encoder_config.get(
+                "checkpoint_input_expansion", None
+            )
             self.encoder_mask_features[encoder_name] = list(encoder_config.get("mask", []))
 
             if len(self.sub_encoders[encoder_name]) > 0:
@@ -406,6 +451,14 @@ class UniversalTokenModule(nn.Module):
             self.decoder_input_features[decoder_name] = input_features
             self.decoder_output_features[decoder_name] = output_features
 
+            # Per-decoder freeze support. This lets distillation stages keep
+            # selected pretrained decoders fixed while still allowing gradients
+            # to flow through them into the active encoder.
+            if decoder_config.get("freeze", False):
+                for param in decoder.parameters():
+                    param.requires_grad = False
+                logger.info(f"Froze decoder: {decoder_name}")
+
             logger.info(
                 f"Initialized {decoder_name} decoder with input features: {input_features} and output features: {output_features}"  # noqa: E501
             )
@@ -415,11 +468,65 @@ class UniversalTokenModule(nn.Module):
             self.encoders_to_iterate = [e for e in self.encoders_to_iterate if e in active_encoders]
             logger.info(f"Active encoders filtered to: {self.encoders_to_iterate}")
         if active_decoders is not None:
-            # Keep all decoders in ModuleDict (for checkpoint compat), but only iterate active ones
-            self._active_decoders = set(active_decoders)
+            unknown_active_decoders = set(active_decoders) - set(self.decoders_cfg)
+            if unknown_active_decoders:
+                raise ValueError(
+                    "active_decoders contains unknown decoder names: "
+                    f"{sorted(unknown_active_decoders)}"
+                )
+            self._active_decoders = tuple(
+                name for name in self.decoders if name in active_decoders
+            )
             logger.info(f"Active decoders filtered to: {list(self._active_decoders)}")
         else:
             self._active_decoders = None
+
+        if rollout_decoders is None:
+            self.rollout_decoders = None
+        else:
+            self.rollout_decoders = tuple(dict.fromkeys(rollout_decoders))
+            unknown_rollout_decoders = set(self.rollout_decoders) - set(self.decoders)
+            if unknown_rollout_decoders:
+                raise ValueError(
+                    "rollout_decoders contains decoders that were not instantiated: "
+                    f"{sorted(unknown_rollout_decoders)}"
+                )
+            action_outputs = {"action", "body_action", "meta_action"}
+            if not any(
+                action_outputs.intersection(self.decoder_output_features[name])
+                for name in self.rollout_decoders
+            ):
+                raise ValueError("rollout_decoders must include an action-producing decoder")
+            if "hand_dyn" in self.decoders and "hand_dyn" not in self.rollout_decoders:
+                raise ValueError(
+                    "rollout_decoders must include hand_dyn when that decoder is active"
+                )
+            logger.info(f"Action-only forwards use decoders: {list(self.rollout_decoders)}")
+
+        if rollout_encoder_exclusions is None:
+            self.rollout_encoder_exclusions = {}
+        else:
+            self.rollout_encoder_exclusions = {
+                encoder_name: tuple(dict.fromkeys(excluded_by))
+                for encoder_name, excluded_by in rollout_encoder_exclusions.items()
+            }
+            configured_encoders = set(self.encoders_to_iterate)
+            referenced_encoders = set(self.rollout_encoder_exclusions)
+            referenced_encoders.update(
+                excluded_name
+                for excluded_by in self.rollout_encoder_exclusions.values()
+                for excluded_name in excluded_by
+            )
+            unknown_rollout_encoders = referenced_encoders - configured_encoders
+            if unknown_rollout_encoders:
+                raise ValueError(
+                    "rollout_encoder_exclusions contains inactive or unknown encoders: "
+                    f"{sorted(unknown_rollout_encoders)}"
+                )
+            logger.info(
+                "Action-only forwards skip overwritten encoder rows: "
+                f"{self.rollout_encoder_exclusions}"
+            )
 
         # Apply freeze logic
         if self.freeze_encoders:
@@ -542,12 +649,156 @@ class UniversalTokenModule(nn.Module):
             ("g1", "teleop", [("g1_has_teleop", "teleop", "g1")]),
             ("teleop", "g1", [("teleop_has_g1", "g1", "teleop")]),
             ("g1", "soma", [("g1_has_soma", "soma", "g1")]),
+            (
+                "g1",
+                "a3_fast",
+                [
+                    ("g1_has_a3_fast", "a3_fast", "g1"),
+                    ("a3_fast_has_g1", "g1", "a3_fast"),
+                ],
+            ),
         ]
         for key1, key2, mask_defs in encoder_mask_combinations:
             if key1 in encoder_masks and key2 in encoder_masks:
                 for mask_name, mask_src, mask_cond in mask_defs:
                     encoder_masks[mask_name] = encoder_masks[mask_src][encoder_masks[mask_cond]]
         return encoder_masks
+
+    def _loaded_state_has_encoder(self, loaded_state_keys, encoder_name):
+        if loaded_state_keys is None:
+            return False
+        needle = f"encoders.{encoder_name}."
+        return any(needle in key for key in loaded_state_keys)
+
+    def apply_encoder_init_from(self, loaded_state_keys=None):
+        """Initialize configured encoders from another encoder after checkpoint load."""
+        for encoder_name, encoder_config in self.encoders_cfg.items():
+            init_config = encoder_config.get("init_from_encoder", None)
+            if init_config is None or encoder_name not in self.encoders:
+                continue
+
+            if isinstance(init_config, str):
+                source_name = init_config
+                policy = "missing_only"
+            else:
+                source_name = init_config.get("source", None)
+                policy = init_config.get("policy", "missing_only")
+
+            if policy not in {"always", "missing_only", "never"}:
+                raise ValueError(
+                    f"Unknown init_from_encoder policy for {encoder_name}: {policy}. "
+                    "Expected one of: always, missing_only, never."
+                )
+            if policy == "never":
+                logger.info(f"Skipped init_from_encoder for {encoder_name}: policy=never")
+                continue
+            if source_name not in self.encoders:
+                raise KeyError(
+                    f"Cannot initialize encoder '{encoder_name}' from missing encoder "
+                    f"'{source_name}'."
+                )
+            if policy == "missing_only" and self._loaded_state_has_encoder(
+                loaded_state_keys, encoder_name
+            ):
+                logger.info(
+                    f"Skipped init_from_encoder for {encoder_name}: checkpoint already "
+                    f"contains encoder weights (policy=missing_only)."
+                )
+                continue
+
+            self.encoders[encoder_name].load_state_dict(
+                self.encoders[source_name].state_dict(), strict=True
+            )
+            logger.info(
+                f"Initialized encoder '{encoder_name}' from '{source_name}' "
+                f"(policy={policy})."
+            )
+
+    @staticmethod
+    def _expand_temporal_input_weight(loaded_weight, target_weight, temporal_dim):
+        """Append zero-initialized features independently inside each temporal frame."""
+        if loaded_weight.ndim != 2 or target_weight.ndim != 2:
+            raise ValueError("Temporal input expansion only supports 2D linear weights")
+        if loaded_weight.shape[0] != target_weight.shape[0]:
+            raise ValueError("Temporal input expansion cannot change the linear output size")
+        old_input_dim = loaded_weight.shape[1]
+        new_input_dim = target_weight.shape[1]
+        if old_input_dim % temporal_dim or new_input_dim % temporal_dim:
+            raise ValueError(
+                f"Input dimensions {old_input_dim} and {new_input_dim} must both be divisible "
+                f"by temporal_dim={temporal_dim}"
+            )
+        old_frame_dim = old_input_dim // temporal_dim
+        new_frame_dim = new_input_dim // temporal_dim
+        if new_frame_dim <= old_frame_dim:
+            raise ValueError(
+                f"Expected an expanded per-frame input, got {old_frame_dim} -> {new_frame_dim}"
+            )
+
+        expanded = target_weight.new_zeros(target_weight.shape)
+        expanded.view(target_weight.shape[0], temporal_dim, new_frame_dim)[
+            :, :, :old_frame_dim
+        ] = loaded_weight.to(device=target_weight.device, dtype=target_weight.dtype).view(
+            loaded_weight.shape[0], temporal_dim, old_frame_dim
+        )
+        return expanded
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Migrate opted-in encoder input layers before PyTorch validates shapes."""
+        for encoder_name, expansion_mode in self.encoder_checkpoint_input_expansion.items():
+            if expansion_mode is None or encoder_name not in self.encoders:
+                continue
+            if expansion_mode != "append_zero_per_frame":
+                error_msgs.append(
+                    f"Unknown checkpoint_input_expansion for {encoder_name}: {expansion_mode}"
+                )
+                continue
+
+            encoder = self.encoders[encoder_name]
+            temporal_dim = getattr(encoder, "num_input_temporal_dims", None)
+            if temporal_dim is None:
+                error_msgs.append(
+                    f"Encoder {encoder_name} needs num_input_temporal_dims for "
+                    "append_zero_per_frame checkpoint migration"
+                )
+                continue
+
+            for parameter_name, target_value in encoder.state_dict().items():
+                checkpoint_key = f"{prefix}encoders.{encoder_name}.{parameter_name}"
+                loaded_value = state_dict.get(checkpoint_key)
+                if loaded_value is None or loaded_value.shape == target_value.shape:
+                    continue
+                try:
+                    state_dict[checkpoint_key] = self._expand_temporal_input_weight(
+                        loaded_value, target_value, temporal_dim
+                    )
+                except ValueError:
+                    continue
+                logger.info(
+                    f"Expanded checkpoint input weight for {encoder_name}.{parameter_name}: "
+                    f"{tuple(loaded_value.shape)} -> {tuple(target_value.shape)}; "
+                    "new per-frame features start with zero influence."
+                )
+                break
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def assemble_all_tokens(self, encoded_tokens, encoder_masks, batch_size, seq_len):
         """Scatter per-encoder tokens into a single batch-aligned tensor.
@@ -607,34 +858,36 @@ class UniversalTokenModule(nn.Module):
 
         input_features = self.encoder_input_features[encoder_name]
 
-        obs_list = [tokenizer_obs[key] for key in input_features]
-        # Only handle dimension broadcasting for the "smpl" encoder_name and for obs with last dim 9 or 12
-        if "smpl" in encoder_name:
-            max_ndim = max(obs.ndim for obs in obs_list)
-            # Check if any obs needs broadcasting: (last dim is 9 or 12 and ndim < max_ndim)
-            need_broadcast = any(
-                (obs.shape[-1] in (9, 12) and obs.ndim < max_ndim) for obs in obs_list
-            )
-            if need_broadcast:
-                aligned_obs_list = []
-                # Use the first obs of max_ndim as the temporal reference
-                target_obs = next(o for o in obs_list if o.ndim == max_ndim)
-                temporal_dim = target_obs.shape[-2]
-                for obs in obs_list:
-                    if obs.shape[-1] in (9, 12) and obs.ndim < max_ndim:
-                        # Add missing dimension(s)
-                        while obs.ndim < max_ndim:
-                            obs = obs.unsqueeze(-2)  # noqa: PLW2901
-                        # Expand temporal dimension
-                        expand_shape = list(obs.shape)
-                        expand_shape[-2] = temporal_dim
-                        obs = obs.expand(*expand_shape)  # noqa: PLW2901
-                    aligned_obs_list.append(obs)
-                encoder_input = torch.cat(aligned_obs_list, dim=-1)
-            else:
-                encoder_input = torch.cat(obs_list, dim=-1)
-        else:
-            encoder_input = torch.cat(obs_list, dim=-1)
+        projectors = (
+            self.encoder_input_projectors[encoder_name]
+            if encoder_name in self.encoder_input_projectors
+            else {}
+        )
+        obs_list = []
+        for feature_name in input_features:
+            obs = tokenizer_obs[feature_name]
+            if feature_name in projectors:
+                obs = projectors[feature_name](obs)
+            obs_list.append(obs)
+
+        max_ndim = max(obs.ndim for obs in obs_list)
+        if any(obs.ndim < max_ndim for obs in obs_list):
+            target_obs = next(obs for obs in obs_list if obs.ndim == max_ndim)
+            temporal_dim = target_obs.shape[-2]
+            aligned_obs_list = []
+            for obs in obs_list:
+                while obs.ndim < max_ndim:
+                    obs = obs.unsqueeze(-2)
+                if obs.shape[-2] == 1:
+                    obs = obs.expand(*obs.shape[:-2], temporal_dim, obs.shape[-1])
+                elif obs.shape[-2] != temporal_dim:
+                    raise ValueError(
+                        f"Cannot align encoder input temporal dimensions for {encoder_name}: "
+                        f"expected 1 or {temporal_dim}, got {obs.shape[-2]}"
+                    )
+                aligned_obs_list.append(obs)
+            obs_list = aligned_obs_list
+        encoder_input = torch.cat(obs_list, dim=-1)
         encoder_input = encoder_input.view(-1, *encoder_input.shape[2:])
 
         # Apply encoder_mask to both input and frame_mask
@@ -748,6 +1001,40 @@ class UniversalTokenModule(nn.Module):
 
         return output_dict
 
+    def _select_decoders_for_forward(self, *, compute_aux_loss, return_dict):
+        """Choose the decoder set without changing rich training outputs."""
+        if (
+            self.rollout_decoders is not None
+            and not compute_aux_loss
+            and not return_dict
+        ):
+            return self.rollout_decoders
+        if self._active_decoders is not None:
+            return self._active_decoders
+        return self.decoders.keys()
+
+    def _select_encoder_masks_for_forward(
+        self, encoder_masks, *, compute_aux_loss, return_dict
+    ):
+        """Drop action-only encoder rows whose tokens are overwritten later."""
+        if self.rollout_encoder_exclusions == {} or compute_aux_loss or return_dict:
+            return encoder_masks
+
+        selected_masks = encoder_masks.copy()
+        for encoder_name, excluded_by in self.rollout_encoder_exclusions.items():
+            encoder_mask = encoder_masks[encoder_name]
+            if encoder_mask is None:
+                continue
+            exclusion_mask = torch.zeros_like(encoder_mask)
+            for excluded_name in excluded_by:
+                excluded_mask = encoder_masks[excluded_name]
+                if excluded_mask is None:
+                    exclusion_mask.fill_(True)
+                else:
+                    exclusion_mask |= excluded_mask
+            selected_masks[encoder_name] = encoder_mask & ~exclusion_mask
+        return selected_masks
+
     def forward(  # noqa: D417
         self,
         input_data,
@@ -827,6 +1114,11 @@ class UniversalTokenModule(nn.Module):
 
         # encode motion using all available encoders
         encoder_masks = self.create_encoder_masks(tokenizer_obs)
+        encoder_masks = self._select_encoder_masks_for_forward(
+            encoder_masks,
+            compute_aux_loss=compute_aux_loss,
+            return_dict=return_dict,
+        )
         encoded_tokens = {}
         encoded_latents = {}
         if latent_residual is not None and latent_residual_mode in [
@@ -889,9 +1181,19 @@ class UniversalTokenModule(nn.Module):
         if latent_residual is not None and latent_residual_mode == "post_quantization":
             all_tokens = all_tokens + residual_reshaped
 
-        # Cache tokens for external access (e.g., by callbacks)
-        self._last_encoded_tokens = {k: v.detach().cpu() for k, v in encoded_tokens.items()}
-        self._last_encoded_latents = {k: v.detach().cpu() for k, v in encoded_latents.items()}
+        # These legacy caches force device-to-host copies and CUDA synchronization.
+        # Throughput-sensitive experiments can disable them when no callback
+        # consumes the private debug state.
+        if self.cache_encoded_cpu:
+            self._last_encoded_tokens = {
+                key: value.detach().cpu() for key, value in encoded_tokens.items()
+            }
+            self._last_encoded_latents = {
+                key: value.detach().cpu() for key, value in encoded_latents.items()
+            }
+        else:
+            self._last_encoded_tokens = None
+            self._last_encoded_latents = None
 
         # Cache flattened full latent on device for reward computation (token smoothness)
         # all_tokens is the post-quantization token that gets sent to decoder
@@ -907,8 +1209,8 @@ class UniversalTokenModule(nn.Module):
         decode_input_dict.update(tokenizer_obs)
 
         decoded_outputs = {}
-        decoders_to_run = (
-            self._active_decoders if self._active_decoders is not None else self.decoders.keys()
+        decoders_to_run = self._select_decoders_for_forward(
+            compute_aux_loss=compute_aux_loss, return_dict=return_dict
         )
         for decoder_name in decoders_to_run:
             decoded_outputs[decoder_name] = self.decode(
@@ -938,13 +1240,17 @@ class UniversalTokenModule(nn.Module):
 
             # Initialize all paired latents
             reencoded_smpl_g1_latents = None
+            reencoded_a3_fast_g1_latents = None
             paired_g1_smpl_latents = None
+            paired_g1_a3_fast_latents = None
             paired_compliance_latents = None
             original_g1_latents_for_reencode = None
+            original_g1_latents_for_a3_fast_reencode = None
 
             # Determine encoder names
             smpl_encoder_name = "smpl" if "smpl" in self.encoders_to_iterate else None
             teleop_encoder_name = "teleop" if "teleop" in self.encoders_to_iterate else None
+            a3_fast_encoder_name = "a3_fast" if "a3_fast" in self.encoders_to_iterate else None
 
             # =========================================================================
             # STIFF-MODE OPTIMIZATION: Check for stiff samples FIRST before computing
@@ -1009,6 +1315,36 @@ class UniversalTokenModule(nn.Module):
                         no_quantization=True,
                     )
 
+            # Compute optional A3-fast cycle-consistency latents.
+            #
+            # Direct A3-fast/G1 latent alignment intentionally uses the same
+            # co-activated encoded_latents + encoder_masks path as G1/teleop
+            # alignment.  That lets from-scratch G1+A3-fast training shape both
+            # encoders together instead of distilling A3-fast against a detached
+            # randomly initialized G1 target.
+            if a3_fast_encoder_name is not None and "g1" in self.encoders:
+                a3_fast_mask = encoder_masks.get(a3_fast_encoder_name)
+                if (
+                    self.reencode_a3_fast_g1_recon
+                    and a3_fast_mask is not None
+                    and a3_fast_mask.sum() > 0
+                ):
+                    g1_latents_for_a3_fast = self.encode(
+                        encoder_name="g1",
+                        tokenizer_obs=tokenizer_obs,
+                        encoder_mask=a3_fast_mask,
+                        no_quantization=True,
+                    ).detach()
+                    original_g1_latents_for_a3_fast_reencode = g1_latents_for_a3_fast
+
+                    if "g1_kin" in decoded_outputs:
+                        reencoded_a3_fast_g1_latents = self.encode(
+                            encoder_name="g1",
+                            tokenizer_obs=decoded_outputs["g1_kin"],
+                            encoder_mask=a3_fast_mask,
+                            no_quantization=True,
+                        )
+
             # Compute paired teleop-SMPL latents for TeleopSmplComplianceLatentLoss
             # NOTE: This applies to ALL compliance values (not just stiff), so no stiff check
             if (
@@ -1048,10 +1384,13 @@ class UniversalTokenModule(nn.Module):
                 ),
                 "decoders_cfg": self.decoders_cfg,
                 "reencoded_smpl_g1_latents": reencoded_smpl_g1_latents,
+                "reencoded_a3_fast_g1_latents": reencoded_a3_fast_g1_latents,
                 # New fields for compliance-aware losses
                 "paired_g1_smpl_latents": paired_g1_smpl_latents,
+                "paired_g1_a3_fast_latents": paired_g1_a3_fast_latents,
                 "paired_compliance_latents": paired_compliance_latents,
                 "original_g1_latents_for_reencode": original_g1_latents_for_reencode,
+                "original_g1_latents_for_a3_fast_reencode": original_g1_latents_for_a3_fast_reencode,
             }
 
             for loss_name, loss_func in self.aux_loss_func.items():

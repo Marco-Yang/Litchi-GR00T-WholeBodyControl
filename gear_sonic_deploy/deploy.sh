@@ -7,7 +7,8 @@ set -e
 # This script handles the complete setup and deployment process for g1_deploy
 # Following the steps from the README.md
 #
-# Usage: ./deploy.sh [sim|real|<interface_name>|<ip_address>]
+# Usage: ./deploy.sh [--robot g1|a3|a3_ultra|h2] [sim|real|<interface_name>|<ip_address>]
+#   --robot - target robot (default g1). a3/a3_ultra dispatch to scripts/deploy_a3.sh
 #   sim   - Use loopback interface for simulation (MuJoCo)
 #   real  - Auto-detect robot network interface (192.168.123.x)
 #   <interface_name> - Use specific interface (e.g., enP8p1s0, eth0)
@@ -232,6 +233,48 @@ show_usage() {
     echo "  $0 --planner planner/custom.onnx --input-type keyboard real  # Use custom planner and input"
     echo "  $0 --motion-data reference/custom_motion/ sim  # Use custom motion data"
 }
+
+# ============================================================================
+# Robot selection:  --robot <g1|a3|a3_ultra|h2>   (default: g1)
+#   g1        - this script (TensorRT + Unitree SDK2 backend), behaviour unchanged
+#   a3        - AgiBot A3 AimRT backend (035 checkpoint), via scripts/deploy_a3.sh
+#   a3_ultra  - same A3 backend; A3 Ultra shares the A3 hardware platform and the
+#               035 contract (worklog #37/#40), so it uses the same package
+#   h2        - training/sim only for now; no C++ deploy backend yet
+# ============================================================================
+ROBOT="${GS_ROBOT:-g1}"
+_forward_args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --robot)
+            if [[ -z "${2:-}" ]]; then
+                echo -e "${RED}Error: --robot requires one of: g1 a3 a3_ultra h2${NC}" >&2
+                exit 1
+            fi
+            ROBOT="$2"; shift 2 ;;
+        --robot=*)
+            ROBOT="${1#--robot=}"; shift ;;
+        *)
+            _forward_args+=("$1"); shift ;;
+    esac
+done
+set -- "${_forward_args[@]+"${_forward_args[@]}"}"
+
+case "$ROBOT" in
+    g1) ;;
+    a3|a3_ultra)
+        exec "$SCRIPT_DIR/scripts/deploy_a3.sh" --robot "$ROBOT" "$@"
+        ;;
+    h2)
+        echo -e "${RED}Error: --robot $ROBOT has no C++ deploy backend yet (training/sim only).${NC}" >&2
+        echo "       Deployable robots: g1, a3, a3_ultra." >&2
+        exit 2
+        ;;
+    *)
+        echo -e "${RED}Error: unknown --robot '$ROBOT'. Choices: g1 a3 a3_ultra h2${NC}" >&2
+        exit 1
+        ;;
+esac
 
 # Default interface mode
 INTERFACE_MODE="real"

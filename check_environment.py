@@ -6,15 +6,20 @@ Run this before training or deployment to verify all prerequisites are met.
 Usage:
     python check_environment.py              # Check everything
     python check_environment.py --training   # Training checks only
-    python check_environment.py --deploy     # Deployment checks only
+    python check_environment.py --deploy     # Deployment checks + ONNX integrity
+    python check_environment.py --training --components pt  # Fine-tune weights
+    python check_environment.py --deploy --components rknn sysroot  # RKNN assets
 """
 
+import argparse
 import importlib
+import json
 import os
 import platform
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 
 def check(name, passed, msg_pass="", msg_fail=""):
@@ -29,12 +34,16 @@ def check_python(training=False):
     v = sys.version_info
     version_str = f"{v.major}.{v.minor}.{v.micro}"
     if training:
-        ok = v.major == 3 and v.minor == 11
+        # Isaac Sim 4.5 / Isaac Lab 2.1 (the public Forge c5862bd6 path) uses
+        # Python 3.10, while newer Isaac runtimes use Python 3.11.  Version
+        # compatibility with the simulator is checked by the environment guide;
+        # this generic preflight must not reject the supported 4.5 stack.
+        ok = v.major == 3 and v.minor in (10, 11)
         return check(
             "Python version",
             ok,
             msg_pass=version_str,
-            msg_fail=f"{version_str} (training requires 3.11.x — Isaac Lab requirement)",
+            msg_fail=f"{version_str} (training needs Python 3.10 or 3.11, matching Isaac Sim/Lab)",
         )
     else:
         ok = v.major == 3 and v.minor >= 10
@@ -46,25 +55,46 @@ def check_python(training=False):
         )
 
 
-def check_git_lfs():
-    lfs_installed = shutil.which("git-lfs") is not None
-    if not lfs_installed:
-        return check("Git LFS", False, msg_fail="not installed (sudo apt install git-lfs)")
+ROOT = Path(__file__).resolve().parent
 
-    # Check if LFS files are pulled (sample an actual LFS-tracked mesh file)
-    mesh_path = "gear_sonic/data/assets/robot_description/urdf/g1/meshes"
-    stl_files = [os.path.join(mesh_path, f) for f in os.listdir(mesh_path) if f.endswith(".STL")] if os.path.isdir(mesh_path) else []
-    sample_file = stl_files[0] if stl_files else "decoupled_wbc/sim2mujoco/resources/robots/g1/policy/GR00T-WholeBodyControl-Balance.onnx"
-    if os.path.exists(sample_file):
-        size = os.path.getsize(sample_file)
-        if size < 1000:
-            return check(
-                "Git LFS",
-                False,
-                msg_fail=f"{sample_file} is {size} bytes (LFS pointer — run 'git lfs pull')",
-            )
-        return check("Git LFS", True, msg_pass="installed, files pulled")
-    return check("Git LFS", True, msg_pass="installed")
+
+def check_git_lfs(root=ROOT):
+    if shutil.which("git-lfs") is None:
+        return check("Git LFS", False, msg_fail="not installed (sudo apt install git-lfs)")
+    result = subprocess.run(
+        ["git", "lfs", "ls-files", "--name-only"], cwd=root,
+        capture_output=True, text=True,
+    )
+    if result.returncode:
+        return check("Git LFS", False, msg_fail="cannot list LFS assets; run from a Git checkout")
+    invalid = []
+    for name in result.stdout.splitlines():
+        path = Path(root) / name
+        if not path.is_file() or path.stat().st_size == 0:
+            invalid.append(name)
+            continue
+        with path.open("rb") as stream:
+            if stream.read(43).startswith(b"version https://git-lfs.github.com/spec/v1"):
+                invalid.append(name)
+    return check("Git LFS", not invalid, msg_pass="all listed assets materialized",
+                 msg_fail="missing or unresolved assets: " + ", ".join(invalid[:5]) + "; run git lfs pull")
+
+
+def check_hf_artifacts(components, root=ROOT):
+    from download_from_hf import matches
+
+    if not components:
+        print("  [i] From-scratch training needs no pretrained weights; for fine-tuning, "
+              "add --components pt (download with python download_from_hf.py --component pt).")
+        return True
+    manifest = json.loads((Path(root) / "a3_hf_manifest.json").read_text())
+    selected = [entry for entry in manifest["files"] if entry["group"] in components]
+    invalid = [entry["destination"] for entry in selected
+               if not matches(Path(root) / entry["destination"], entry)]
+    return check("Hugging Face artifacts", bool(selected) and not invalid,
+                 msg_pass="selected artifacts pass size/SHA-256 checks",
+                 msg_fail="missing or corrupt: " + ", ".join(invalid[:5])
+                 + "; run python download_from_hf.py --component " + " ".join(components))
 
 
 def check_cuda():
@@ -180,11 +210,17 @@ def check_disk_space():
 
 
 def main():
-    mode = "all"
-    if "--training" in sys.argv:
-        mode = "training"
-    elif "--deploy" in sys.argv:
-        mode = "deploy"
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--training", action="store_true")
+    modes.add_argument("--deploy", action="store_true")
+    parser.add_argument("--components", nargs="+", choices=["pt", "onnx", "rknn", "sysroot"],
+                        help="HF artifacts to verify; training defaults to none, deploy to onnx, all to pt+onnx")
+    args = parser.parse_args()
+    mode = "training" if args.training else "deploy" if args.deploy else "all"
+    components = args.components if args.components is not None else {
+        "training": [], "deploy": ["onnx"], "all": ["pt", "onnx"]
+    }[mode]
 
     print(f"GR00T-WholeBodyControl Environment Check")
     print(f"Platform: {platform.system()} {platform.machine()}")
@@ -197,6 +233,7 @@ def main():
     print("Basic:")
     all_pass &= check_python(training=(mode in ("all", "training")))
     all_pass &= check_git_lfs()
+    all_pass &= check_hf_artifacts(components)
     all_pass &= check_cuda()
     all_pass &= check_torch()
     all_pass &= check_disk_space()

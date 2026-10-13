@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import time
+
 import hydra
 from loguru import logger
 import omegaconf
@@ -29,6 +30,7 @@ import wandb
 import yaml
 
 from gear_sonic.trl.callbacks import im_eval_callback
+from gear_sonic.trl.utils import logger_utils
 from gear_sonic.utils import config_utils
 
 config_utils.register_rl_resolvers()
@@ -46,6 +48,10 @@ class CheckpointEvaluator:
         self.evaluation_timeout = config.get("evaluation_timeout", 24 * 3600)
         self.eval_frequency = config.get("eval_frequency", None)
         self.eval_last_n = config.get("eval_last_n", None)
+        self.train_config = {}
+        self.tensorboard_enabled = False
+        self.tensorboard_log_dir = self.experiment_dir / "tensorboard"
+        self.tensorboard_state_file = self.tensorboard_log_dir / "eval_logged_steps.json"
 
         if not self.experiment_dir.exists():
             raise ValueError(f"Experiment directory does not exist: {self.experiment_dir}")
@@ -55,15 +61,18 @@ class CheckpointEvaluator:
         self.wandb_run_id = None
         self.wandb_project = None
         self.wandb_entity = None
-        self._load_wandb_config()
+        self._load_logger_config()
 
         logger.info(f"Monitoring experiment directory: {self.experiment_dir}")
         logger.info(f"Scan interval: {config.scan_interval} seconds")
         logger.info(f"Evaluation timeout: {self.evaluation_timeout / 3600:.1f} hours")
         if self.wandb_run_id:
             logger.info(f"Wandb logging enabled: run_id={self.wandb_run_id}")
+        if self.tensorboard_enabled:
+            logger.info(f"TensorBoard eval logging enabled: log_dir={self.tensorboard_log_dir}")
 
         self._backfill_wandb()
+        self._backfill_tensorboard()
 
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -72,12 +81,12 @@ class CheckpointEvaluator:
         logger.info("Received shutdown signal. Stopping checkpoint monitoring...")
         self.shutdown_flag = True
 
-    def _load_wandb_config(self):
+    def _load_logger_config(self):
         meta_path = self.experiment_dir / "meta.yaml"
         if meta_path.exists():
             with open(meta_path) as f:
                 meta = yaml.safe_load(f)
-            self.wandb_run_id = meta.get("wandb_run")
+            self.wandb_run_id = meta.get("wandb_run") if meta else None
 
         config_path = self.experiment_dir / ".hydra" / "config.yaml"
         if not config_path.exists():
@@ -85,17 +94,38 @@ class CheckpointEvaluator:
         if config_path.exists():
             try:
                 with open(config_path) as f:
-                    train_config = yaml.safe_load(f)
-                wandb_cfg = train_config.get("wandb", {})
-                self.wandb_project = train_config.get("project_name", "TRL_G1_Track")
+                    self.train_config = yaml.safe_load(f) or {}
+                wandb_cfg = self.train_config.get("wandb", {})
+                self.wandb_project = self.train_config.get("project_name", "TRL_G1_Track")
                 self.wandb_entity = wandb_cfg.get("wandb_entity", None)
+                trl_cfg = self.train_config.get("algo", {}).get("trl", {})
+                self.tensorboard_enabled = logger_utils.report_to_contains(
+                    trl_cfg.get("report_to", None), "tensorboard"
+                )
+                self.tensorboard_log_dir = self._resolve_tensorboard_log_dir(
+                    trl_cfg.get("logging_dir", None)
+                )
+                self.tensorboard_state_file = (
+                    self.tensorboard_log_dir / "eval_logged_steps.json"
+                )
             except Exception as e:  # noqa: BLE001
-                logger.warning(f"Could not load training config for wandb: {e}")
+                logger.warning(f"Could not load training config for logger setup: {e}")
 
         if self.wandb_project is None:
             self.wandb_project = "TRL_G1_Track"
         if self.wandb_entity is None:
             self.wandb_entity = None  # uses wandb default entity
+
+    def _resolve_tensorboard_log_dir(self, logging_dir: str | None) -> Path:
+        if not logging_dir:
+            return self.experiment_dir / "tensorboard"
+        log_dir = str(logging_dir).replace("${experiment_dir}", str(self.experiment_dir))
+        if "${" in log_dir:
+            return self.experiment_dir / "tensorboard"
+        path = Path(log_dir)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return path
 
     def _get_wandb_logged_steps(self) -> set[int]:
         logged_steps = set()
@@ -122,7 +152,7 @@ class CheckpointEvaluator:
 
     def _backfill_wandb(self):
         if not self.wandb_run_id:
-            self._load_wandb_config()
+            self._load_logger_config()
             if not self.wandb_run_id:
                 logger.info("No wandb run ID available, skipping backfill")
                 return
@@ -161,9 +191,66 @@ class CheckpointEvaluator:
 
         logger.info("Backfill complete")
 
+    def _get_tensorboard_logged_steps(self) -> set[int]:
+        if not self.tensorboard_state_file.exists():
+            return set()
+        try:
+            with open(self.tensorboard_state_file) as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return {int(step) for step in data}
+            return {int(step) for step in data.get("logged_steps", [])}
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Could not read TensorBoard eval state: {e}")
+            return set()
+
+    def _save_tensorboard_logged_steps(self, logged_steps: set[int]):
+        self.tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
+        data = {"logged_steps": sorted(logged_steps)}
+        with open(self.tensorboard_state_file, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def _backfill_tensorboard(self):
+        if not self.tensorboard_enabled:
+            return
+
+        eval_dir = self.experiment_dir / "eval"
+        if not eval_dir.exists():
+            return
+
+        completed_steps = []
+        for eval_subdir in sorted(eval_dir.iterdir()):
+            if not eval_subdir.is_dir():
+                continue
+            try:
+                step_num = int(eval_subdir.name)
+            except ValueError:
+                continue
+            if (eval_subdir / "all_eval_finish.txt").exists():
+                completed_steps.append((step_num, str(eval_subdir)))
+
+        logged_steps = self._get_tensorboard_logged_steps()
+        missing = [(step, path) for step, path in completed_steps if step not in logged_steps]
+        if not missing:
+            if completed_steps:
+                logger.info(
+                    f"All {len(completed_steps)} completed eval steps already logged to TensorBoard"
+                )
+            return
+
+        logger.info(f"Backfilling {len(missing)}/{len(completed_steps)} eval steps to TensorBoard")
+        for eval_step, checkpoint_work_dir in missing:
+            self._log_eval_to_tensorboard(eval_step, checkpoint_work_dir)
+
+        logger.info("TensorBoard backfill complete")
+
+    def _log_eval_results(self, eval_step: int, checkpoint_work_dir: str):
+        self._log_eval_to_wandb(eval_step, checkpoint_work_dir)
+        self._log_eval_to_tensorboard(eval_step, checkpoint_work_dir)
+
     def _log_eval_to_wandb(self, eval_step: int, checkpoint_work_dir: str):
         if not self.wandb_run_id:
-            self._load_wandb_config()
+            self._load_logger_config()
             if not self.wandb_run_id:
                 logger.warning("No wandb run ID found, skipping wandb logging")
                 return
@@ -219,7 +306,66 @@ class CheckpointEvaluator:
             except Exception as e:  # noqa: BLE001
                 logger.error(f"Error finishing wandb: {e}")
 
-    def _load_metrics(self, eval_step: int, metrics_file: Path) -> dict | None:
+    def _log_eval_to_tensorboard(self, eval_step: int, checkpoint_work_dir: str):
+        if not self.tensorboard_enabled:
+            return
+
+        logged_steps = self._get_tensorboard_logged_steps()
+        if eval_step in logged_steps:
+            logger.info(f"Eval step {eval_step} already logged to TensorBoard, skipping")
+            return
+
+        eval_dir = Path(checkpoint_work_dir)
+        if not eval_dir.exists():
+            return
+
+        writer = None
+        wrote_anything = False
+        try:
+            writer = logger_utils.create_summary_writer(self.tensorboard_log_dir)
+            writer.add_scalar("eval_step", eval_step, eval_step)
+
+            for subdir in sorted(eval_dir.iterdir()):
+                if not subdir.is_dir():
+                    continue
+
+                try:
+                    metrics_file = subdir / "metrics_eval.json"
+                    metrics_finish = subdir / "metrics_finish.txt"
+                    if metrics_finish.exists() and metrics_file.exists():
+                        wrote_anything = (
+                            self._log_metrics_to_tensorboard(writer, eval_step, metrics_file)
+                            or wrote_anything
+                        )
+
+                    render_finish = subdir / "render_finish.txt"
+                    video_dir = subdir / "render_results"
+                    if render_finish.exists() and video_dir.exists():
+                        wrote_anything = (
+                            self._log_videos_to_tensorboard(
+                                writer, eval_step, metrics_file, video_dir
+                            )
+                            or wrote_anything
+                        )
+                except Exception as subdir_e:  # noqa: BLE001
+                    logger.error(
+                        f"Failed to log subdir {subdir.name} to TensorBoard for step {eval_step}: {subdir_e}"
+                    )
+
+            if wrote_anything:
+                writer.flush()
+                logged_steps.add(eval_step)
+                self._save_tensorboard_logged_steps(logged_steps)
+                logger.info(f"Logged eval results to TensorBoard for step {eval_step}")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Failed to log to TensorBoard for step {eval_step}: {e}")
+        finally:
+            if writer is not None:
+                writer.close()
+
+    def _load_metrics(
+        self, eval_step: int, metrics_file: Path, table_format: str = "wandb"
+    ) -> dict | None:
         try:
             with open(metrics_file) as f:
                 metrics_eval = json.load(f)
@@ -237,11 +383,11 @@ class CheckpointEvaluator:
                 f"Skipping per-motion dicts for {metrics_file.parent.name} ({file_size_mb:.0f} MB > 20 MB)"
             )
         else:
-            if "eval/all_metrics_dict" in metrics_eval:
+            if table_format == "wandb" and "eval/all_metrics_dict" in metrics_eval:
                 metrics_eval["eval/all_metrics_dict"] = im_eval_callback.create_html_table(
                     metrics_eval["eval/all_metrics_dict"]
                 )
-            if "eval/failed_metrics_dict" in metrics_eval:
+            if table_format == "wandb" and "eval/failed_metrics_dict" in metrics_eval:
                 metrics_eval["eval/failed_metrics_dict"] = im_eval_callback.create_html_table(
                     metrics_eval["eval/failed_metrics_dict"]
                 )
@@ -261,6 +407,13 @@ class CheckpointEvaluator:
         metrics = self._load_metrics(eval_step, metrics_file)
         if metrics:
             wandb.log(metrics)
+
+    def _log_metrics_to_tensorboard(self, writer, eval_step: int, metrics_file: Path) -> bool:
+        metrics = self._load_metrics(eval_step, metrics_file, table_format="tensorboard")
+        if not metrics:
+            return False
+        logger_utils.write_tensorboard_values(writer, metrics, eval_step)
+        return True
 
     def _log_videos(self, eval_step: int, metrics_file: Path, video_dir: Path):
         if not video_dir.exists():
@@ -293,6 +446,37 @@ class CheckpointEvaluator:
         }
         wandb_videos["eval_step"] = eval_step
         wandb.log(wandb_videos)
+
+    def _log_videos_to_tensorboard(
+        self, writer, eval_step: int, metrics_file: Path, video_dir: Path
+    ) -> bool:
+        if not video_dir.exists():
+            return False
+
+        log_keys = None
+        if metrics_file.exists():
+            try:
+                with open(metrics_file) as f:
+                    metrics = json.load(f)
+                    log_keys = metrics.get("log_keys")
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"Error getting log_keys from metrics file: {e}")
+
+        video_files = sorted(
+            [
+                (i, f)
+                for i, f in enumerate(sorted(video_dir.iterdir()))
+                if f.is_file() and f.name.endswith(".mp4")
+            ]
+        )
+        if not video_files:
+            return False
+
+        prefix = f"videos_hard_{log_keys}" if log_keys else "videos_hard"
+        for i, video_file in reversed(video_files):
+            logger_utils.add_video_or_text(writer, f"{prefix}/{i:04d}", video_file, eval_step)
+        writer.flush()
+        return True
 
     def find_evaluated_checkpoints(self):
         """Find all checkpoints that have been successfully evaluated."""
@@ -562,12 +746,12 @@ class CheckpointEvaluator:
                             os.path.join(checkpoint_work_dir, "all_eval_finish.txt"), "w"
                         ) as f:
                             f.write("all_eval_finish")
-                        self._log_eval_to_wandb(eval_step, checkpoint_work_dir)
+                        self._log_eval_results(eval_step, checkpoint_work_dir)
                     elif metrics_success:
                         logger.warning(
-                            f"Render failed for step {eval_step}, logging metrics-only to W&B"
+                            f"Render failed for step {eval_step}, logging metrics-only to configured loggers"
                         )
-                        self._log_eval_to_wandb(eval_step, checkpoint_work_dir)
+                        self._log_eval_results(eval_step, checkpoint_work_dir)
 
                     if success:
                         self.evaluated_checkpoints.add(str(checkpoint))

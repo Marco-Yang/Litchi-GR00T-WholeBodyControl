@@ -557,6 +557,73 @@ class G1ReconLoss(nn.Module):
         return _compute_masked_loss(g1_motion_output_pred, g1_motion_output, mask, self.loss_type)
 
 
+class A3FastReconLoss(nn.Module):
+    """Reconstruct the valid A3-fast reference frames from its quantized tokens.
+
+    The A3-fast encoder keeps a ten-slot input tensor for deploy compatibility,
+    but experiment 020 only populates the first five slots (0--80 ms) and zeros
+    the rest.  This loss supervises exactly those valid slots.  It intentionally
+    reuses ``g1_kin`` as the auxiliary reconstruction head; the head's remaining
+    temporal outputs are excluded from the loss.
+    """
+
+    target_keys = (
+        "command_multi_future_a3_fast_nonflat",
+        "motion_anchor_ori_a3_fast_b_mf_nonflat",
+    )
+    prediction_keys = (
+        "command_multi_future_nonflat",
+        "motion_anchor_ori_b_mf_nonflat",
+    )
+
+    def __init__(
+        self,
+        loss_type="mse",
+        valid_future_frames=5,
+        decoder_name="g1_kin",
+        **kwargs,  # noqa: ARG002
+    ):
+        super().__init__()
+        self.loss_type = loss_type
+        self.valid_future_frames = int(valid_future_frames)
+        self.decoder_name = decoder_name
+        if self.valid_future_frames <= 0:
+            raise ValueError("valid_future_frames must be positive")
+
+    def forward(self, loss_inputs):
+        tokenizer_obs = loss_inputs["tokenizer_obs"]
+        decoded_output = loss_inputs["decoded_outputs"][self.decoder_name]
+        num_frames = self.valid_future_frames
+
+        target_parts = []
+        prediction_parts = []
+        for target_key, prediction_key in zip(
+            self.target_keys, self.prediction_keys, strict=True
+        ):
+            target = tokenizer_obs[target_key]
+            prediction = decoded_output[prediction_key]
+            if target.shape[-2] < num_frames or prediction.shape[-2] < num_frames:
+                raise ValueError(
+                    "A3-fast reconstruction requires at least "
+                    f"{num_frames} frames, got target={target.shape[-2]} "
+                    f"and prediction={prediction.shape[-2]} for {target_key}"
+                )
+            if (
+                target.shape[:-2] != prediction.shape[:-2]
+                or target.shape[-1] != prediction.shape[-1]
+            ):
+                raise ValueError(
+                    f"A3-fast reconstruction shape mismatch for {target_key}: "
+                    f"target={tuple(target.shape)}, prediction={tuple(prediction.shape)}"
+                )
+            target_parts.append(target[..., :num_frames, :])
+            prediction_parts.append(prediction[..., :num_frames, :])
+
+        target = torch.cat(target_parts, dim=-1)
+        prediction = torch.cat(prediction_parts, dim=-1)
+        return _compute_masked_loss(prediction, target, mask=None, loss_type=self.loss_type)
+
+
 class G1ReconLossAligned(G1ReconLoss):
     """Same as G1ReconLoss but uses a single key list for target and pred so that
     encoder input = g1_kin output = loss. Expects loss_inputs["recon_target_keys"].
@@ -624,6 +691,109 @@ class G1SmplLatentLoss(nn.Module):
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
 
         return loss
+
+
+class A3FastG1LatentLoss(nn.Module):
+    """Loss that compares A3-fast student latents with matching G1 teacher latents."""
+
+    def __init__(self, loss_type="mse", **kwargs):  # noqa: ARG002
+        super().__init__()
+        self.loss_type = loss_type
+
+    def forward(self, loss_inputs):
+        paired_latents = loss_inputs.get("paired_g1_a3_fast_latents", None)
+        if paired_latents is not None:
+            g1_latents_matched = paired_latents["g1"]
+            a3_fast_latents_matched = paired_latents["a3_fast"]
+            if g1_latents_matched.shape[0] == 0:
+                return zero_loss(g1_latents_matched.device)
+            assert g1_latents_matched.shape == a3_fast_latents_matched.shape, (
+                f"Shape mismatch: g1_matched={g1_latents_matched.shape}, "
+                f"a3_fast_matched={a3_fast_latents_matched.shape}."
+            )
+            return compute_loss(a3_fast_latents_matched, g1_latents_matched, self.loss_type)
+
+        encoded_latents = loss_inputs["encoded_latents"]
+        encoder_masks = loss_inputs["encoder_masks"]
+
+        if "g1" not in encoded_latents or "a3_fast" not in encoded_latents:
+            return zero_loss(_get_device_from_loss_inputs(loss_inputs))
+        if "g1_has_a3_fast" not in encoder_masks:
+            return zero_loss(_get_device_from_loss_inputs(loss_inputs))
+
+        g1_latents = encoded_latents["g1"]
+        a3_fast_latents = encoded_latents["a3_fast"]
+
+        g1_latents_matched = g1_latents[encoder_masks["g1_has_a3_fast"]]
+        if "a3_fast_has_g1" in encoder_masks:
+            a3_fast_latents_matched = a3_fast_latents[encoder_masks["a3_fast_has_g1"]]
+        else:
+            a3_fast_latents_matched = a3_fast_latents
+
+        if g1_latents_matched.shape[0] == 0:
+            return zero_loss(g1_latents.device)
+        assert g1_latents_matched.shape == a3_fast_latents_matched.shape, (
+            f"Shape mismatch: g1_matched={g1_latents_matched.shape}, "
+            f"a3_fast_matched={a3_fast_latents_matched.shape}. Ensure g1 and a3_fast "
+            "are co-activated for paired latent alignment."
+        )
+
+        return compute_loss(a3_fast_latents_matched, g1_latents_matched, self.loss_type)
+
+
+class TeleopA3FastLatentLoss(nn.Module):
+    """Backward-compatible teleop/A3-fast latent alignment loss.
+
+    Some older A3-fast checkpoints reference this class in their saved Hydra
+    config.  Current configs no longer use it, but eval/export still
+    instantiates the aux-loss modules before loading weights.
+    """
+
+    def __init__(self, loss_type="mse", **kwargs):  # noqa: ARG002
+        super().__init__()
+        self.loss_type = loss_type
+
+    def forward(self, loss_inputs):
+        paired_latents = loss_inputs.get("paired_teleop_a3_fast_latents", None)
+        if paired_latents is not None:
+            teleop_latents_matched = paired_latents["teleop"]
+            a3_fast_latents_matched = paired_latents["a3_fast"]
+            if teleop_latents_matched.shape[0] == 0:
+                return zero_loss(teleop_latents_matched.device)
+            assert teleop_latents_matched.shape == a3_fast_latents_matched.shape, (
+                f"Shape mismatch: teleop_matched={teleop_latents_matched.shape}, "
+                f"a3_fast_matched={a3_fast_latents_matched.shape}."
+            )
+            return compute_loss(a3_fast_latents_matched, teleop_latents_matched, self.loss_type)
+
+        encoded_latents = loss_inputs.get("encoded_latents", {})
+        encoder_masks = loss_inputs.get("encoder_masks", {})
+        if "teleop" not in encoded_latents or "a3_fast" not in encoded_latents:
+            return zero_loss(_get_device_from_loss_inputs(loss_inputs))
+
+        teleop_latents = encoded_latents["teleop"]
+        a3_fast_latents = encoded_latents["a3_fast"]
+        teleop_mask = encoder_masks.get("teleop")
+        a3_fast_mask = encoder_masks.get("a3_fast")
+
+        if teleop_mask is None or a3_fast_mask is None:
+            if teleop_latents.shape[0] == 0 or teleop_latents.shape != a3_fast_latents.shape:
+                return zero_loss(teleop_latents.device)
+            return compute_loss(a3_fast_latents, teleop_latents, self.loss_type)
+
+        shared_mask = teleop_mask & a3_fast_mask
+        if not bool(shared_mask.any().item()):
+            return zero_loss(teleop_latents.device)
+
+        teleop_latents_matched = teleop_latents[a3_fast_mask[teleop_mask]]
+        a3_fast_latents_matched = a3_fast_latents[teleop_mask[a3_fast_mask]]
+        assert teleop_latents_matched.shape == a3_fast_latents_matched.shape, (
+            f"Shape mismatch: teleop_matched={teleop_latents_matched.shape}, "
+            f"a3_fast_matched={a3_fast_latents_matched.shape}. Ensure teleop and "
+            "a3_fast are co-activated for paired latent alignment."
+        )
+
+        return compute_loss(a3_fast_latents_matched, teleop_latents_matched, self.loss_type)
 
 
 class TeleopSmplLatentLoss(nn.Module):
@@ -809,6 +979,30 @@ class ReencodedSmplG1LatentLoss(nn.Module):
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
 
         return loss
+
+
+class ReencodedA3FastG1LatentLoss(nn.Module):
+    """Cycle loss for A3-fast samples decoded to G1 motion and re-encoded by G1."""
+
+    def __init__(self, loss_type="mse", **kwargs):  # noqa: ARG002
+        super().__init__()
+        self.loss_type = loss_type
+
+    def forward(self, loss_inputs):
+        reencoded_latents = loss_inputs.get("reencoded_a3_fast_g1_latents", None)
+        g1_latents_matched = loss_inputs.get("original_g1_latents_for_a3_fast_reencode", None)
+
+        if reencoded_latents is None or g1_latents_matched is None:
+            return zero_loss(_get_device_from_loss_inputs(loss_inputs))
+
+        if g1_latents_matched.shape[0] == 0:
+            return zero_loss(g1_latents_matched.device)
+        assert reencoded_latents.shape == g1_latents_matched.shape, (
+            f"Shape mismatch: reencoded={reencoded_latents.shape}, "
+            f"g1_matched={g1_latents_matched.shape}."
+        )
+
+        return compute_loss(reencoded_latents, g1_latents_matched, self.loss_type)
 
 
 # =============================================================================

@@ -1,4 +1,6 @@
 import copy
+import csv
+import json
 import os
 from pathlib import Path
 import shutil
@@ -73,6 +75,10 @@ class ModelSaveCallback(TrainerCallback):
                     args,
                     f"{self.save_dir}/model_step_{state.global_step:06d}.pt",
                 )
+                if hasattr(env, "get_adaptive_sampling_report"):
+                    report = env.get_adaptive_sampling_report()
+                    if report is not None:
+                        self.save_adaptive_sampling_report(report, state.global_step)
 
             # Always save last checkpoint every 50 steps
             if state.global_step % self.save_last_frequency == 0:
@@ -87,6 +93,36 @@ class ModelSaveCallback(TrainerCallback):
                     f"{self.save_dir}/last.pt",
                 )
                 # self.export_policy_to_onnx(env, state, model)
+
+    def save_adaptive_sampling_report(self, report, global_step):
+        report_dir = self.save_dir / "adaptive_sampling_stats"
+        report_dir.mkdir(parents=True, exist_ok=True)
+
+        rows = report.get("rows", [])
+        motions = report.get("motions", [])
+        summary = dict(report.get("summary", {}))
+        summary["global_step"] = int(global_step)
+
+        bins_path = report_dir / f"adaptive_sampling_bins_step_{global_step:06d}.csv"
+        motions_path = report_dir / f"adaptive_sampling_motions_step_{global_step:06d}.csv"
+        summary_path = report_dir / f"adaptive_sampling_summary_step_{global_step:06d}.json"
+
+        if rows:
+            with bins_path.open("w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
+
+        if motions:
+            with motions_path.open("w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(motions[0].keys()))
+                writer.writeheader()
+                writer.writerows(motions)
+
+        with summary_path.open("w") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+
+        logger.info(f"Saved adaptive sampling report to {report_dir} at step {global_step}")
 
     def get_example_obs(self, env):
         obs_dict = copy.deepcopy(env.obs_buf_dict)

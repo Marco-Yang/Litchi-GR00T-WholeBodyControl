@@ -80,6 +80,9 @@ class PolicyAndValueWrapper(nn.Module):
         super().__init__()
         self.policy = policy
         self.value_model = value_model
+        self.sample_actions_in_policy_update = bool(
+            kwargs.pop("sample_actions_in_policy_update", True)
+        )
         if "disc_model" in kwargs:
             self.disc_model = kwargs["disc_model"]
 
@@ -155,7 +158,14 @@ class PolicyAndValueWrapper(nn.Module):
             Dict of component outputs (keys vary by mode).
         """
         if mode == "policy":
-            self.policy.act(**kwargs)
+            if self.sample_actions_in_policy_update:
+                self.policy.act(**kwargs)
+            else:
+                # PPO evaluates log-probabilities for stored rollout actions;
+                # the freshly sampled action from ``act`` is discarded.
+                # Build the identical training distribution without consuming
+                # random numbers or launching an unused Normal sample kernel.
+                self.policy.update_distribution(is_training=True, **kwargs)
             log_probs = self.policy.get_actions_log_prob(actions=actions)
             results = {
                 "logprobs": log_probs,
@@ -305,18 +315,29 @@ def process_ep_infos(ep_infos, device):
     """
     infos = {}
     for key in ep_infos[0]:
-        # Buffer tensors in Python and concatenate once to avoid filling allocator buckets with mismatched sizes.
         values = []
         for ep_info in ep_infos:
-            v = ep_info[key]
-            if not isinstance(v, torch.Tensor):
-                v = torch.tensor([v], device=device)
-            else:
-                if v.dim() == 0: v = v.unsqueeze(0)
-                if v.device != device: v = v.to(device)
-            values.append(v)
-        infos[key] = torch.cat(values).mean()
+            # handle scalar and zero dimensional tensor infos
+            value = ep_info[key]
+            if not isinstance(value, torch.Tensor):
+                value = torch.tensor([value], dtype=torch.float32)
+            elif value.ndim == 0:
+                value = value.unsqueeze(0)
+            values.append(value.to(device))
+        # Include the legacy float32 seed in the one concatenation so PyTorch's
+        # dtype promotion remains exact (including preserving float64 inputs).
+        infotensor = torch.cat([torch.empty(0, device=device), *values])
+        value = torch.mean(infotensor)
+        infos[key] = value
     return infos
+
+
+def _compact_completed_episode_stats(reward_snapshots, length_snapshots, masks):
+    """Compact dense per-step episode snapshots once at rollout end."""
+    completed_mask = torch.cat(masks, dim=0)
+    reward_sums = torch.cat(reward_snapshots, dim=0)[completed_mask].unsqueeze(1)
+    episode_lengths = torch.cat(length_snapshots, dim=0)[completed_mask].unsqueeze(1)
+    return reward_sums, episode_lengths
 
 
 class TRLPPOTrainer(PPOTrainer):  # noqa: F405
@@ -552,9 +573,11 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             args.total_episodes / args.batch_size
         )  # we may train for more than `total_episodes`
         time_tensor = torch.tensor(int(time.time()), device=accelerator.device)
-        time_int = accelerate_utils.broadcast(
-            time_tensor, 0
-        ).item()  # avoid different timestamps across processes
+        time_int = common.distributed_stage(
+            "trainer_timestamp_broadcast",
+            lambda: accelerate_utils.broadcast(time_tensor, 0).item(),
+            accelerator=accelerator,
+        )  # avoid different timestamps across processes
         args.run_name = f"{args.exp_name}__{args.seed}__{time_int}"
         self.local_seed = local_seed
         if args.num_sample_generations > 0:
@@ -575,11 +598,18 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             addition_models["reward_model"] = kwargs["reward_model"]
         if "disc_model" in kwargs:
             addition_models["disc_model"] = kwargs["disc_model"]
+        addition_models["sample_actions_in_policy_update"] = self.config.get(
+            "sample_actions_in_policy_update", True
+        )
 
         self.model = PolicyAndValueWrapper(self.policy_model, self.value_model, **addition_models)
         # self.model.config = self.policy_model.config  # needed for pushing to hub
-        self.create_optimizer_and_scheduler(
-            num_training_steps=args.num_total_batches
+        common.distributed_stage(
+            "create_optimizer_and_scheduler",
+            lambda: self.create_optimizer_and_scheduler(
+                num_training_steps=args.num_total_batches
+            ),
+            accelerator=accelerator,
         )  # note that we are calling `self.lr_scheduler.step()` manually only at the batch level
 
         #########
@@ -646,8 +676,10 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
         torch.manual_seed(args.seed)
 
-        self.model, self.optimizer, self.dataloader = accelerator.prepare(
-            self.model, self.optimizer, self.dataloader
+        self.model, self.optimizer, self.dataloader = common.distributed_stage(
+            "accelerator_prepare",
+            lambda: accelerator.prepare(self.model, self.optimizer, self.dataloader),
+            accelerator=accelerator,
         )
         self.unwrapped_model = unwrap_model(self.model)  # noqa: F405
         torch.manual_seed(self.local_seed)  # reset the local seed again
@@ -732,7 +764,44 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         self.num_steps_per_env = self.config.num_steps_per_env
         self.use_padding_mask = self.config.get("use_padding_mask", False)
         self.ppo_shuffle_every_epoch = self.config.get("ppo_shuffle_every_epoch", True)
+        benchmark_synchronized_timing = self.config.get("benchmark_synchronized_timing", False)
+        if isinstance(benchmark_synchronized_timing, str):
+            benchmark_synchronized_timing = benchmark_synchronized_timing.lower() in (
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            )
+        # This is deliberately opt-in: normal training keeps its existing
+        # asynchronous timing behavior, while a throughput benchmark can make
+        # rank-0 phase times represent the slowest rank at each boundary.
+        self.benchmark_synchronized_timing = bool(benchmark_synchronized_timing)
         self.empty_cache_every_n_ppo_epoch = self.config.get("empty_cache_every_n_ppo_epoch", -1)
+        adaptive_empty_cache_enabled = self.config.get("adaptive_empty_cache_enabled", False)
+        if isinstance(adaptive_empty_cache_enabled, str):
+            adaptive_empty_cache_enabled = adaptive_empty_cache_enabled.lower() in (
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            )
+        self.adaptive_empty_cache_enabled = bool(adaptive_empty_cache_enabled)
+        self.adaptive_empty_cache_reserved_frac = float(
+            self.config.get("adaptive_empty_cache_reserved_frac", 0.92)
+        )
+        self.adaptive_empty_cache_free_frac = float(
+            self.config.get("adaptive_empty_cache_free_frac", 0.08)
+        )
+        self.adaptive_empty_cache_min_reclaimable_mb = float(
+            self.config.get("adaptive_empty_cache_min_reclaimable_mb", 1024.0)
+        )
+        self.adaptive_empty_cache_cooldown_ppo_epochs = int(
+            self.config.get("adaptive_empty_cache_cooldown_ppo_epochs", 5)
+        )
+        self._adaptive_empty_cache_ppo_epoch_counter = 0
+        self._adaptive_empty_cache_last_epoch = -10**9
 
         self.entropy_coef = self.config.entropy_coef
         self.desired_kl = self.config.desired_kl
@@ -741,6 +810,9 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         self.adaptive_lr_min = self.config.get("adaptive_lr_min", 1e-5)
         self.adaptive_lr_max = self.config.get("adaptive_lr_max", 1e-2)
         self.sync_advantage_normalization = self.config.get("sync_advantage_normalization", True)
+        self.enable_loss_finite_diagnostics = bool(
+            self.config.get("enable_loss_finite_diagnostics", True)
+        )
         self.multi_critic_advantage_weights = self.config.get(
             "multi_critic_advantage_weights", None
         )
@@ -748,6 +820,100 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         self.compute_imgaug_bc_loss = self.config.get("compute_imgaug_bc_loss", False)
         self.imgaug_bc_loss_coef = self.config.get("imgaug_bc_loss_coef", 1.0)
         self.imgaug_bc_loss_fn = torch.nn.MSELoss()
+
+    def _align_benchmark_phase_start(self) -> None:
+        """Align ranks before an opt-in benchmark phase begins.
+
+        CUDA launches are asynchronous and a rank-local wall clock can hide a
+        slow DDP rank.  The public throughput benchmark finishes queued CUDA
+        work, aligns ranks, and starts each core phase after the boundary.  The
+        barrier itself is instrumentation rather than part of Collection or
+        Learning; durations are reduced to the slowest rank separately.
+        """
+        if not self.benchmark_synchronized_timing:
+            return
+        if self.accelerator.device.type == "cuda":
+            torch.cuda.synchronize(self.accelerator.device)
+        if self.accelerator.num_processes > 1:
+            self.accelerator.wait_for_everyone()
+        if self.accelerator.device.type == "cuda":
+            torch.cuda.synchronize(self.accelerator.device)
+
+    def _aggregate_benchmark_phase_durations(
+        self, collection_time: float, learn_time: float
+    ) -> tuple[float, float]:
+        """Return max per-rank core-phase durations in benchmark mode."""
+        if not self.benchmark_synchronized_timing or self.accelerator.num_processes <= 1:
+            return collection_time, learn_time
+        durations = torch.tensor(
+            [collection_time, learn_time],
+            device=self.accelerator.device,
+            dtype=torch.float64,
+        )
+        gathered = self.accelerator.gather(durations)
+        phase_max = gathered.reshape(self.accelerator.num_processes, 2).amax(dim=0)
+        return float(phase_max[0].item()), float(phase_max[1].item())
+
+    def _empty_cuda_cache(self, *, reason: str) -> None:
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(
+            f"[Rank {self.accelerator.process_index}]"
+            f" torch.cuda.empty_cache() reason={reason}",
+            flush=True,
+        )  # noqa: T201
+
+    def _maybe_adaptive_empty_cache(self, ppo_epoch_idx: int) -> None:
+        self._adaptive_empty_cache_ppo_epoch_counter += 1
+        if not self.adaptive_empty_cache_enabled:
+            return
+        if not torch.cuda.is_available() or self.accelerator.device.type != "cuda":
+            return
+
+        cooldown = max(1, self.adaptive_empty_cache_cooldown_ppo_epochs)
+        epoch_counter = self._adaptive_empty_cache_ppo_epoch_counter
+        if epoch_counter - self._adaptive_empty_cache_last_epoch < cooldown:
+            return
+
+        device = self.accelerator.device
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            reserved_bytes = torch.cuda.memory_reserved(device)
+            allocated_bytes = torch.cuda.memory_allocated(device)
+        except RuntimeError as err:
+            print(
+                f"[Rank {self.accelerator.process_index}] adaptive empty_cache check skipped: {err}",
+                flush=True,
+            )  # noqa: T201
+            return
+
+        if total_bytes <= 0:
+            return
+
+        reclaimable_bytes = max(0, reserved_bytes - allocated_bytes)
+        reserved_frac = reserved_bytes / total_bytes
+        free_frac = free_bytes / total_bytes
+        min_reclaimable_bytes = int(
+            self.adaptive_empty_cache_min_reclaimable_mb * 1024 * 1024
+        )
+        memory_pressure = (
+            reserved_frac >= self.adaptive_empty_cache_reserved_frac
+            or free_frac <= self.adaptive_empty_cache_free_frac
+        )
+
+        if not memory_pressure or reclaimable_bytes < min_reclaimable_bytes:
+            return
+
+        self._adaptive_empty_cache_last_epoch = epoch_counter
+        reason = (
+            f"adaptive ppo_epoch={ppo_epoch_idx + 1} global_epoch={epoch_counter} "
+            f"reserved={reserved_bytes / 1024**2:.0f}MiB "
+            f"allocated={allocated_bytes / 1024**2:.0f}MiB "
+            f"reclaimable={reclaimable_bytes / 1024**2:.0f}MiB "
+            f"free={free_bytes / 1024**2:.0f}MiB "
+            f"reserved_frac={reserved_frac:.3f} free_frac={free_frac:.3f}"
+        )
+        self._empty_cuda_cache(reason=reason)
 
     def _setup_storage(self):
         """Allocate rollout storage buffers and episode tracking accumulators.
@@ -906,6 +1072,9 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         self.storage.clear()
 
         dones = torch.zeros(self.env.num_envs, device=device)
+        completed_reward_sums = []
+        completed_episode_lengths = []
+        completed_episode_masks = []
         with torch.no_grad():
             for i in range(self.num_steps_per_env):  # noqa: B007
                 # Compute the actions and values
@@ -964,11 +1133,31 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 self._process_env_step(rewards, dones, infos)
                 self.cur_reward_sum += rewards_stored
                 self.cur_episode_length += 1
-                new_ids = (dones > 0).nonzero(as_tuple=False)
-                self.state.rewbuffer.extend(self.cur_reward_sum[new_ids].cpu().numpy().tolist())
-                self.state.lenbuffer.extend(self.cur_episode_length[new_ids].cpu().numpy().tolist())
-                self.cur_reward_sum[new_ids] = 0
-                self.cur_episode_length[new_ids] = 0
+                completed_mask = dones > 0
+                # CUDA ``nonzero`` must return a dynamic-size tensor to the
+                # host and therefore synchronizes every simulation step. Keep
+                # the tiny dense episode snapshots on-device and compact them
+                # once after the 24-step rollout instead.
+                completed_reward_sums.append(self.cur_reward_sum.clone())
+                completed_episode_lengths.append(self.cur_episode_length.clone())
+                completed_episode_masks.append(completed_mask)
+                self.cur_reward_sum.masked_fill_(completed_mask[:, None], 0)
+                self.cur_episode_length.masked_fill_(completed_mask, 0)
+
+            # Preserve step order, but transfer completed-episode statistics to
+            # the host once per rollout instead of synchronizing every step.
+            completed_reward_sums, completed_episode_lengths = (
+                _compact_completed_episode_stats(
+                    completed_reward_sums,
+                    completed_episode_lengths,
+                    completed_episode_masks,
+                )
+            )
+            if completed_reward_sums.numel() > 0:
+                self.state.rewbuffer.extend(completed_reward_sums.cpu().numpy().tolist())
+                self.state.lenbuffer.extend(
+                    completed_episode_lengths.cpu().numpy().tolist()
+                )
 
             policy_model.clear_rollout()
             # gc.collect()
@@ -1379,7 +1568,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 axis=-1,
             )
             local_kl_mean = torch.mean(kl)
-            kl_mean = self.accelerator.gather(local_kl_mean).mean()
+            kl_mean = self.accelerator.reduce(local_kl_mean, reduction="mean")
             self._adjust_learning_rate_based_on_kl(kl_mean, optimizer)
 
         # Forward a DDP model twice will cause the error: "one of the variables needed for gradient computation has been modified by an inplace operation"  # noqa: E501
@@ -1443,7 +1632,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         else:
             loss = pg_loss + args.vf_coef * vf_loss + self.entropy_coef * entropy_loss
 
-        if torch.isnan(loss) or torch.isinf(loss):
+        if self.enable_loss_finite_diagnostics and not torch.isfinite(loss).item():
             print(f"Invalid loss detected: {loss}")  # noqa: T201
             print(
                 f"Ratio stats: min={ratio.min()}, max={ratio.max()}, mean={ratio.mean()}"
@@ -1566,68 +1755,80 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             "mb_advantage"
         ].std()
 
-    def _get_train_metrics(self):
-        """Gather and aggregate training statistics from all processes.
-
-        Returns:
-            Dict of scalar metrics (approx KL, clip fractions, losses, entropy,
-            ratios, advantage stats) averaged across all GPUs and update steps.
-        """
-        metrics = {}
-
-        approxkl_avg = self.accelerator.gather_for_metrics(self.approxkl_stats).mean().item()
-
-        metrics["policy/approxkl_avg"] = approxkl_avg
-        metrics["policy/clipfrac_avg"] = (
-            self.accelerator.gather_for_metrics(self.pg_clipfrac_stats).mean().item()
-        )
-        metrics["loss/policy_avg"] = (
-            self.accelerator.gather_for_metrics(self.pg_loss_stats).mean().item()
-        )
+    def _get_train_metric_stats(self):
+        """Return tensors whose distributed summaries are logged each update."""
+        mean_stats = {
+            "policy/approxkl_avg": self.approxkl_stats,
+            "policy/clipfrac_avg": self.pg_clipfrac_stats,
+            "loss/policy_avg": self.pg_loss_stats,
+        }
         if self.compute_imgaug_bc_loss:
-            metrics["loss/imgaug_bc_avg"] = (
-                self.accelerator.gather_for_metrics(self.imgaug_bc_loss_stats).mean().item()
-            )
-            metrics["loss/weighted_imgaug_bc_avg"] = (
-                self.accelerator.gather_for_metrics(self.weighted_imgaug_bc_loss_stats)
-                .mean()
-                .item()
+            mean_stats["loss/imgaug_bc_avg"] = self.imgaug_bc_loss_stats
+            mean_stats["loss/weighted_imgaug_bc_avg"] = (
+                self.weighted_imgaug_bc_loss_stats
             )
         if self.use_symmetry:
-            metrics["loss/actor_sym"] = (
-                self.accelerator.gather_for_metrics(self.actor_sym_loss_stats).mean().item()
+            mean_stats.update(
+                {
+                    "loss/actor_sym": self.actor_sym_loss_stats,
+                    "loss/critic_sym": self.critic_sym_loss_stats,
+                    "loss/estimation": self.estimation_loss_stats,
+                    "loss/swap": self.swap_loss_stats,
+                }
             )
-            metrics["loss/critic_sym"] = (
-                self.accelerator.gather_for_metrics(self.critic_sym_loss_stats).mean().item()
-            )
-            metrics["loss/estimation"] = (
-                self.accelerator.gather_for_metrics(self.estimation_loss_stats).mean().item()
-            )
-            metrics["loss/swap"] = (
-                self.accelerator.gather_for_metrics(self.swap_loss_stats).mean().item()
-            )
-        metrics["loss/value_avg"] = (
-            self.accelerator.gather_for_metrics(self.vf_loss_stats).mean().item()
+        mean_stats.update(
+            {
+                "loss/value_avg": self.vf_loss_stats,
+                "loss/entropy_avg": self.entropy_stats,
+                "loss/weighted_ppo_loss_avg": self.weighted_ppo_loss_stats,
+                "val/clipfrac_avg": self.vf_clipfrac_stats,
+                "val/ratio": self.ratio_stats,
+                "val/advantage_mean": self.advantage_mean_stats,
+                "val/advantage_std": self.advantage_std_stats,
+            }
         )
-        metrics["loss/entropy_avg"] = (
-            self.accelerator.gather_for_metrics(self.entropy_stats).mean().item()
+        return mean_stats, {"val/ratio_var": self.ratio_stats}
+
+    def _reduce_train_metric_stats(self, mean_stats, variance_stats):
+        """Reduce all scalar metric summaries in one collective."""
+        mean_names = list(mean_stats)
+        variance_names = list(variance_stats)
+        all_tensors = [*mean_stats.values(), *variance_stats.values()]
+        if not all_tensors:
+            return {}
+
+        local_sums = torch.stack(
+            [tensor.to(torch.float64).sum() for tensor in all_tensors]
         )
-        metrics["loss/weighted_ppo_loss_avg"] = (
-            self.accelerator.gather_for_metrics(self.weighted_ppo_loss_stats).mean().item()
+        local_counts = local_sums.new_tensor(
+            [tensor.numel() for tensor in all_tensors]
         )
-        metrics["val/clipfrac_avg"] = (
-            self.accelerator.gather_for_metrics(self.vf_clipfrac_stats).mean().item()
+        variance_square_sums = torch.stack(
+            [tensor.to(torch.float64).square().sum() for tensor in variance_stats.values()]
         )
-        metrics["val/ratio"] = self.accelerator.gather_for_metrics(self.ratio_stats).mean().item()
-        metrics["val/ratio_var"] = (
-            self.accelerator.gather_for_metrics(self.ratio_stats).var().item()
+        num_mean_stats = len(mean_names)
+        reduced = self.accelerator.reduce(
+            torch.cat([local_sums, local_counts, variance_square_sums]),
+            reduction="sum",
         )
-        metrics["val/advantage_mean"] = (
-            self.accelerator.gather_for_metrics(self.advantage_mean_stats).mean().item()
-        )
-        metrics["val/advantage_std"] = (
-            self.accelerator.gather_for_metrics(self.advantage_std_stats).mean().item()
-        )
+        global_sums = reduced[: len(all_tensors)]
+        global_counts = reduced[len(all_tensors) : 2 * len(all_tensors)]
+        global_square_sums = reduced[2 * len(all_tensors) :]
+
+        mean_values = global_sums[:num_mean_stats] / global_counts[:num_mean_stats]
+        variance_sums = global_sums[num_mean_stats:]
+        variance_counts = global_counts[num_mean_stats:]
+        variance_numerators = (
+            global_square_sums - variance_sums.square() / variance_counts
+        ).clamp_min(0)
+        variance_values = variance_numerators / (variance_counts - 1)
+        values = torch.cat([mean_values, variance_values]).detach().cpu().tolist()
+        return dict(zip([*mean_names, *variance_names], values, strict=True))
+
+    def _get_train_metrics(self):
+        """Aggregate training statistics with one distributed collective."""
+        mean_stats, variance_stats = self._get_train_metric_stats()
+        metrics = self._reduce_train_metric_stats(mean_stats, variance_stats)
         metrics["objective/entropy"] = metrics["loss/entropy_avg"]
 
         return metrics
@@ -1643,6 +1844,13 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             5. Log metrics and invoke ``on_step_end`` callbacks (which handle
                checkpointing, evaluation, and early stopping).
         """
+        print(
+            "[DistributedStage] training_loop_enter "
+            f"global_rank={self.accelerator.process_index} "
+            f"local_rank={self.accelerator.local_process_index} "
+            f"world_size={self.accelerator.num_processes} pid={os.getpid()}",
+            flush=True,
+        )
         args = self.args
         accelerator = self.accelerator
         optimizer = self.optimizer
@@ -1663,6 +1871,12 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         start_time = time.time()
         self._register_stats_buffer()
         model.train()
+        if self.benchmark_synchronized_timing:
+            accelerator.print(
+                "[Benchmark] synchronized CUDA/DDP core-phase timing is enabled; "
+                "reported phase times are maxima across participating ranks.",
+                flush=True,
+            )
 
         # trainer state initialization
         self.state.max_steps = args.num_total_batches
@@ -1696,7 +1910,8 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             obs_dict[obs_key] = obs_dict[obs_key].to(device)
 
         for batch_idx in range(1, args.num_total_batches + 1):
-            batch_start_time = time.time()
+            self._align_benchmark_phase_start()
+            batch_start_time = time.perf_counter()
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)  # noqa: F841
 
@@ -1722,8 +1937,15 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 ) as model:
                     obs_dict = self._rollout_step(model, obs_dict)
 
-                end_collection_time = time.time()
-                collection_time = end_collection_time - batch_start_time
+                if self.benchmark_synchronized_timing and device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                collection_time = time.perf_counter() - batch_start_time
+                if self.benchmark_synchronized_timing:
+                    self._align_benchmark_phase_start()
+                    learn_start_time = time.perf_counter()
+                else:
+                    end_collection_time = time.perf_counter()
+                    collection_time = end_collection_time - batch_start_time
 
             with common.Timer("get_rollout_data"):
                 rollout_data = self._get_rollout_data(obs_keys=obs_dict.keys())
@@ -1811,10 +2033,14 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                         minibatch_idx += 1  # noqa: SIM113
                         # del everything and empty cache
                         # fmt: off
-                    # if self.empty_cache_every_n_ppo_epoch > 0 and (ppo_epoch_idx + 1) % self.empty_cache_every_n_ppo_epoch == 0:  # noqa: E501
-                    #     # print(f"Empty cache at ppo_epoch_idx {ppo_epoch_idx}")
-                    #     gc.collect()
-                    #     torch.cuda.empty_cache()
+                    fixed_empty_cache = (
+                        self.empty_cache_every_n_ppo_epoch > 0
+                        and (ppo_epoch_idx + 1) % self.empty_cache_every_n_ppo_epoch == 0
+                    )
+                    if fixed_empty_cache:
+                        self._empty_cuda_cache(reason=f"fixed ppo_epoch={ppo_epoch_idx + 1}")
+                    else:
+                        self._maybe_adaptive_empty_cache(ppo_epoch_idx)
             ######################################################### Sync Running Mean Std #########################################################  # noqa: E501
             with common.Timer("sync_running_mean_std"):
                 self.sync_running_mean_std()
@@ -1838,29 +2064,36 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             ######################################################### Sync Running Mean Std #########################################################  # noqa: E501
 
             with torch.no_grad():
-                learn_time = time.time() - end_collection_time
+                if self.benchmark_synchronized_timing:
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(device)
+                    learn_time = time.perf_counter() - learn_start_time
+                    collection_time, learn_time = self._aggregate_benchmark_phase_durations(
+                        collection_time, learn_time
+                    )
+                else:
+                    learn_time = time.perf_counter() - end_collection_time
                 eps = int(self.state.episode / (time.time() - start_time))
 
                 metrics = {}
                 train_metrics = self._get_train_metrics()
                 metrics.update(train_metrics)
                 metrics["eps"] = eps
-                metrics["objective/rewards"] = (
-                    self.accelerator.gather_for_metrics(
-                        torch.tensor(np.mean(np.array(self.state.rewbuffer).sum(axis=-1))).to(
-                            device
-                        )
-                    )
-                    .mean()
-                    .item()
+                local_objectives = torch.tensor(
+                    [
+                        np.mean(np.array(self.state.rewbuffer).sum(axis=-1)),
+                        np.mean(self.state.lenbuffer),
+                    ],
+                    device=device,
                 )
-                metrics["objective/length"] = (
-                    self.accelerator.gather_for_metrics(
-                        torch.tensor(np.mean(self.state.lenbuffer)).to(device)
-                    )
-                    .mean()
-                    .item()
+                objective_rewards, objective_length = (
+                    self.accelerator.reduce(local_objectives, reduction="mean")
+                    .detach()
+                    .cpu()
+                    .tolist()
                 )
+                metrics["objective/rewards"] = objective_rewards
+                metrics["objective/length"] = objective_length
                 metrics["lr"] = self.args.learning_rate
                 metrics["episode"] = self.state.episode
                 env_log_dict = self.episode_env_tensors.mean_and_clear()
@@ -1872,22 +2105,37 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 self.state.tot_time += collection_time + learn_time
                 self.state.epoch = self.state.episode / self.train_dataset_len  # used by self.log
                 self.state.global_step += 1
+                global_transitions_per_iteration = (
+                    self.num_steps_per_env * self.env.num_envs * accelerator.num_processes
+                )
+                fps = global_transitions_per_iteration / (collection_time + learn_time)
+                # Preserve the historical integer tag for normal training.  A
+                # synchronized benchmark needs fractional precision so small
+                # throughput changes remain visible in its JSON summary.
+                if not self.benchmark_synchronized_timing:
+                    fps = int(fps)
                 log_dict = {
                     "collection_time": collection_time,
                     "learn_time": learn_time,
                     "tot_timesteps": self.state.tot_timesteps,
                     "tot_time": self.state.tot_time,
                     "it": self.state.global_step,
-                    "fps": int(
-                        self.num_steps_per_env
-                        * self.env.num_envs
-                        * accelerator.num_processes
-                        / (collection_time + learn_time)
-                    ),
+                    "fps": fps,
                     "experiment_save_dir": self.args.output_dir,
                     "batch_idx": batch_idx,
                     "num_total_batches": args.num_total_batches,
                 }
+
+                if self.benchmark_synchronized_timing:
+                    accelerator.print(
+                        "[BenchmarkTiming] "
+                        f"iteration={self.state.global_step} "
+                        f"fps={log_dict['fps']:.3f} "
+                        f"collection_s={collection_time:.6f} "
+                        f"learning_s={learn_time:.6f} "
+                        f"iteration_s={collection_time + learn_time:.6f}",
+                        flush=True,
+                    )
 
                 for key, value in ep_infos.items():
                     log_dict[f"Episode/{key}"] = value
@@ -1905,6 +2153,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 metrics.update(env_log_dict)
                 metrics.update(log_dict)
 
+                metrics = self._prepare_log_metrics(metrics)
                 self.log(metrics)
                 self.ep_infos.clear()
 
@@ -1921,10 +2170,9 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             if self.control.should_training_stop:
                 break
 
-        if self.control.should_training_stop:
-            return
-
-        # HF trainer specifics
+        # Finalize callbacks even when the loop stopped at the configured
+        # iteration limit.  Returning here used to bypass TensorBoard/W&B
+        # shutdown hooks and could leave buffered metrics unwritten.
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
         if self.control.should_save:
             self._save_checkpoint(model, trial=None, metrics=None)
@@ -1975,6 +2223,19 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
     def append_to_log_dict(self, log_dict):
         """Hook for subclasses to inject additional entries into the per-iteration log dict."""
         pass
+
+    @staticmethod
+    def _prepare_log_metrics(metrics):
+        """Convert scalar tensor-like values to Python scalars before Trainer.log."""
+        log_metrics = {}
+        for key, value in metrics.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 1:
+                    value = value.detach().cpu().item()
+            elif isinstance(value, np.generic):
+                value = value.item()
+            log_metrics[key] = value
+        return log_metrics
 
     def _eval_mode(self):
         """Switch models and environment to evaluation mode."""
@@ -2051,17 +2312,6 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         """
         args = self.args
         model = self.model
-
-        # Check for NaN/Inf in gradients
-        for name, param in model.named_parameters():
-            if param.grad is not None and (
-                torch.isnan(param.grad).any() or torch.isinf(param.grad).any()
-            ):
-                print(  # noqa: T201
-                    f"[Rank {self.accelerator.process_index}] NaN/Inf grad in {name}, norm={param.grad.norm():.3e}"
-                )
-                self.optimizer.zero_grad()
-                return None
         grad_norm = None
         if args.max_grad_norm is not None and args.max_grad_norm > 0:
             # deepspeed does its own clipping
@@ -2091,7 +2341,80 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             else:
                 grad_norm = _grad_norm
 
+            # ``clip_grad_norm_`` already traverses every gradient and returns
+            # their pre-clipping global norm. Checking that single scalar avoids
+            # a Python truth-value synchronization for every parameter tensor.
+            gradients_finite = torch.isfinite(
+                torch.as_tensor(grad_norm, device=self.accelerator.device)
+            ).all()
+        else:
+            gradients = [
+                param.grad
+                for param in model.parameters()
+                if param.grad is not None
+            ]
+            grad_norm = (
+                torch.stack(
+                    [torch.norm(gradient.detach(), p=2) for gradient in gradients]
+                ).norm(p=2)
+                if gradients
+                else torch.zeros((), device=self.accelerator.device)
+            )
+            gradients_finite = torch.isfinite(grad_norm)
+
+        if not gradients_finite.item():
+            # Clipping with a non-finite global norm may propagate NaNs into
+            # otherwise-finite gradients, so a post-clip parameter scan cannot
+            # reliably identify the original source tensor. Report the global
+            # failure truthfully and discard the entire update.
+            diagnostic = (
+                f"non-finite global gradient norm: {grad_norm}"
+                if grad_norm is not None
+                else "non-finite gradient detected"
+            )
+            print(  # noqa: T201
+                f"[Rank {self.accelerator.process_index}] {diagnostic}"
+            )
+            self.optimizer.zero_grad()
+            return None
+
         return grad_norm
+
+    def _normalize_advantages(self, advantages):
+        """Normalize advantages locally or from distributed moments.
+
+        Synchronizing ``sum``, ``sum(x**2)`` and ``count`` is mathematically
+        sufficient and avoids all-gathering the full rollout from every rank.
+        The variance uses Bessel's correction to match ``torch.std``'s default.
+        """
+        reduction_dims = (0, 1)
+        if not self.sync_advantage_normalization:
+            return (advantages - advantages.mean(dim=reduction_dims, keepdim=True)) / (
+                advantages.std(dim=reduction_dims, keepdim=True) + 1.0e-8
+            )
+
+        # The communicated payload is only three scalars per critic. Compute
+        # moments in float64 to avoid cancellation in sum-of-squares variance.
+        moment_values = advantages.to(torch.float64)
+        local_sum = moment_values.sum(dim=reduction_dims, keepdim=True)
+        local_square_sum = moment_values.square().sum(
+            dim=reduction_dims, keepdim=True
+        )
+        local_count = torch.full_like(
+            local_sum, advantages.shape[0] * advantages.shape[1]
+        )
+        global_sum, global_square_sum, global_count = self.accelerator.reduce(
+            torch.stack([local_sum, local_square_sum, local_count]),
+            reduction="sum",
+        ).unbind(0)
+
+        mean = global_sum / global_count
+        variance = (
+            global_square_sum - global_sum.square() / global_count
+        ) / (global_count - 1).clamp_min(1)
+        mean = mean.to(advantages.dtype)
+        std = variance.clamp_min(0).sqrt().to(advantages.dtype)
+        return (advantages - mean) / (std + 1.0e-8)
 
     def _compute_returns(self, values, last_values, policy_state_dict):
         """Compute the returns and advantages for the given policy state.
@@ -2135,20 +2458,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
 
         # Compute and normalize the advantages
         advantages = returns - values
-        if self.sync_advantage_normalization:
-            # gather advantages from all processes before normalization
-            advantages = self.accelerator.gather(advantages)
-            advantages = (advantages - advantages.mean(dim=(0, 1), keepdim=True)) / (
-                advantages.std(dim=(0, 1), keepdim=True) + 1e-8
-            )
-            # ungather advantages
-            advantages = advantages.reshape(
-                self.accelerator.num_processes, -1, *advantages.shape[1:]
-            )[self.accelerator.process_index].to(device)
-        else:
-            advantages = (advantages - advantages.mean(dim=(0, 1), keepdim=True)) / (
-                advantages.std(dim=(0, 1), keepdim=True) + 1e-8
-            )
+        advantages = self._normalize_advantages(advantages)
         return returns, advantages
 
     def _adjust_learning_rate_based_on_kl(self, kl_mean, optimizer):
@@ -2165,6 +2475,11 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         """
         if self.desired_kl is None:
             return
+
+        if isinstance(kl_mean, torch.Tensor):
+            # LR mutation is host-side; synchronize the reduced scalar once
+            # instead of once per Python comparison below.
+            kl_mean = kl_mean.item()
 
         if kl_mean > self.desired_kl * 2.0:
             new_lr = max(self.adaptive_lr_min, self.args.learning_rate / 1.5)
@@ -2195,10 +2510,32 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
 
         # Load model state
         model = self.accelerator.unwrap_model(self.model)
+        policy_state_dict = None
         if "actor_model_state_dict" in checkpoint:
-            model.policy.load_state_dict(checkpoint["actor_model_state_dict"])
+            policy_state_dict = checkpoint["actor_model_state_dict"]
         elif "policy_state_dict" in checkpoint:
-            model.policy.load_state_dict(checkpoint["policy_state_dict"], strict=False)
+            policy_state_dict = checkpoint["policy_state_dict"]
+
+        if policy_state_dict is not None:
+            missing_keys, unexpected_keys = model.policy.load_state_dict(
+                policy_state_dict, strict=False
+            )
+            backbone = getattr(model.policy, "actor_module", None)
+            if backbone is None:
+                backbone = getattr(model.policy, "backbone", None)
+            if hasattr(backbone, "apply_encoder_init_from"):
+                backbone.apply_encoder_init_from(policy_state_dict.keys())
+            if missing_keys:
+                print(
+                    f"Policy checkpoint missing {len(missing_keys)} keys after non-strict load "
+                    f"(first 20): {missing_keys[:20]}. "
+                    "Keys covered by init_from_encoder may have been initialized above."
+                )  # noqa: T201
+            if unexpected_keys:
+                print(
+                    f"Policy checkpoint has {len(unexpected_keys)} unexpected keys "
+                    f"(first 20): {unexpected_keys[:20]}"
+                )  # noqa: T201
         if "value_state_dict" in checkpoint and model.value_model is not None:
             model.value_model.load_state_dict(checkpoint["value_state_dict"])
 

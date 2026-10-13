@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import copy
 import dataclasses
+import logging
 import os
 import re
 
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg, ViewerCfg
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import CameraCfg, ContactSensorCfg, FrameTransformerCfg, TiledCameraCfg
 import isaaclab.sim as sim_utils
@@ -16,8 +19,173 @@ import joblib
 import pxr
 
 from gear_sonic.envs.manager_env.mdp import terrain
-from gear_sonic.envs.manager_env.robots import a3_ultra, g1, h2
+from gear_sonic.envs.manager_env.mdp.actuators import (
+    A3MotorSpaceActuatorCfg,
+    DelayedImplicitActuatorCfg,
+)
+from gear_sonic.envs.manager_env.robots import a3, a3_old, a3_ultra, g1, h2
 from gear_sonic.trl.utils import common
+
+logger = logging.getLogger(__name__)
+
+
+def _ensure_urdf_importer_compat() -> None:
+    """Use the URDF importer version expected by IsaacLab's converter."""
+    try:
+        import omni.kit.app
+
+        manager = omni.kit.app.get_app().get_extension_manager()
+        if manager.is_extension_enabled("isaacsim.asset.importer.urdf"):
+            enabled_id = manager.get_enabled_extension_id("isaacsim.asset.importer.urdf")
+            if enabled_id != "isaacsim.asset.importer.urdf-2.4.31":
+                manager.set_extension_enabled_immediate("isaacsim.asset.importer.urdf", False)
+        if not manager.is_extension_enabled("isaacsim.asset.importer.urdf-2.4.31"):
+            manager.set_extension_enabled_immediate("isaacsim.asset.importer.urdf-2.4.31", True)
+    except Exception as exc:
+        logger.warning("Could not pin IsaacLab-compatible URDF importer: %s", exc)
+
+
+def _set_delayed_implicit_actuators(
+    robot_cfg: ArticulationCfg,
+    min_delay: int,
+    max_delay: int,
+) -> None:
+    """Replace implicit actuator configs with delayed implicit variants."""
+    delayed_actuators = {}
+    for name, actuator_cfg in robot_cfg.actuators.items():
+        if isinstance(actuator_cfg, A3MotorSpaceActuatorCfg):
+            delayed_actuators[name] = actuator_cfg.replace(
+                min_delay=min_delay,
+                max_delay=max_delay,
+            )
+            continue
+        cfg_kwargs = {}
+        for field in dataclasses.fields(actuator_cfg):
+            if not field.init or field.name == "class_type":
+                continue
+            cfg_kwargs[field.name] = copy.deepcopy(getattr(actuator_cfg, field.name))
+        cfg_kwargs["min_delay"] = min_delay
+        cfg_kwargs["max_delay"] = max_delay
+        delayed_actuators[name] = DelayedImplicitActuatorCfg(**cfg_kwargs)
+    robot_cfg.actuators = delayed_actuators
+
+
+def _set_a3_motor_space_actuators(
+    robot_cfg: ArticulationCfg,
+    motor_model_cfg: dict,
+) -> None:
+    """Replace active A3 drives with explicit motor-space actuator models."""
+
+    converted_actuators = {}
+    for name, actuator_cfg in robot_cfg.actuators.items():
+        if name == "passive_foot_springs":
+            converted_actuators[name] = actuator_cfg
+            continue
+        effort_limit = copy.deepcopy(
+            actuator_cfg.effort_limit
+            if actuator_cfg.effort_limit is not None
+            else actuator_cfg.effort_limit_sim
+        )
+        converted_actuators[name] = A3MotorSpaceActuatorCfg(
+            joint_names_expr=copy.deepcopy(actuator_cfg.joint_names_expr),
+            effort_limit=effort_limit,
+            effort_limit_sim=None,
+            velocity_limit=copy.deepcopy(
+                actuator_cfg.velocity_limit
+                if actuator_cfg.velocity_limit is not None
+                else actuator_cfg.velocity_limit_sim
+            ),
+            velocity_limit_sim=copy.deepcopy(actuator_cfg.velocity_limit_sim),
+            stiffness=copy.deepcopy(actuator_cfg.stiffness),
+            damping=copy.deepcopy(actuator_cfg.damping),
+            armature=copy.deepcopy(actuator_cfg.armature),
+            friction=copy.deepcopy(actuator_cfg.friction),
+            dynamic_friction=copy.deepcopy(actuator_cfg.dynamic_friction),
+            viscous_friction=copy.deepcopy(actuator_cfg.viscous_friction),
+            tn_torque_scale=float(motor_model_cfg.get("tn_torque_scale", 1.0)),
+            parallel_torque_scale=float(
+                motor_model_cfg.get("parallel_torque_scale", 1.0)
+            ),
+            jacobian_table_dir=motor_model_cfg.get("jacobian_table_dir"),
+        )
+    robot_cfg.actuators = converted_actuators
+
+
+def _set_joint_asset_cfg(term_cfg, joint_names: list[str]) -> None:
+    if term_cfg is None:
+        return
+    params = getattr(term_cfg, "params", None)
+    if params is None:
+        params = {}
+        term_cfg.params = params
+    params["asset_cfg"] = SceneEntityCfg(
+        name="robot", joint_names=list(joint_names), preserve_order=True
+    )
+
+
+def _filter_joint_observations(observations, joint_names: list[str]) -> None:
+    for group_cfg in vars(observations).values():
+        if group_cfg is None or not hasattr(group_cfg, "__dict__"):
+            continue
+        _set_joint_asset_cfg(getattr(group_cfg, "joint_pos", None), joint_names)
+        _set_joint_asset_cfg(getattr(group_cfg, "joint_vel", None), joint_names)
+
+
+def _set_a3_fitted_passive_foot_gains(robot_cfg: ArticulationCfg) -> None:
+    actuator_cfg = robot_cfg.actuators.get("passive_foot_springs")
+    if actuator_cfg is None:
+        return
+    actuator_cfg.effort_limit_sim = {
+        ".*_foot_forefoot_joint": 400.0,
+        ".*_foot_toe_joint": 100.0,
+    }
+    actuator_cfg.stiffness = {
+        ".*_foot_forefoot_joint": 2396.666,
+        ".*_foot_toe_joint": 27.58407,
+    }
+    actuator_cfg.damping = {
+        ".*_foot_forefoot_joint": 1.51683722,
+        ".*_foot_toe_joint": 0.0686125693,
+    }
+    actuator_cfg.armature = {
+        ".*_foot_forefoot_joint": 1.0e-4,
+        ".*_foot_toe_joint": 3.0e-5,
+    }
+
+
+def _set_a3_foot_contact_compliance(
+    robot_cfg: ArticulationCfg,
+    compliance_cfg: dict,
+    robot_module,
+) -> None:
+    """Configure A3 URDF spawn-time compliant-contact material for foot links."""
+    if not compliance_cfg or not compliance_cfg.get("enabled", False):
+        return
+
+    sample_per_env = bool(compliance_cfg.get("sample_per_env", False))
+    robot_cfg.spawn.func = (
+        robot_module.spawn_a3_urdf_with_per_env_foot_contact_compliance
+        if sample_per_env
+        else robot_module.spawn_a3_urdf_with_foot_contact_compliance
+    )
+    robot_cfg.spawn.foot_contact_compliance = {
+        "enabled": True,
+        "sample_per_env": sample_per_env,
+        "base_stiffness": float(compliance_cfg.get("base_stiffness", 69050.0)),
+        "base_damping": float(compliance_cfg.get("base_damping", 650.0)),
+        "stiffness_scale_range": list(compliance_cfg.get("stiffness_scale_range", [1.0, 1.0])),
+        "damping_ratio_scale_range": list(
+            compliance_cfg.get("damping_ratio_scale_range", [1.0, 1.0])
+        ),
+        "link_names": list(
+            compliance_cfg.get("link_names", robot_module.A3_FOOT_CONTACT_LINK_NAMES)
+        ),
+        "static_friction": float(compliance_cfg.get("static_friction", 1.0)),
+        "dynamic_friction": float(compliance_cfg.get("dynamic_friction", 1.0)),
+        "restitution": float(compliance_cfg.get("restitution", 0.0)),
+        "friction_combine_mode": compliance_cfg.get("friction_combine_mode", "multiply"),
+        "restitution_combine_mode": compliance_cfg.get("restitution_combine_mode", "multiply"),
+    }
 
 
 def _load_opencv_params_from_usd(usd_path: str) -> dict:
@@ -71,9 +239,7 @@ def _load_opencv_params_from_usd(usd_path: str) -> dict:
 
     # Assert at least k1 distortion exists (otherwise why use OpenCV mode?)
     if "k1" not in params:
-        raise ValueError(
-            f"USD file {usd_path} missing distortion coefficient k1 - use pinhole camera instead"
-        )
+        raise ValueError(f"USD file {usd_path} missing distortion coefficient k1 - use pinhole camera instead")
 
     print(f"Loaded OpenCV params from {usd_path}: {params}")  # noqa: T201
     return params
@@ -97,9 +263,7 @@ def spawn_opencv_camera(
 
     # Create the camera prim
     if not prim_utils.is_prim_path_valid(prim_path):
-        prim_utils.create_prim(
-            prim_path, "Camera", translation=translation, orientation=orientation
-        )
+        prim_utils.create_prim(prim_path, "Camera", translation=translation, orientation=orientation)
     else:
         raise ValueError(f"A prim already exists at path: '{prim_path}'.")
 
@@ -127,9 +291,7 @@ def spawn_opencv_camera(
         prim_spec.SetInfo("apiSchemas", api_schemas)
 
     # Set the distortion model
-    prim.CreateAttribute("omni:lensdistortion:model", pxr.Sdf.ValueTypeNames.Token).Set(
-        "opencvPinhole"
-    )
+    prim.CreateAttribute("omni:lensdistortion:model", pxr.Sdf.ValueTypeNames.Token).Set("opencvPinhole")
 
     # Set OpenCV distortion parameters from config
     opencv_attrs = {
@@ -161,9 +323,9 @@ def spawn_opencv_camera(
     if hasattr(cfg, "opencv_image_size") and cfg.opencv_image_size is not None:
         import pxr
 
-        prim.CreateAttribute(
-            "omni:lensdistortion:opencvPinhole:imageSize", pxr.Sdf.ValueTypeNames.Int2
-        ).Set(pxr.Gf.Vec2i(cfg.opencv_image_size[0], cfg.opencv_image_size[1]))
+        prim.CreateAttribute("omni:lensdistortion:opencvPinhole:imageSize", pxr.Sdf.ValueTypeNames.Int2).Set(
+            pxr.Gf.Vec2i(cfg.opencv_image_size[0], cfg.opencv_image_size[1])
+        )
         print(  # noqa: T201
             f"[DEBUG] spawn_opencv_camera: Set imageSize to {cfg.opencv_image_size}"
         )  # noqa: T201
@@ -264,6 +426,12 @@ def _resolve_object_usd_paths(usd_path):
     return expanded_paths
 
 
+def _rank_uses_terrain(config):
+    from gear_sonic.utils.paired_terrain import rank_uses_terrain
+
+    return rank_uses_terrain(config.get("rank_partitioned_terrain", None))
+
+
 @configclass
 class MySceneCfg(InteractiveSceneCfg):
     """Configuration for the terrain scene with a legged robot."""
@@ -283,9 +451,7 @@ class MySceneCfg(InteractiveSceneCfg):
         if config.get("render_results", False):
             self.eval_camera = TiledCameraCfg(
                 prim_path="/World/envs/env_.*/eval_camera",
-                offset=TiledCameraCfg.OffsetCfg(
-                    pos=(0, 0, 0), rot=(1, 0, 0, 0), convention="world"
-                ),
+                offset=TiledCameraCfg.OffsetCfg(pos=(0, 0, 0), rot=(1, 0, 0, 0), convention="world"),
                 data_types=["rgb"],
                 spawn=sim_utils.PinholeCameraCfg(
                     focal_length=5.0,
@@ -316,17 +482,20 @@ class MySceneCfg(InteractiveSceneCfg):
 
         # ground terrain
         terrain_type = config.get("terrain_type", "plane")
+        terrain_physics_material = sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+            compliant_contact_stiffness=config.get("terrain_compliant_contact_stiffness", 0.0),
+            compliant_contact_damping=config.get("terrain_compliant_contact_damping", 0.0),
+        )
         if terrain_type == "plane":
             self.terrain = TerrainImporterCfg(
                 prim_path="/World/ground",
                 terrain_type="plane",
                 collision_group=-1,
-                physics_material=sim_utils.RigidBodyMaterialCfg(
-                    friction_combine_mode="multiply",
-                    restitution_combine_mode="multiply",
-                    static_friction=1.0,
-                    dynamic_friction=1.0,
-                ),
+                physics_material=terrain_physics_material,
                 visual_material=sim_utils.MdlFileCfg(
                     mdl_path="{NVIDIA_NUCLEUS_DIR}/Materials/Base/Architecture/Shingles_01.mdl",
                     project_uvw=True,
@@ -339,12 +508,7 @@ class MySceneCfg(InteractiveSceneCfg):
                 terrain_generator=terrain.ROUGH_TERRAINS_CFG,
                 max_init_terrain_level=10,
                 collision_group=1,
-                physics_material=sim_utils.RigidBodyMaterialCfg(
-                    friction_combine_mode="multiply",
-                    restitution_combine_mode="multiply",
-                    static_friction=1.0,
-                    dynamic_friction=1.0,
-                ),
+                physics_material=terrain_physics_material,
                 visual_material=sim_utils.MdlFileCfg(
                     mdl_path="{NVIDIA_NUCLEUS_DIR}/Materials/Base/Architecture/Shingles_01.mdl",
                     project_uvw=True,
@@ -389,8 +553,25 @@ class MySceneCfg(InteractiveSceneCfg):
             debug_vis=False,
         )
 
+        robot_config = config.get("robot", {})
+        robot_asset_path = str(robot_config.get("asset_path", ""))
+        enable_foot_end_contact = bool(
+            robot_config.get("enable_foot_end_contact_sensor", "hard_sole_3seg" in robot_asset_path)
+        )
+        if enable_foot_end_contact:
+            self.foot_end_contact = ContactSensorCfg(
+                prim_path="{ENV_REGEX_NS}/Robot/.*foot_(front|mid|rear)_Link",
+                update_period=0.0,
+                history_length=6,
+                debug_vis=False,
+                track_pose=False,
+                track_contact_points=False,
+                track_friction_forces=False,
+                track_air_time=False,
+            )
+
         # Check if robot has hands (43 DOF robots) - used for hand-related sensors
-        robot_type = config.get("robot", {}).get("type", "g1")
+        robot_type = robot_config.get("type", "g1")
         robot_has_hands = "43dof" in robot_type or "hand" in robot_type
 
         motion_meta_info_path = config.get("motion_meta_info_path", None)
@@ -416,7 +597,7 @@ class MySceneCfg(InteractiveSceneCfg):
         #
         # multi_object_per_env=True:  All objects spawned in every env (one active at a time)
         # multi_object_per_env=False: One object per env (MultiUsdFileCfg cycles through)
-        if config.get("add_object", False):
+        if config.get("add_object", False) and _rank_uses_terrain(config):
             usd_path = config.get("object_usd_path", f"{os.getcwd()}/data/wheelchair.usd")
             object_is_dynamic = config.get("object_is_dynamic", False)
             object_collision_enabled = config.get("object_collision_enabled", True)
@@ -428,9 +609,7 @@ class MySceneCfg(InteractiveSceneCfg):
                 resolved_paths = _resolve_object_usd_paths(usd_path)
             elif os.path.isdir(usd_path):
                 resolved_paths = sorted(
-                    os.path.abspath(os.path.join(usd_path, f))
-                    for f in os.listdir(usd_path)
-                    if f.endswith(".usd")
+                    os.path.abspath(os.path.join(usd_path, f)) for f in os.listdir(usd_path) if f.endswith(".usd")
                 )
             else:
                 resolved_paths = [os.path.abspath(usd_path)]
@@ -473,11 +652,7 @@ class MySceneCfg(InteractiveSceneCfg):
             elif len(resolved_paths) == 1:
                 # SINGLE OBJECT MODE
                 object_mass = config.get("object_mass", None)
-                mass_props = (
-                    sim_utils.MassPropertiesCfg(mass=object_mass)
-                    if object_mass is not None
-                    else None
-                )
+                mass_props = sim_utils.MassPropertiesCfg(mass=object_mass) if object_mass is not None else None
                 object_opacity = config.get("object_opacity", 1.0)
                 if object_color is not None:
                     visual_material = sim_utils.PreviewSurfaceCfg(
@@ -561,9 +736,7 @@ class MySceneCfg(InteractiveSceneCfg):
                 #    right_hand_middle_0_link, right_hand_middle_1_link]
                 custom_finger_links = config.get("contact_sensor_finger_links", None)
                 if custom_finger_links is not None:
-                    right_finger_tip_bodies = [
-                        f"{{ENV_REGEX_NS}}/Robot/{link}" for link in custom_finger_links
-                    ]
+                    right_finger_tip_bodies = [f"{{ENV_REGEX_NS}}/Robot/{link}" for link in custom_finger_links]
                 else:
                     # Default: fingertips + palm (4 links)
                     right_finger_tip_bodies = [
@@ -661,9 +834,7 @@ class MySceneCfg(InteractiveSceneCfg):
                         ),
                         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.5, 0.35, 0.2)),
                     ),
-                    init_state=RigidObjectCfg.InitialStateCfg(
-                        pos=tuple(table_pos), rot=table_quat_cuboid
-                    ),
+                    init_state=RigidObjectCfg.InitialStateCfg(pos=tuple(table_pos), rot=table_quat_cuboid),
                 )
             else:
                 # Use table USD with scene_scale and proper rotation
@@ -671,9 +842,7 @@ class MySceneCfg(InteractiveSceneCfg):
                     prim_path="{ENV_REGEX_NS}/Table",
                     spawn=sim_utils.UsdFileCfg(
                         activate_contact_sensors=True,
-                        usd_path=config.get(
-                            "table_usd_path", "data/motion_lib_grab/common/table.usda"
-                        ),
+                        usd_path=config.get("table_usd_path", "data/motion_lib_grab/common/table.usda"),
                         rigid_props=sim_utils.RigidBodyPropertiesCfg(
                             kinematic_enabled=True,
                             max_depenetration_velocity=1.0,
@@ -783,7 +952,8 @@ class MySceneCfg(InteractiveSceneCfg):
             if config.get("render_ego_opencv_usd", False):
                 # Load OpenCV distortion parameters from USD file
                 opencv_usd_path = cameras_cfg.get(
-                    "opencv_usd_path", "runs/oak_camera.usda"  # Default path
+                    "opencv_usd_path",
+                    "runs/oak_camera.usda",  # Default path
                 )
                 print(  # noqa: T201
                     f"USING OPENCV CAMERA - loading distortion from: {opencv_usd_path}"
@@ -876,9 +1046,7 @@ class MySceneCfg(InteractiveSceneCfg):
 
             self.ego_camera = TiledCameraCfg(
                 prim_path=camera_prim_path,
-                offset=TiledCameraCfg.OffsetCfg(
-                    pos=camera_pos_offset, rot=camera_rot_offset, convention="world"
-                ),
+                offset=TiledCameraCfg.OffsetCfg(pos=camera_pos_offset, rot=camera_rot_offset, convention="world"),
                 data_types=camera_data_types,
                 spawn=camera_spawn_cfg,
                 height=camera_resolution[0],
@@ -1011,36 +1179,112 @@ class ModularTrackingEnvCfg(ManagerBasedRLEnvCfg):
                 "action_scale": a3_ultra.A3_ULTRA_ACTION_SCALE,
                 "isaaclab_to_mujoco_mapping": a3_ultra.A3ULTRA_ISAACLAB_TO_MUJOCO_MAPPING,
             },
+            "a3": {
+                "robot_cfg": a3.A3_CYLINDER_CFG,
+                "action_scale": a3.A3_ACTION_SCALE,
+                "isaaclab_to_mujoco_mapping": a3.A3_ISAACLAB_TO_MUJOCO_MAPPING,
+                "active_joint_names": a3.A3_ACTIVE_JOINT_NAMES,
+            },
+            "a3_exp020": {
+                "robot_cfg": a3.A3_EXP020_CYLINDER_CFG,
+                "action_scale": a3.A3_EXP020_ACTION_SCALE,
+                "isaaclab_to_mujoco_mapping": a3.A3_ISAACLAB_TO_MUJOCO_MAPPING,
+                "active_joint_names": a3.A3_ACTIVE_JOINT_NAMES,
+            },
+            "a3_024": {
+                "robot_cfg": a3.A3_024_CYLINDER_CFG,
+                "action_scale": a3.A3_024_ACTION_SCALE,
+                "isaaclab_to_mujoco_mapping": a3.A3_ISAACLAB_TO_MUJOCO_MAPPING,
+                "active_joint_names": a3.A3_ACTIVE_JOINT_NAMES,
+            },
+            # Backward compatibility for historical serialized 024 configs.
+            "a3_exp023": {
+                "robot_cfg": a3.A3_024_CYLINDER_CFG,
+                "action_scale": a3.A3_024_ACTION_SCALE,
+                "isaaclab_to_mujoco_mapping": a3.A3_ISAACLAB_TO_MUJOCO_MAPPING,
+                "active_joint_names": a3.A3_ACTIVE_JOINT_NAMES,
+            },
+            "a3_old": {
+                "robot_cfg": a3_old.A3_CYLINDER_CFG,
+                "action_scale": a3_old.A3_ACTION_SCALE,
+                "isaaclab_to_mujoco_mapping": a3_old.A3_ISAACLAB_TO_MUJOCO_MAPPING,
+                "active_joint_names": a3_old.A3_ACTIVE_JOINT_NAMES,
+            },
         }
 
         robot_type = config["robot"].get("type", "g1")
-        self.scene.robot = robot_mapping[robot_type]["robot_cfg"].replace(
-            prim_path="{ENV_REGEX_NS}/Robot"
-        )
-        self.actions.joint_pos.scale = robot_mapping[config["robot"].get("type", "g1")][
-            "action_scale"
-        ]
-        self.isaaclab_to_mujoco_mapping = robot_mapping[config["robot"].get("type", "g1")][
-            "isaaclab_to_mujoco_mapping"
-        ]
+        robot_cfg = copy.deepcopy(robot_mapping[robot_type]["robot_cfg"])
+        self.scene.robot = robot_cfg.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        robot_asset_path = config["robot"].get("asset_path", None)
+        if robot_asset_path:
+            self.scene.robot.spawn.asset_path = robot_asset_path
+        if "merge_fixed_joints" in config["robot"]:
+            _ensure_urdf_importer_compat()
+            self.scene.robot.spawn.merge_fixed_joints = bool(config["robot"]["merge_fixed_joints"])
+        if robot_type in {"a3", "a3_old"}:
+            # The spawn-time foot material helpers are generic for A3 URDF links.
+            _set_a3_foot_contact_compliance(
+                self.scene.robot,
+                config["robot"].get("foot_contact_compliance", {}),
+                a3_old,
+            )
+        if robot_type == "a3" and config["robot"].get("disable_passive_foot", False):
+            self.scene.robot.actuators.pop("passive_foot_springs", None)
+            for joint_name in a3.A3_PASSIVE_FOOT_JOINT_NAMES:
+                self.scene.robot.init_state.joint_pos.pop(joint_name, None)
+            if getattr(self.events, "passive_foot_actuator_gains", None) is not None:
+                self.events.passive_foot_actuator_gains = None
+        if robot_type == "a3" and config["robot"].get("use_fitted_passive_foot_gains", False):
+            _set_a3_fitted_passive_foot_gains(self.scene.robot)
+        motor_model_cfg = config["robot"].get("motor_model", {})
+        if motor_model_cfg.get("enabled", False):
+            if robot_type not in {"a3", "a3_024", "a3_exp020", "a3_exp023"}:
+                raise ValueError(
+                    "A3 motor-space actuator model requires robot.type to be "
+                    f"a3/a3_024/a3_exp020, got {robot_type!r}"
+                )
+            _set_a3_motor_space_actuators(self.scene.robot, motor_model_cfg)
+        actuator_delay_cfg = config["robot"].get("actuator_delay", {})
+        if actuator_delay_cfg.get("enabled", False):
+            min_delay = int(actuator_delay_cfg.get("min_delay", 0))
+            max_delay = int(actuator_delay_cfg.get("max_delay", 0))
+            if (
+                "min_delay_control_steps" in actuator_delay_cfg
+                or "max_delay_control_steps" in actuator_delay_cfg
+            ):
+                min_delay = int(
+                    actuator_delay_cfg.get("min_delay_control_steps", 0) * self.decimation
+                )
+                max_delay = int(
+                    actuator_delay_cfg.get("max_delay_control_steps", 0) * self.decimation
+                )
+            _set_delayed_implicit_actuators(self.scene.robot, min_delay, max_delay)
+
+        active_joint_names = robot_mapping[robot_type].get("active_joint_names")
+        if active_joint_names is not None:
+            self.actions.joint_pos.joint_names = list(active_joint_names)
+            self.actions.joint_pos.preserve_order = True
+            _filter_joint_observations(self.observations, active_joint_names)
+            _set_joint_asset_cfg(getattr(self.rewards, "joint_limit", None), active_joint_names)
+            _set_joint_asset_cfg(
+                getattr(self.events, "add_joint_default_pos", None), active_joint_names
+            )
+            if hasattr(self.commands, "motion") and self.commands.motion is not None:
+                self.commands.motion.motion_lib_num_dof = len(active_joint_names)
+
+        self.actions.joint_pos.scale = robot_mapping[robot_type]["action_scale"]
+        self.isaaclab_to_mujoco_mapping = robot_mapping[robot_type]["isaaclab_to_mujoco_mapping"]
 
         # curriculum? WARNING HARDCODED
         import importlib
 
-        if (
-            hasattr(self.curriculum, "force_push_curriculum")
-            and self.curriculum.force_push_curriculum
-        ):
+        if hasattr(self.curriculum, "force_push_curriculum") and self.curriculum.force_push_curriculum:
             module = importlib.import_module("gear_sonic.envs.manager_env.mdp")
-            self.curriculum.force_push_curriculum.params["modify_fn"] = getattr(
-                module, "step_curriculum"
-            )
+            self.curriculum.force_push_curriculum.params["modify_fn"] = getattr(module, "step_curriculum")
 
         if (
             hasattr(self.curriculum, "force_push_linear_curriculum")
             and self.curriculum.force_push_linear_curriculum
         ):
             module = importlib.import_module("gear_sonic.envs.manager_env.mdp")
-            self.curriculum.force_push_linear_curriculum.params["modify_fn"] = getattr(
-                module, "linear_curriculum"
-            )
+            self.curriculum.force_push_linear_curriculum.params["modify_fn"] = getattr(module, "linear_curriculum")

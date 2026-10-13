@@ -2265,8 +2265,12 @@ if __name__ == "__main__":
         "--robot",
         type=str,
         default="g1",
-        choices=["g1", "a3_ultra", "h2"],
-        help="Which robot's IK/FK model to use for pose calibration (default: g1).",
+        choices=["g1", "a3", "a3_ultra", "h2"],
+        help=(
+            "Which robot's IK/FK model to use for pose calibration (default: g1). "
+            "Only g1 has an IK/FK RobotModel registered today; the others raise a clear "
+            "NotImplementedError (see ROBOT_MODEL_REGISTRY)."
+        ),
     )
     args = parser.parse_args()
 

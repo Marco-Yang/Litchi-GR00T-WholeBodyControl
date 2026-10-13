@@ -1,6 +1,9 @@
 import enum
 import gc
 import glob
+import hashlib
+import json
+import math
 import os
 import os.path as osp
 from pathlib import Path
@@ -19,7 +22,18 @@ import torch.multiprocessing as mp
 
 from gear_sonic.isaac_utils import rotations
 from gear_sonic.trl.utils import common
+from gear_sonic.utils.adaptive_sampling_index import (
+    aggregate_bin_values_by_motion,
+    build_compact_adaptive_index,
+    expand_contiguous_ranges,
+    map_motion_frames_to_bins,
+    sparse_add_bin_counts_,
+)
 from gear_sonic.utils.motion_lib import skeleton
+from gear_sonic.utils.paired_terrain import (
+    condition_bin_probabilities_by_motion,
+    sample_paired_motion_time_steps,
+)
 
 
 class FixHeightMode(enum.Enum):
@@ -38,6 +52,28 @@ def to_torch(tensor):
         return tensor
     else:
         return torch.from_numpy(tensor)
+
+
+def _raise_nofile_soft_limit(target_limit=1048576):
+    """Raise only the process soft FD limit, never the privileged hard cap."""
+    soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit == resource.RLIM_INFINITY or soft_limit >= target_limit:
+        return soft_limit
+    new_soft_limit = (
+        target_limit
+        if hard_limit == resource.RLIM_INFINITY
+        else min(target_limit, hard_limit)
+    )
+    if new_soft_limit <= soft_limit:
+        return soft_limit
+    resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft_limit, hard_limit))
+    logger.info(
+        "Increased soft file descriptor limit from {} to {} (hard limit: {})",
+        soft_limit,
+        new_soft_limit,
+        hard_limit,
+    )
+    return new_soft_limit
 
 
 def is_navigation_motion(motion_key):
@@ -222,6 +258,9 @@ class MotionLibBase:
         self._sim_fps = 1 / self.m_cfg.get("step_dt", 1 / 50)
         self.target_fps = self.m_cfg.get("target_fps", 50)
         self.adaptive_sampling_cfg = self.m_cfg.get("adaptive_sampling", {})
+        self.adaptive_sampling_sync_across_gpus = self.adaptive_sampling_cfg.get(
+            "sync_across_gpus", True
+        )
         self.all_motions_loaded = False
 
         self.debug = motion_lib_cfg.get("debug", False)
@@ -361,57 +400,299 @@ class MotionLibBase:
         # MuJoCo DOF indices for wrist joints (L/R roll/pitch/yaw)
         self.wrist_mujoco_dof_indices = [19, 20, 21, 26, 27, 28]
 
-    def load_data(self, motion_file):
-        if osp.isfile(motion_file):
-            self.mode = MotionlibMode.file
-            self._motion_data_load = joblib.load(motion_file)
-        else:
-            assert osp.isdir(
-                motion_file
-            ), f"Expected motion_file to be a directory, got: {motion_file}"
-            self.mode = MotionlibMode.directory
-            if self.debug:
-                self._motion_data_load = {}
-            else:
-                self._motion_data_load = {
-                    osp.splitext(osp.basename(f))[0]: {"path": f}
-                    for f in glob.glob(osp.join(motion_file, "**", "*.pkl"), recursive=True)
-                    if not f.endswith("metadata.pkl")
-                }
+    @staticmethod
+    def _is_motion_file_sequence(motion_file):
+        if isinstance(motion_file, (str, os.PathLike)):
+            return False
+        return isinstance(motion_file, (list, tuple)) or motion_file.__class__.__name__ == "ListConfig"
 
-            metadata_files = []
-            # Check for metadata.pkl directly in motion_file directory
-            direct_metadata = osp.join(motion_file, "metadata.pkl")
-            if osp.exists(direct_metadata):
-                metadata_files.append(direct_metadata)
-            # Also check subdirectories for metadata.pkl
-            all_sub_dirs = os.listdir(motion_file)
-            if self.debug:
-                all_sub_dirs = all_sub_dirs[:1]
-            for sub_dir in all_sub_dirs:
-                sub_dir_path = osp.join(motion_file, sub_dir)
-                if osp.isdir(sub_dir_path):
-                    sub_meta = osp.join(sub_dir_path, "metadata.pkl")
-                    if osp.exists(sub_meta):
-                        metadata_files.append(sub_meta)
+    @staticmethod
+    def _find_semantic_manifest(motion_source, max_parent_levels=4):
+        """Find a dataset-generation manifest near a directory motion source."""
+        source_path = Path(str(motion_source))
+        if not source_path.is_dir():
+            return None
+        search_dir = source_path
+        for _ in range(max_parent_levels + 1):
+            candidate = search_dir / "semantic_manifest.jsonl"
+            if candidate.is_file():
+                return candidate
+            if search_dir.parent == search_dir:
+                break
+            search_dir = search_dir.parent
+        return None
 
-            for metadata_file in metadata_files:
-                metadata = joblib.load(metadata_file)
-                if self.debug:
-                    metadata = {
-                        k: v
-                        for k, v in list(metadata.items())[:5]
-                        if osp.exists(f"{sub_dir_path}/{k}.pkl")
-                    }
-                for k, v in metadata.items():
-                    if self.debug:
-                        self._motion_data_load[k] = {"path": f"{sub_dir_path}/{k}.pkl"}
+    @staticmethod
+    def _load_validated_semantic_manifest(manifest, source_entries):
+        """Parse one manifest after enforcing its completion contract."""
+        manifest_root = manifest.parent.resolve()
+        complete_path = manifest_root / "COMPLETE.json"
+        if not complete_path.is_file():
+            raise ValueError("COMPLETE.json is missing")
+        with complete_path.open(encoding="utf-8") as complete_file:
+            complete = json.load(complete_file)
+        if complete.get("status") != "complete":
+            raise ValueError("dataset status is not complete")
+
+        # Both fields are mandatory. Accepting an unverified manifest would
+        # turn a partially generated or edited index into silent training data.
+        expected_digest = complete["manifest_sha256"]
+        expected_count = complete["output_motions"]
+        if not isinstance(expected_digest, str) or not expected_digest:
+            raise ValueError("manifest_sha256 is missing or invalid")
+        if (
+            isinstance(expected_count, bool)
+            or not isinstance(expected_count, int)
+            or expected_count < 0
+        ):
+            raise ValueError("output_motions must be a non-negative integer")
+
+        source_prefixes = []
+        for source_key, source_path in source_entries:
+            relative_source = source_path.relative_to(manifest_root).as_posix()
+            source_prefixes.append(
+                (
+                    ""
+                    if relative_source in ("", ".")
+                    else relative_source.rstrip("/") + "/",
+                    source_key,
+                )
+            )
+        if not source_prefixes:
+            raise ValueError("manifest does not contain any configured source directory")
+        source_prefixes.sort(key=lambda item: len(item[0]), reverse=True)
+        for index, (prefix, _) in enumerate(source_prefixes):
+            if any(
+                prefix.startswith(other_prefix)
+                or other_prefix.startswith(prefix)
+                for other_prefix, _ in source_prefixes[index + 1 :]
+            ):
+                # The legacy recursive loader reports duplicate motions when a
+                # parent source and its nested directory are both configured.
+                # Fall back so the manifest shortcut cannot silently change
+                # that validation contract by assigning each file only once.
+                raise ValueError("configured motion source directories overlap")
+        source_data = {source_key: {} for _, source_key in source_prefixes}
+
+        digest = hashlib.sha256()
+        manifest_motion_count = 0
+        with manifest.open("rb") as manifest_file:
+            for line in manifest_file:
+                digest.update(line)
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise TypeError("manifest row must be a JSON object")
+                for variant in row.get("variants", ()):
+                    if not isinstance(variant, dict):
+                        raise TypeError("manifest variant must be a JSON object")
+                    manifest_motion_count += 1
+                    relative_output = variant["output_file"]
+                    if not isinstance(relative_output, str):
+                        raise TypeError("manifest output_file must be a string")
+                    relative_output = relative_output.replace(os.sep, "/")
+                    relative_path = Path(relative_output)
                     if (
-                        k in self._motion_data_load
-                    ):  # metadata file can have more motion sequences than in the directory. Only load the necessary ones.  # noqa: E501
-                        self._motion_data_load[k].update(v)
+                        not relative_output
+                        or relative_path.is_absolute()
+                        or ".." in relative_path.parts
+                    ):
+                        raise ValueError(
+                            f"unsafe manifest output path: {relative_output!r}"
+                        )
+                    source_key = next(
+                        (
+                            key
+                            for prefix, key in source_prefixes
+                            if relative_output.startswith(prefix)
+                        ),
+                        None,
+                    )
+                    if source_key is None:
+                        continue
 
-            print(f"Loaded {len(self._motion_data_load)} motion files")  # noqa: T201
+                    motion_key = variant["output_key"]
+                    frame_count = variant["frames"]
+                    fps_value = variant["fps"]
+                    if not isinstance(motion_key, str):
+                        raise TypeError("manifest output_key must be a string")
+                    if (
+                        isinstance(frame_count, bool)
+                        or not isinstance(frame_count, int)
+                    ):
+                        raise TypeError("manifest frames must be an integer")
+                    if isinstance(fps_value, bool) or not isinstance(
+                        fps_value, (int, float)
+                    ):
+                        raise TypeError("manifest fps must be numeric")
+                    fps = float(fps_value)
+                    if (
+                        not motion_key
+                        or frame_count <= 0
+                        or not math.isfinite(fps)
+                        or fps <= 0
+                    ):
+                        raise ValueError(
+                            f"invalid metadata for manifest output {relative_output!r}"
+                        )
+                    if motion_key in source_data[source_key]:
+                        raise ValueError(
+                            f"duplicate motion key {motion_key!r} in {manifest}"
+                        )
+                    source_data[source_key][motion_key] = {
+                        "path": str(manifest_root / relative_path),
+                        "length": frame_count,
+                        "fps": fps,
+                    }
+
+        if digest.hexdigest() != expected_digest:
+            raise ValueError("manifest checksum does not match COMPLETE.json")
+        if manifest_motion_count != expected_count:
+            raise ValueError(
+                f"manifest motion count {manifest_motion_count} does not match "
+                f"COMPLETE.json count {expected_count}"
+            )
+        return source_data
+
+    def _load_sources_from_semantic_manifests(self, motion_sources):
+        """Build directory-source indexes from validated generation manifests.
+
+        This bypasses recursive globbing of hundreds of thousands of files in
+        addition to supplying the frame metadata used by adaptive sampling.
+        The shortcut is opt-in and requires the dataset's ``COMPLETE.json`` to
+        declare a complete build with a matching manifest checksum/count.
+        Any malformed or unverifiable manifest falls back to the legacy source
+        loader instead of making training startup fail.
+        """
+        if self.debug or not self.m_cfg.get("use_semantic_manifest_metadata", False):
+            return {}
+
+        sources_by_manifest = {}
+        for source in motion_sources:
+            source_path = Path(str(source))
+            if not source_path.is_dir():
+                continue
+            manifest = self._find_semantic_manifest(source_path)
+            if manifest is not None:
+                sources_by_manifest.setdefault(manifest, []).append(
+                    (str(source), source_path.resolve())
+                )
+
+        loaded_sources = {}
+        for manifest, source_entries in sources_by_manifest.items():
+            try:
+                source_data = self._load_validated_semantic_manifest(
+                    manifest, source_entries
+                )
+            except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:
+                logger.warning(
+                    "Ignoring invalid semantic manifest {}; falling back to legacy "
+                    "motion discovery: {}",
+                    manifest,
+                    exc,
+                )
+                continue
+
+            for source_key, entries in source_data.items():
+                if entries:
+                    loaded_sources[source_key] = entries
+            logger.info(
+                "Loaded {} validated motion entries from semantic manifest {}",
+                sum(len(entries) for entries in source_data.values()),
+                manifest,
+            )
+        return loaded_sources
+
+    def _load_single_motion_source(self, motion_file):
+        motion_file = str(motion_file)
+        if osp.isfile(motion_file):
+            return joblib.load(motion_file), MotionlibMode.file
+
+        assert osp.isdir(
+            motion_file
+        ), f"Expected motion_file to be a file or directory, got: {motion_file}"
+        data_load = {}
+        if not self.debug:
+            for pkl_path in sorted(
+                glob.glob(osp.join(motion_file, "**", "*.pkl"), recursive=True)
+            ):
+                if pkl_path.endswith("metadata.pkl"):
+                    continue
+                key = osp.splitext(osp.basename(pkl_path))[0]
+                if key in data_load:
+                    raise ValueError(
+                        f"Duplicate motion key '{key}' inside motion source {motion_file}: "
+                        f"{data_load[key]['path']} and {pkl_path}"
+                    )
+                data_load[key] = {"path": pkl_path}
+
+        metadata_files = []
+        direct_metadata = osp.join(motion_file, "metadata.pkl")
+        if osp.exists(direct_metadata):
+            metadata_files.append(direct_metadata)
+
+        all_sub_dirs = os.listdir(motion_file)
+        if self.debug:
+            all_sub_dirs = all_sub_dirs[:1]
+        for sub_dir in all_sub_dirs:
+            sub_dir_path = osp.join(motion_file, sub_dir)
+            if osp.isdir(sub_dir_path):
+                sub_meta = osp.join(sub_dir_path, "metadata.pkl")
+                if osp.exists(sub_meta):
+                    metadata_files.append(sub_meta)
+
+        for metadata_file in metadata_files:
+            metadata = joblib.load(metadata_file)
+            metadata_dir = osp.dirname(metadata_file)
+            if self.debug:
+                metadata = {
+                    k: v
+                    for k, v in list(metadata.items())[:5]
+                    if osp.exists(osp.join(metadata_dir, f"{k}.pkl"))
+                }
+            for k, v in metadata.items():
+                if self.debug:
+                    data_load[k] = {"path": osp.join(metadata_dir, f"{k}.pkl")}
+                if k in data_load:
+                    data_load[k].update(v)
+
+        return data_load, MotionlibMode.directory
+
+    def load_data(self, motion_file):
+        if self._is_motion_file_sequence(motion_file):
+            motion_sources = list(motion_file)
+            assert motion_sources, "motion_file list must not be empty"
+        else:
+            motion_sources = [motion_file]
+
+        semantic_sources = self._load_sources_from_semantic_manifests(motion_sources)
+        merged_data = {}
+        source_by_key = {}
+        modes = []
+        for source in motion_sources:
+            source_key = str(source)
+            if source_key in semantic_sources:
+                source_data = semantic_sources.pop(source_key)
+                mode = MotionlibMode.directory
+            else:
+                source_data, mode = self._load_single_motion_source(source)
+            modes.append(mode)
+            duplicates = sorted(set(merged_data).intersection(source_data))
+            if duplicates:
+                preview = ", ".join(duplicates[:10])
+                suffix = "..." if len(duplicates) > 10 else ""
+                raise ValueError(
+                    f"Duplicate motion keys across motion_file sources: {preview}{suffix}. "
+                    f"First source: {source_by_key[duplicates[0]]}; duplicate source: {source}. "
+                    "Rename/split the motions or add a source prefix before mixing datasets."
+                )
+            for key, value in source_data.items():
+                merged_data[key] = value
+                source_by_key[key] = str(source)
+            print(f"Loaded {len(source_data)} motion files from {source}")  # noqa: T201
+
+        self.mode = modes[0] if len(modes) == 1 else MotionlibMode.directory
+        self._motion_data_load = merged_data
+        print(f"Loaded {len(self._motion_data_load)} motion files total")  # noqa: T201
 
         data_list = self._motion_data_load
 
@@ -1107,26 +1388,12 @@ class MotionLibBase:
             soma_data_list = None
         torch.set_num_threads(1)
 
-        # Increase file descriptor limit to prevent "too many open files" error
+        # Multiprocessing tensor queues can consume thousands of descriptors.
+        # Raising the hard cap is privileged and may report ValueError instead
+        # of PermissionError, bypassing the old fallback. Raise only the soft
+        # limit up to the process's existing hard cap.
         try:
-            soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
-            target_limit = 1048576
-
-            # Try to set both soft and hard limits
-            if soft_limit < target_limit:
-                try:
-                    # First try to increase hard limit (requires root)
-                    resource.setrlimit(resource.RLIMIT_NOFILE, (target_limit, target_limit))
-                    logger.info(
-                        f"Increased file descriptor limits from {soft_limit}/{hard_limit} to {target_limit}/{target_limit}"  # noqa: E501
-                    )
-                except PermissionError:
-                    # Fallback to increasing only soft limit up to hard limit
-                    new_soft = min(target_limit, hard_limit)
-                    resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard_limit))
-                    logger.info(
-                        f"Increased soft file descriptor limit from {soft_limit} to {new_soft} (hard limit: {hard_limit})"  # noqa: E501
-                    )
+            _raise_nofile_soft_limit()
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Could not increase file descriptor limit: {e}")
 
@@ -2268,11 +2535,9 @@ class MotionLibBase:
         NOTE: This operates over ALL unique motions in the dataset (not just the
         currently loaded batch), so bin indices are stable across reloads.
         """
-        self.adp_samp_num_frames = torch.zeros(
-            self._num_unique_motions, device=self._device, dtype=torch.long
-        )
+        num_frames_by_motion = []
         # Compute motion lengths and frame counts for all unique motions using self._motion_data_keys
-        for i, motion_key in enumerate(self._motion_data_keys):
+        for motion_key in self._motion_data_keys:
             motion_data = self._motion_data_load[motion_key]
 
             # Compute motion length and frame count similar to how it's done in load_motions
@@ -2307,87 +2572,45 @@ class MotionLibBase:
                 num_frames = original_num_frames
             else:
                 num_frames = len(torch.arange(0, original_duration, 1 / self.target_fps))
-            self.adp_samp_num_frames[i] = num_frames
+            num_frames_by_motion.append(int(num_frames))
 
-        # Compute length_starts similar to how it's done in load_motions (using num_frames, not lengths)
-        lengths = self.adp_samp_num_frames
-        lengths_shifted = lengths.roll(1)
-        lengths_shifted[0] = 0
-        self.adp_samp_length_starts = lengths_shifted.cumsum(0)
-        self.adp_samp_total_frames = self.adp_samp_num_frames.sum()
-        self.adp_samp_length_starts_mask = torch.zeros(
-            self.adp_samp_total_frames, device=self._device, dtype=torch.bool
+        self.adp_samp_num_frames = torch.tensor(
+            num_frames_by_motion, device=self._device, dtype=torch.long
         )
-        self.adp_samp_length_starts_mask[self.adp_samp_length_starts] = True
-
-        # init bins - batch version
-        self.adp_samp_bin_size = self.adaptive_sampling_cfg.get("bin_size", 50)
-        self.adp_samp_frame_to_bin = torch.zeros(
-            self.adp_samp_total_frames, device=self._device, dtype=torch.long
+        self.adp_samp_bin_size = int(self.adaptive_sampling_cfg.get("bin_size", 50))
+        self.adp_samp_use_paired_motions = bool(
+            self.m_cfg.get("use_paired_motions", False)
         )
+        compact_index = build_compact_adaptive_index(
+            self.adp_samp_num_frames,
+            self.adp_samp_bin_size,
+            build_paired=self.adp_samp_use_paired_motions,
+        )
+        self.adp_samp_total_frames = compact_index.total_frames
+        self.adp_samp_num_bins = compact_index.num_bins
+        self.adp_samp_num_bins_per_motion = compact_index.num_bins_per_motion
+        self.adp_samp_motion_bin_starts = compact_index.motion_bin_starts
+        self.adp_samp_bins = compact_index.bins
+        self.adp_samp_bin_motion_ids = compact_index.bin_motion_ids
+        self.adp_samp_bin_motion_length = compact_index.bin_lengths
+        self.adp_samp_bin_new_motion_mask = compact_index.bin_new_motion_mask
+        self.adp_samp_num_peer_bins = compact_index.num_peer_bins
+        if compact_index.motion_bin_ids is not None:
+            self.adp_samp_motion_bin_ids = compact_index.motion_bin_ids
 
-        # Pre-compute all bin information in batch
-        all_bins = []
-        all_bin_motion_lengths = []
-        all_bin_new_motion_masks = []
-        all_num_peer_bins = []
-        all_motion_to_bins = []
-
-        cur_bin_idx = 0
-        for orig_motion_id in range(self._num_unique_motions):
-            num_frames = self.adp_samp_num_frames[orig_motion_id]
-            frame_start = self.adp_samp_length_starts[orig_motion_id]
-            frame_end = (
-                self.adp_samp_length_starts[orig_motion_id + 1]
-                if orig_motion_id < self._num_unique_motions - 1
-                else self.adp_samp_total_frames
-            )
-
-            # Create bin starts and ends in batch
-            bin_starts = torch.arange(
-                0, num_frames, self.adp_samp_bin_size, device=self._device, dtype=torch.long
-            )
-            bin_ends = torch.minimum(bin_starts + self.adp_samp_bin_size, num_frames)
-            num_bins = len(bin_starts)
-            motion_ids = torch.full(
-                (num_bins,), orig_motion_id, device=self._device, dtype=torch.long
-            )
-            motion_bins = torch.stack([motion_ids, bin_starts, bin_ends], dim=1)
-            all_bins.append(motion_bins)
-
-            # Calculate bin lengths
-            bin_lengths = bin_ends - bin_starts
-            all_bin_motion_lengths.append(bin_lengths)
-
-            # Create new motion mask (first bin of each motion is True)
-            new_motion_mask = torch.zeros(num_bins, device=self._device, dtype=torch.bool)
-            new_motion_mask[0] = True
-            all_bin_new_motion_masks.append(new_motion_mask)
-
-            # Number of peer bins (same for all bins in this motion)
-            peer_bins = torch.full((num_bins,), num_bins, device=self._device, dtype=torch.long)
-            all_num_peer_bins.append(peer_bins)
-
-            bin_ids = torch.zeros(num_frames, device=self._device, dtype=torch.long)
-            bin_ids[bin_starts[1:]] = 1
-            bin_ids = bin_ids.cumsum(0) + cur_bin_idx
-            self.adp_samp_frame_to_bin[frame_start:frame_end] = bin_ids
-
-            # Store motion to bins mapping
-            motion_bin_indices = torch.arange(
-                cur_bin_idx, cur_bin_idx + num_bins, device=self._device, dtype=torch.long
-            )
-            all_motion_to_bins.append(motion_bin_indices)
-
-            cur_bin_idx += num_bins
-
-        # Concatenate all batch results
-        self.adp_samp_bins = torch.cat(all_bins, dim=0)
-        self.adp_samp_bin_motion_length = torch.cat(all_bin_motion_lengths, dim=0)
-        self.adp_samp_bin_new_motion_mask = torch.cat(all_bin_new_motion_masks, dim=0)
-        self.adp_samp_num_peer_bins = torch.cat(all_num_peer_bins, dim=0)
-        self.orig_motion_id_to_bins = all_motion_to_bins
-        self.adp_samp_num_bins = len(self.adp_samp_bins)
+        legacy_frame_index_bytes = self.adp_samp_total_frames * (
+            torch.tensor([], dtype=torch.long).element_size()
+            + torch.tensor([], dtype=torch.bool).element_size()
+        )
+        logger.info(
+            "Adaptive sampling compact index: motions={}, bins={}, frames={}, "
+            "paired={}, eliminated_frame_index={:.2f} GiB",
+            self._num_unique_motions,
+            self.adp_samp_num_bins,
+            self.adp_samp_total_frames,
+            self.adp_samp_use_paired_motions,
+            legacy_frame_index_bytes / 1024**3,
+        )
 
         self.adp_samp_bin_weights = (
             self.adp_samp_bin_motion_length / self.adp_samp_bin_motion_length.float().mean()
@@ -2458,6 +2681,13 @@ class MotionLibBase:
 
             self.adp_samp_num_episodes[:] = state_dict["adp_samp_num_episodes"].to(self._device)
             self.adp_samp_num_failures[:] = state_dict["adp_samp_num_failures"].to(self._device)
+            logger.info(
+                "Restored adaptive sampling state: bins={}, episode_sum={:.3f}, "
+                "failure_sum={:.3f}",
+                self.adp_samp_num_bins,
+                self.adp_samp_num_episodes.sum().item(),
+                self.adp_samp_num_failures.sum().item(),
+            )
             self.sync_and_compute_adaptive_sampling(sync_across_gpus=False)
         return
 
@@ -2478,27 +2708,28 @@ class MotionLibBase:
         # Convert motion_ids to dataset motion ids if needed
         dataset_motion_ids = self.get_motion_ids_in_dataset(motion_ids)
 
-        time_steps = self.adp_samp_length_starts[dataset_motion_ids] + motion_time_steps
+        bin_ids = map_motion_frames_to_bins(
+            dataset_motion_ids,
+            motion_time_steps,
+            self.adp_samp_motion_bin_starts,
+            self.adp_samp_num_frames,
+            self.adp_samp_bin_size,
+            validate=False,
+        )
+        sparse_add_bin_counts_(
+            self.adp_samp_num_episodes,
+            bin_ids,
+            divisors=self.adp_samp_bin_motion_length,
+        )
 
-        # Handle non-unique dataset_motion_ids by counting occurrences
-        if len(time_steps) > 0:
-            # Use bincount to count occurrences of each unique ID
-            bin_ids = self.adp_samp_frame_to_bin[time_steps]
-            counts = torch.bincount(bin_ids, minlength=self.adp_samp_num_bins)
-            counts = counts / self.adp_samp_bin_motion_length
-            self.adp_samp_num_episodes += counts
-
-        # Update failure counts for failed motions
-        if failure.any():
-            failed_time_steps = time_steps[failure]
-            # Handle non-unique failed motion IDs by counting occurrences
-            if len(failed_time_steps) > 0:
-                bin_ids = self.adp_samp_frame_to_bin[failed_time_steps]
-                failure_counts = torch.bincount(bin_ids, minlength=self.adp_samp_num_bins)
-                failure_counts_multiplier = self.adaptive_sampling_cfg.get(
-                    "failure_counts_multiplier", 1
-                )
-                self.adp_samp_num_failures += failure_counts * failure_counts_multiplier
+        failure_counts_multiplier = self.adaptive_sampling_cfg.get(
+            "failure_counts_multiplier", 1
+        )
+        sparse_add_bin_counts_(
+            self.adp_samp_num_failures,
+            bin_ids[failure],
+            multiplier=failure_counts_multiplier,
+        )
 
     def sync_and_compute_adaptive_sampling(self, accelerator=None, sync_across_gpus=False):
         """Synchronize adaptive sampling stats across GPUs and recompute probabilities.
@@ -2516,17 +2747,21 @@ class MotionLibBase:
         if not self.use_adaptive_sampling:
             return
 
+        sync_across_gpus = sync_across_gpus and self.adaptive_sampling_sync_across_gpus
         if sync_across_gpus:
             with common.Timer("sync_adaptive_sampling_across_gpus"):
                 adp_samp_stats = torch.cat(
                     [self.adp_samp_num_episodes, self.adp_samp_num_failures], dim=-1
                 )
-                adp_samp_stats_all = accelerator.gather(adp_samp_stats).reshape(
-                    -1, *adp_samp_stats.shape
+                # The production 032 corpus has millions of bins. An
+                # all-gather materializes world_size copies on every rank
+                # (over a GiB/rank at world size 32) only to average them.
+                # Reduce the same sufficient statistic in-place instead.
+                adp_samp_stats_mean = accelerator.reduce(
+                    adp_samp_stats, reduction="mean"
                 )
-                adp_samp_stats_all = adp_samp_stats_all.mean(dim=0)
-                self.adp_samp_num_episodes, self.adp_samp_num_failures = adp_samp_stats_all.chunk(
-                    2, dim=-1
+                self.adp_samp_num_episodes, self.adp_samp_num_failures = (
+                    adp_samp_stats_mean.chunk(2, dim=-1)
                 )
 
         with common.Timer("compute_sampling_prob"):
@@ -2634,6 +2869,7 @@ class MotionLibBase:
         if self.max_prob_per_bin_cfg is None and self.max_prob_per_motion_cfg is None:
             self.adp_sampling_active_prob = self.adp_sampling_active_prob.float()
             assert (self.adp_sampling_active_prob >= 0).all()
+            self._update_paired_conditioned_probabilities()
             return
 
         num_active_bins = len(self.adp_samp_active_motion_bins)
@@ -2694,6 +2930,21 @@ class MotionLibBase:
 
         self.adp_sampling_active_prob = self.adp_sampling_active_prob.float()
         assert (self.adp_sampling_active_prob >= 0).all()
+        self._update_paired_conditioned_probabilities()
+
+    def _update_paired_conditioned_probabilities(self):
+        """Build per-motion time-bin distributions for scene-locked terrain motions."""
+        if not self.adp_samp_use_paired_motions:
+            return
+        global_probabilities = torch.zeros(
+            self.adp_samp_num_bins,
+            device=self._device,
+            dtype=self.adp_sampling_active_prob.dtype,
+        )
+        global_probabilities[self.adp_samp_active_motion_bins] = self.adp_sampling_active_prob
+        self.adp_sampling_conditioned_prob = condition_bin_probabilities_by_motion(
+            global_probabilities, self.adp_samp_motion_bin_ids
+        )
 
     def update_adaptive_sampling_motion_sequences(self):
         """Recompute global (full-dataset) motion-level sampling probabilities.
@@ -2729,11 +2980,11 @@ class MotionLibBase:
         # ==========================================================================
         if self.max_prob_per_bin_cfg is None and self.max_prob_per_motion_cfg is None:
             # Sum up the adp_sampling_prob for each motion's frames (no constraints)
-            motion_sampling_probs = torch.zeros(self._num_unique_motions, device=self._device)
-            for orig_motion_id in range(self._num_unique_motions):
-                motion_sampling_probs[orig_motion_id] = self.adp_sampling_prob[
-                    self.orig_motion_id_to_bins[orig_motion_id]
-                ].sum()
+            motion_sampling_probs = aggregate_bin_values_by_motion(
+                self.adp_sampling_prob,
+                self.adp_samp_bin_motion_ids,
+                self._num_unique_motions,
+            )
             self._sampling_prob = motion_sampling_probs / motion_sampling_probs.sum()
             return
 
@@ -2757,11 +3008,11 @@ class MotionLibBase:
                 self.adp_sampling_prob = self.adp_sampling_prob / self.adp_sampling_prob.sum()
 
         # Sum up the adp_sampling_prob for each motion's frames
-        motion_sampling_probs = torch.zeros(self._num_unique_motions, device=self._device)
-        for orig_motion_id in range(self._num_unique_motions):
-            motion_sampling_probs[orig_motion_id] = self.adp_sampling_prob[
-                self.orig_motion_id_to_bins[orig_motion_id]
-            ].sum()
+        motion_sampling_probs = aggregate_bin_values_by_motion(
+            self.adp_sampling_prob,
+            self.adp_samp_bin_motion_ids,
+            self._num_unique_motions,
+        )
 
         # Apply max_prob_per_motion constraint if configured
         if self.max_prob_per_motion_cfg is not None:
@@ -2780,6 +3031,177 @@ class MotionLibBase:
 
         self._sampling_prob = motion_sampling_probs / motion_sampling_probs.sum()
 
+    def get_adaptive_sampling_report(self):
+        """Return full-dataset adaptive sampling probabilities grouped by motion bins.
+
+        The report is intended for periodic training diagnostics. Each row
+        corresponds to one adaptive-sampling bin, i.e. one time segment inside a
+        source motion/pkl. ``sampling_prob`` is the final global probability of
+        drawing that bin after failure-rate weighting, uniform mixing, bin
+        weights, and configured probability caps.
+        """
+        top_k = int(self.adaptive_sampling_cfg.get("report_top_k", 0))
+        if not self.use_adaptive_sampling or top_k <= 0:
+            return None
+
+        # Keep the exported snapshot aligned with the probabilities used to
+        # choose motion sequences on the next motion reload.
+        self.update_adaptive_sampling_motion_sequences()
+        report_full_csv = bool(self.adaptive_sampling_cfg.get("report_full_csv", True))
+        active_motion_ids = set()
+        if self._curr_motion_ids is not None:
+            active_motion_ids = set(self._curr_motion_ids.detach().cpu().tolist())
+
+        def motion_context(orig_motion_id):
+            motion_key = str(self._motion_data_keys[orig_motion_id])
+            motion_data = self._motion_data_load.get(motion_key, {})
+            return motion_key, str(motion_data.get("path", ""))
+
+        def make_bin_row(bin_id, tensors, motion_sampling_prob):
+            bins, sampling_prob, failure_rate, failure_rate_raw, num_episodes, num_failures = (
+                tensors
+            )
+            orig_motion_id, start_frame, end_frame = bins[bin_id].tolist()
+            orig_motion_id = int(orig_motion_id)
+            motion_key, pkl_path = motion_context(orig_motion_id)
+            motion_prob = float(motion_sampling_prob[orig_motion_id].item())
+            segment_index = bin_id - int(motion_bin_starts[orig_motion_id].item())
+            return {
+                "motion_id": orig_motion_id,
+                "motion_key": motion_key,
+                "pkl_path": pkl_path,
+                "bin_id": int(bin_id),
+                "segment_index": int(segment_index),
+                "start_frame": int(start_frame),
+                "end_frame": int(end_frame),
+                "num_frames": int(end_frame - start_frame),
+                "sampling_prob": float(sampling_prob[bin_id].item()),
+                "motion_sampling_prob": motion_prob,
+                "failure_rate": float(failure_rate[bin_id].item()),
+                "failure_rate_raw": float(failure_rate_raw[bin_id].item()),
+                "num_episodes": float(num_episodes[bin_id].item()),
+                "num_failures": float(num_failures[bin_id].item()),
+                "is_active": orig_motion_id in active_motion_ids,
+            }
+
+        def make_motion_row(orig_motion_id, sampling_prob, motion_sampling_prob):
+            orig_motion_id = int(orig_motion_id)
+            motion_key, pkl_path = motion_context(orig_motion_id)
+            bin_start = int(motion_bin_starts[orig_motion_id].item())
+            num_bins = int(num_bins_per_motion[orig_motion_id].item())
+            max_bin_sampling_prob = float(
+                sampling_prob[bin_start : bin_start + num_bins].max().item()
+            )
+            return {
+                "motion_id": orig_motion_id,
+                "motion_key": motion_key,
+                "pkl_path": pkl_path,
+                "num_bins": num_bins,
+                "num_frames": int(num_frames[orig_motion_id].item()),
+                "motion_sampling_prob": float(motion_sampling_prob[orig_motion_id].item()),
+                "max_bin_sampling_prob": max_bin_sampling_prob,
+                "is_active": orig_motion_id in active_motion_ids,
+            }
+
+        rows = []
+        motion_rows = []
+        if report_full_csv:
+            motion_bin_starts = self.adp_samp_motion_bin_starts.detach().cpu()
+            num_bins_per_motion = self.adp_samp_num_bins_per_motion.detach().cpu()
+            num_frames = self.adp_samp_num_frames.detach().cpu()
+            motion_sampling_prob = self._sampling_prob.detach().cpu()
+            tensors = (
+                self.adp_samp_bins.detach().cpu(),
+                self.adp_sampling_prob.detach().cpu(),
+                self.adp_samp_failure_rate.detach().cpu(),
+                self.adp_samp_failure_rate_raw.detach().cpu(),
+                self.adp_samp_num_episodes.detach().cpu(),
+                self.adp_samp_num_failures.detach().cpu(),
+            )
+            for orig_motion_id in range(self._num_unique_motions):
+                bin_start = int(motion_bin_starts[orig_motion_id].item())
+                num_bins = int(num_bins_per_motion[orig_motion_id].item())
+                motion_rows.append(
+                    make_motion_row(orig_motion_id, tensors[1], motion_sampling_prob)
+                )
+                rows.extend(
+                    make_bin_row(bin_id, tensors, motion_sampling_prob)
+                    for bin_id in range(bin_start, bin_start + num_bins)
+                )
+            top_bins = sorted(
+                rows, key=lambda item: item["sampling_prob"], reverse=True
+            )[:top_k]
+            top_motions = sorted(
+                motion_rows,
+                key=lambda item: item["motion_sampling_prob"],
+                reverse=True,
+            )[:top_k]
+        else:
+            motion_bin_starts = self.adp_samp_motion_bin_starts
+            num_bins_per_motion = self.adp_samp_num_bins_per_motion
+            num_frames = self.adp_samp_num_frames
+            motion_sampling_prob = self._sampling_prob
+            num_top_bins = min(top_k, self.adp_samp_num_bins)
+            top_bin_ids = torch.topk(self.adp_sampling_prob, num_top_bins).indices
+            selected_bin_ids = top_bin_ids.detach().cpu().tolist()
+            tensors = (
+                self.adp_samp_bins[selected_bin_ids].detach().cpu(),
+                self.adp_sampling_prob[selected_bin_ids].detach().cpu(),
+                self.adp_samp_failure_rate[selected_bin_ids].detach().cpu(),
+                self.adp_samp_failure_rate_raw[selected_bin_ids].detach().cpu(),
+                self.adp_samp_num_episodes[selected_bin_ids].detach().cpu(),
+                self.adp_samp_num_failures[selected_bin_ids].detach().cpu(),
+            )
+
+            # The selected tensors are compact, so remap their local rows back to
+            # global bin IDs while keeping the existing report schema.
+            top_bins = []
+            for local_id, bin_id in enumerate(selected_bin_ids):
+                compact_tensors = tuple(tensor[local_id : local_id + 1] for tensor in tensors)
+                row = make_bin_row(0, compact_tensors, motion_sampling_prob)
+                row["bin_id"] = int(bin_id)
+                row["segment_index"] = int(
+                    bin_id - motion_bin_starts[row["motion_id"]].item()
+                )
+                top_bins.append(row)
+
+            num_top_motions = min(top_k, self._num_unique_motions)
+            top_motion_ids = torch.topk(self._sampling_prob, num_top_motions).indices
+            top_motions = [
+                make_motion_row(
+                    orig_motion_id,
+                    self.adp_sampling_prob,
+                    motion_sampling_prob,
+                )
+                for orig_motion_id in top_motion_ids.detach().cpu().tolist()
+            ]
+
+        top_bins = [
+            {**row, "rank": rank} for rank, row in enumerate(top_bins, start=1)
+        ]
+        top_motions = [
+            {**row, "rank": rank} for rank, row in enumerate(top_motions, start=1)
+        ]
+        max_bin = {key: value for key, value in top_bins[0].items() if key != "rank"}
+        max_motion = {key: value for key, value in top_motions[0].items() if key != "rank"}
+
+        return {
+            "rows": rows,
+            "motions": motion_rows,
+            "summary": {
+                "num_motions": self._num_unique_motions,
+                "num_bins": self.adp_samp_num_bins,
+                "bin_size": int(self.adp_samp_bin_size),
+                "uniform_sampling_rate": float(self.uniform_sampling_rate),
+                "top_k": top_k,
+                "full_csv_enabled": report_full_csv,
+                "max_bin": max_bin,
+                "max_motion": max_motion,
+                "top_bins": top_bins,
+                "top_motions": top_motions,
+            },
+        }
+
     def update_adaptive_sampling_motion_frames(self):
         """Build the active-bin index for the currently loaded motion batch.
 
@@ -2789,27 +3211,32 @@ class MotionLibBase:
         ``update_adaptive_sampling_probabilities()`` to sample and update only
         the bins that correspond to currently loaded motions.
         """
-        self.adp_samp_active_motion_bins = []
         self.orig_motion_id_to_motion_ids = torch.zeros(
             self._num_unique_motions, device=self._device, dtype=torch.long
         )
-        for motion_id, orig_motion_id in enumerate(self._curr_motion_ids):
-            bins = self.orig_motion_id_to_bins[orig_motion_id.item()]
-            self.adp_samp_active_motion_bins.append(bins)
-            self.orig_motion_id_to_motion_ids[orig_motion_id.item()] = motion_id
+        curr_motion_ids = self._curr_motion_ids.long()
+        motion_ids = torch.arange(
+            len(curr_motion_ids), device=self._device, dtype=torch.long
+        )
+        self.orig_motion_id_to_motion_ids[curr_motion_ids] = motion_ids
+        self.adp_samp_active_motion_bins = expand_contiguous_ranges(
+            self.adp_samp_motion_bin_starts[curr_motion_ids],
+            self.adp_samp_num_bins_per_motion[curr_motion_ids],
+        )
 
-            # Validate adaptive sampling frame count matches actual loaded frames
-            adp_frames = self.adp_samp_num_frames[orig_motion_id].item()
-            loaded_frames = self._motion_num_frames[motion_id].item()
-            assert adp_frames == loaded_frames, (
-                f"Adaptive sampling frame count mismatch for motion "
-                f"{orig_motion_id.item()} (key={self._motion_data_keys[orig_motion_id]}): "
-                f"adp_samp={adp_frames}, loaded={loaded_frames}. "
-                f"This means init_adaptive_sampling computed a different frame count "
-                f"than fk_batch produced at load time."
+        expected_frames = self.adp_samp_num_frames[curr_motion_ids]
+        mismatches = expected_frames != self._motion_num_frames
+        if bool(mismatches.any().item()):
+            motion_id = int(torch.where(mismatches)[0][0].item())
+            orig_motion_id = int(curr_motion_ids[motion_id].item())
+            raise AssertionError(
+                "Adaptive sampling frame count mismatch for motion "
+                f"{orig_motion_id} (key={self._motion_data_keys[orig_motion_id]}): "
+                f"adp_samp={int(expected_frames[motion_id].item())}, "
+                f"loaded={int(self._motion_num_frames[motion_id].item())}. "
+                "This means init_adaptive_sampling computed a different frame count "
+                "than fk_batch produced at load time."
             )
-
-        self.adp_samp_active_motion_bins = torch.cat(self.adp_samp_active_motion_bins, dim=0)
         self.update_adaptive_sampling_probabilities()
 
     def sample_motion_ids_and_time_steps(self, n):
@@ -2845,3 +3272,18 @@ class MotionLibBase:
             offset = torch.randint(pre_failure_sample_window, (n,), device=self._device)
             motion_time_steps = (motion_time_steps - offset).clamp_min(0)
         return motion_ids, motion_time_steps.int()
+
+    def sample_time_steps_for_paired_motion_ids(self, motion_ids):
+        """Sample failure-weighted time bins while preserving fixed motion/scene pairs."""
+        if not self.use_adaptive_sampling:
+            return self.sample_time_steps(motion_ids, truncate_time=None)
+        dataset_motion_ids = self.get_motion_ids_in_dataset(motion_ids)
+        return sample_paired_motion_time_steps(
+            dataset_motion_ids,
+            self.adp_samp_motion_bin_ids,
+            self.adp_sampling_conditioned_prob,
+            self.adp_samp_bins,
+            pre_failure_sample_window=self.adaptive_sampling_cfg.get(
+                "pre_failure_sample_window", 0
+            ),
+        )

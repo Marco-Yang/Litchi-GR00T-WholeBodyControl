@@ -33,6 +33,7 @@ from gear_sonic.envs.env_utils import joint_utils
 from gear_sonic.isaac_utils import rotations
 from gear_sonic.trl.utils import common, order_converter, torch_transform
 from gear_sonic.utils.motion_lib import motion_lib_robot
+from gear_sonic.utils.paired_terrain import rank_uses_terrain, validate_paired_stems
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -65,6 +66,59 @@ def _init_variable_frames(
         f"> num_future_frames={num_future_frames}"
     )
     return per_env_num_frames, frame_choices
+
+
+def _build_a3_fast_relative_slots(
+    num_frames: int,
+    num_history_frames: int | None,
+    valid_future_frames: int | None,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Build A3-fast reference slots for history or truncated-future encoders."""
+    history = 0 if num_history_frames is None else int(num_history_frames)
+    if not (0 <= history <= num_frames):
+        raise ValueError(
+            f"a3_fast_num_history_frames must be in [0, {num_frames}], got {history}"
+        )
+    if valid_future_frames is not None and not (1 <= valid_future_frames <= num_frames):
+        raise ValueError(
+            "a3_fast_valid_future_frames must be within "
+            f"[1, {num_frames}], got {valid_future_frames}"
+        )
+    if history and valid_future_frames is not None:
+        raise ValueError(
+            "a3_fast_num_history_frames and a3_fast_valid_future_frames are mutually exclusive"
+        )
+
+    slots = torch.arange(num_frames, device=device, dtype=torch.long) - history
+    if valid_future_frames is not None:
+        slots.clamp_max_(valid_future_frames - 1)
+    return slots
+
+
+def _zero_pad_a3_fast_future_frames(
+    values: torch.Tensor,
+    num_frames: int,
+    valid_future_frames: int | None,
+    enabled: bool,
+) -> torch.Tensor:
+    """Zero invalid A3-fast time slots while preserving the flattened shape."""
+    if not enabled:
+        return values
+    if valid_future_frames is None:
+        raise ValueError(
+            "a3_fast_zero_pad_invalid_frames requires a3_fast_valid_future_frames"
+        )
+    if not 1 <= int(valid_future_frames) <= int(num_frames):
+        raise ValueError(
+            "a3_fast_valid_future_frames must be within "
+            f"[1, {num_frames}], got {valid_future_frames}"
+        )
+    framed = values.reshape(values.shape[0], num_frames, -1)
+    mask = (
+        torch.arange(num_frames, device=values.device) < int(valid_future_frames)
+    ).to(dtype=values.dtype)
+    return (framed * mask.view(1, num_frames, 1)).reshape(values.shape[0], -1)
 
 
 @configclass
@@ -127,9 +181,13 @@ class TrackingCommand(CommandTerm):
                 into GPU memory. Defaults to ``min(num_envs, 1024)`` or the
                 full library when ``use_paired_motions`` is enabled.
         """
+        # CommandTerm initializes debug visualization before returning to this
+        # constructor, so rank-dependent visualization state must exist first.
+        self._rank_uses_terrain = rank_uses_terrain(cfg.rank_partitioned_terrain)
         super().__init__(cfg, env)
 
         self.is_evaluating = False
+        self.cache_current_references = bool(cfg.cache_current_references)
         self.cmd_body_names = self.cfg.body_names
         self.robot: Articulation = env.scene[cfg.asset_name]
         self.robot_anchor_body_index = self.robot.body_names.index(self.cfg.anchor_body)
@@ -201,6 +259,26 @@ class TrackingCommand(CommandTerm):
                     "filter_motion_keys": self.cfg.filter_motion_keys,
                 }
             )
+        rank_partition = self.cfg.rank_partitioned_terrain
+        self._rank_uses_terrain = rank_uses_terrain(rank_partition)
+        self._use_paired_motions = self.cfg.use_paired_motions
+        self._start_from_first_frame = self.cfg.start_from_first_frame
+        self._init_z_offset = self.cfg.init_z_offset
+        if rank_partition is not None:
+            mode = "terrain" if self._rank_uses_terrain else "flat"
+            motion_lib_cfg.motion_file = rank_partition[f"{mode}_motion_file"]
+            motion_lib_cfg.object_motion_file = (
+                rank_partition.get("terrain_object_motion_file")
+                if self._rank_uses_terrain else None)
+            self._use_paired_motions = self._rank_uses_terrain
+            self._start_from_first_frame = bool(
+                rank_partition.get(f"{mode}_start_from_first_frame", False))
+            self._init_z_offset = float(rank_partition.get(f"{mode}_init_z_offset", 0.0))
+            print(  # noqa: T201
+                f"[TrackingCommand] LOCAL_RANK={os.environ.get('LOCAL_RANK', '0')} "
+                f"uses {mode} motion source: {motion_lib_cfg.motion_file}"
+            )
+
         # Only override filter_motion_keys if explicitly set at command level
         # (don't overwrite the value from motion_lib_cfg if it exists there)
         filter_keys = self.cfg.filter_motion_keys
@@ -225,14 +303,23 @@ class TrackingCommand(CommandTerm):
                 "randomize_wrist_poses": self.cfg.randomize_wrist_poses,
                 "randomize_wrist_prob": self.cfg.randomize_wrist_prob,
                 "randomize_wrist_std": self.cfg.randomize_wrist_std,
+                "use_paired_motions": self._use_paired_motions,
             }
         )
 
         self.motion_lib = motion_lib_robot.MotionLibRobot(
             motion_lib_cfg, self.num_envs, self.device
         )
+        if self._use_paired_motions:
+            if not self.cfg.paired_object_usd_path:
+                raise ValueError("paired_object_usd_path is required for paired terrain motions")
+            validate_paired_stems(
+                self.motion_lib._motion_data_keys,  # noqa: SLF001
+                self.motion_lib.object_data_keys,
+                self.cfg.paired_object_usd_path,
+            )
         if max_num_load_motions is None:
-            if self.cfg.use_paired_motions:
+            if self._use_paired_motions:
                 self.max_num_load_motions = self.motion_lib._num_unique_motions  # noqa: SLF001
             else:
                 self.max_num_load_motions = min(self.num_envs, 1024)
@@ -262,20 +349,48 @@ class TrackingCommand(CommandTerm):
 
         if self.has_dof_mismatch:
             self.body_joint_indices = joint_utils.get_body_joint_indices(self.robot)
-            self.extra_joint_indices = joint_utils.get_hand_joint_indices(self.robot)
+            if len(self.body_joint_indices) != self.motion_lib_num_dof:
+                raise ValueError(
+                    "motion_lib_num_dof does not match resolved body joints: "
+                    f"{self.motion_lib_num_dof} vs {len(self.body_joint_indices)}"
+                )
+            body_joint_index_set = set(self.body_joint_indices.detach().cpu().tolist())
+            extra_joint_indices = [
+                idx for idx in range(self.robot_num_dof) if idx not in body_joint_index_set
+            ]
+            if len(extra_joint_indices) != self.extra_num_dof:
+                raise ValueError(
+                    "extra joint count mismatch: "
+                    f"expected {self.extra_num_dof}, got {len(extra_joint_indices)}"
+                )
+            self.extra_joint_indices = torch.tensor(
+                extra_joint_indices, dtype=torch.long, device=self.device
+            )
+            extra_default_positions = self.cfg.hand_default_positions or [0.0] * self.extra_num_dof
+            extra_default_velocities = self.cfg.hand_default_velocities or [0.0] * self.extra_num_dof
+            if len(extra_default_positions) != self.extra_num_dof:
+                raise ValueError(
+                    "hand_default_positions length must match extra_num_dof: "
+                    f"{len(extra_default_positions)} vs {self.extra_num_dof}"
+                )
+            if len(extra_default_velocities) != self.extra_num_dof:
+                raise ValueError(
+                    "hand_default_velocities length must match extra_num_dof: "
+                    f"{len(extra_default_velocities)} vs {self.extra_num_dof}"
+                )
             self.extra_default_positions = torch.tensor(
-                self.cfg.hand_default_positions or [0.0] * self.extra_num_dof,
+                extra_default_positions,
                 dtype=torch.float32,
                 device=self.device,
             )
             self.extra_default_velocities = torch.tensor(
-                self.cfg.hand_default_velocities or [0.0] * self.extra_num_dof,
+                extra_default_velocities,
                 dtype=torch.float32,
                 device=self.device,
             )
 
         # Step 1: Select which motions to use
-        if self.cfg.use_paired_motions:
+        if self._use_paired_motions:
             # Assign motion IDs sequentially (wraps around if more envs than motions)
             self.motion_ids = (
                 torch.arange(self.num_envs, device=self.device)
@@ -299,9 +414,14 @@ class TrackingCommand(CommandTerm):
             self.motion_ids = self.motion_lib.sample_motions(self.num_envs)
 
         # Step 2: Sample start time steps for selected motions
-        self.motion_start_time_steps = self.motion_lib.sample_time_steps(
-            self.motion_ids, truncate_time=None
-        )
+        if self._use_paired_motions and self.use_adaptive_sampling:
+            self.motion_start_time_steps = (
+                self.motion_lib.sample_time_steps_for_paired_motion_ids(self.motion_ids)
+            )
+        else:
+            self.motion_start_time_steps = self.motion_lib.sample_time_steps(
+                self.motion_ids, truncate_time=None
+            )
 
         # # Debug: print motion assignments
         # motion_keys = self.motion_lib._motion_data_keys
@@ -321,7 +441,9 @@ class TrackingCommand(CommandTerm):
                 dtype=self.motion_start_time_steps.dtype,
                 device=self.device,
             )
-        elif self.cfg.start_from_first_frame:
+        elif self._start_from_first_frame and not (
+            self._use_paired_motions and self.use_adaptive_sampling
+        ):
             self.motion_start_time_steps.zero_()
         self.motion_num_steps = self.motion_lib.get_motion_num_steps(self.motion_ids)
 
@@ -375,6 +497,20 @@ class TrackingCommand(CommandTerm):
         else:
             self.smpl_dt_future_ref_frames = self.cfg.smpl_dt_future_ref_frames
 
+        if self.cfg.a3_fast_num_future_frames is None:
+            self.a3_fast_num_future_frames = self.num_future_frames
+        else:
+            self.a3_fast_num_future_frames = self.cfg.a3_fast_num_future_frames
+        if self.cfg.a3_fast_dt_future_ref_frames is None:
+            self.a3_fast_dt_future_ref_frames = self.cfg.dt_future_ref_frames
+        else:
+            self.a3_fast_dt_future_ref_frames = self.cfg.a3_fast_dt_future_ref_frames
+        self.a3_fast_num_history_frames = self.cfg.a3_fast_num_history_frames
+        self.a3_fast_valid_future_frames = self.cfg.a3_fast_valid_future_frames
+        self.a3_fast_zero_pad_invalid_frames = (
+            self.cfg.a3_fast_zero_pad_invalid_frames
+        )
+
         self.smpl_frame_skips = self.smpl_dt_future_ref_frames // (1.0 / motion_lib_cfg.target_fps)
         self.smpl_future_time_steps_init = (
             (
@@ -385,8 +521,26 @@ class TrackingCommand(CommandTerm):
             .repeat(self.num_envs, 1)
         )
 
+        self.a3_fast_frame_skips = self.a3_fast_dt_future_ref_frames // (
+            1.0 / motion_lib_cfg.target_fps
+        )
+        a3_fast_slots = _build_a3_fast_relative_slots(
+            self.a3_fast_num_future_frames,
+            self.a3_fast_num_history_frames,
+            self.a3_fast_valid_future_frames,
+            self.device,
+        )
+        self.a3_fast_future_time_steps_init = (
+            (a3_fast_slots * self.a3_fast_frame_skips)
+            .view(1, -1)
+            .repeat(self.num_envs, 1)
+        )
+
         self.future_motion_ids = self.motion_ids.repeat_interleave(self.num_future_frames)
         self.smpl_future_motion_ids = self.motion_ids.repeat_interleave(self.smpl_num_future_frames)
+        self.a3_fast_future_motion_ids = self.motion_ids.repeat_interleave(
+            self.a3_fast_num_future_frames
+        )
 
         # Variable frame support
         self.variable_frames_enabled = getattr(self.cfg, "variable_frames_enabled", False)
@@ -405,6 +559,10 @@ class TrackingCommand(CommandTerm):
         )
         self.encoder_sample_probs = None
         if self.encoder_sample_probs_dict is not None:
+            self._requires_encoder_availability_filter = any(
+                float(self.encoder_sample_probs_dict.get(name, 0.0)) > 0.0
+                for name in ("smpl", "soma")
+            )
             self.encoder_sample_probs = torch.tensor(
                 list(self.encoder_sample_probs_dict.values()), device=self.device
             )
@@ -431,6 +589,13 @@ class TrackingCommand(CommandTerm):
                 )
             else:
                 self.teleop_encoder_index = None
+
+            if "a3_fast" in self.encoder_sample_probs_dict:
+                self.a3_fast_encoder_index = list(self.encoder_sample_probs_dict.keys()).index(
+                    "a3_fast"
+                )
+            else:
+                self.a3_fast_encoder_index = None
 
             if "soma" in self.encoder_sample_probs_dict:
                 self.soma_encoder_index = list(self.encoder_sample_probs_dict.keys()).index("soma")
@@ -469,6 +634,12 @@ class TrackingCommand(CommandTerm):
                 self.encoder_sample_probs_no_smpl_no_soma = None
 
             self.teleop_sample_prob_when_smpl = self.cfg.teleop_sample_prob_when_smpl
+            self.coactivate_g1_when_teleop = getattr(
+                self.cfg, "coactivate_g1_when_teleop", False
+            )
+            self.coactivate_g1_when_a3_fast = getattr(
+                self.cfg, "coactivate_g1_when_a3_fast", True
+            )
 
             self.encoder_index = torch.zeros(
                 (self.num_envs, self.encoder_sample_probs.shape[0]),
@@ -524,7 +695,7 @@ class TrackingCommand(CommandTerm):
         # Cache for table metadata loaded from pkl files (loaded once per motion key)
         self._table_meta_cache = {}  # motion_key -> {'table_pos': tensor, 'table_quat': tensor}
 
-        if self.cfg.use_height_map:
+        if self.cfg.use_height_map and self._rank_uses_terrain:
             try:
                 from simple_raycaster.raycaster import MultiMeshRaycaster
             except ImportError:
@@ -594,6 +765,9 @@ class TrackingCommand(CommandTerm):
         inst = object.__new__(cls)
         inst._offline = True  # noqa: SLF001
         inst._debug_vis_handle = None  # noqa: SLF001
+        inst.cache_current_references = bool(
+            motion_lib_cfg.get("cache_current_references", False)
+        )
         num_envs = 1
 
         # device / num_envs are read-only properties on ManagerTermBase that
@@ -619,7 +793,9 @@ class TrackingCommand(CommandTerm):
         # Inject body/DOF mapping into motion_lib_cfg so motion_lib handles
         # body reordering and xyzw→wxyz quaternion conversion at load time.
 
-        isaaclab_to_mujoco_mapping = order_converter.G1Converter().get_isaaclab_to_mujoco_mapping()
+        isaaclab_to_mujoco_mapping = order_converter.get_converter(
+            motion_lib_cfg.get("robot_type", "g1")
+        ).get_isaaclab_to_mujoco_mapping()
         motion_lib_cfg.update(
             {
                 "mujoco_to_isaaclab_body": isaaclab_to_mujoco_mapping["mujoco_to_isaaclab_body"],
@@ -734,6 +910,45 @@ class TrackingCommand(CommandTerm):
         )
         inst.smpl_future_motion_ids = inst.motion_ids.repeat_interleave(inst.smpl_num_future_frames)
 
+        a3_fast_num_future_frames = motion_lib_cfg.get("a3_fast_num_future_frames", None)
+        a3_fast_dt_future_ref_frames = motion_lib_cfg.get("a3_fast_dt_future_ref_frames", None)
+        a3_fast_num_history_frames = motion_lib_cfg.get(
+            "a3_fast_num_history_frames", None
+        )
+        a3_fast_valid_future_frames = motion_lib_cfg.get(
+            "a3_fast_valid_future_frames", None
+        )
+        inst.a3_fast_num_future_frames = (
+            a3_fast_num_future_frames
+            if a3_fast_num_future_frames is not None
+            else num_future_frames
+        )
+        inst.a3_fast_dt_future_ref_frames = (
+            a3_fast_dt_future_ref_frames
+            if a3_fast_dt_future_ref_frames is not None
+            else dt_future_ref_frames
+        )
+        inst.a3_fast_num_history_frames = a3_fast_num_history_frames
+        inst.a3_fast_valid_future_frames = a3_fast_valid_future_frames
+        inst.a3_fast_zero_pad_invalid_frames = motion_lib_cfg.get(
+            "a3_fast_zero_pad_invalid_frames", False
+        )
+        inst.a3_fast_frame_skips = inst.a3_fast_dt_future_ref_frames // (1.0 / target_fps)
+        a3_fast_slots = _build_a3_fast_relative_slots(
+            inst.a3_fast_num_future_frames,
+            inst.a3_fast_num_history_frames,
+            inst.a3_fast_valid_future_frames,
+            device,
+        )
+        inst.a3_fast_future_time_steps_init = (
+            (a3_fast_slots * inst.a3_fast_frame_skips)
+            .view(1, -1)
+            .repeat(num_envs, 1)
+        )
+        inst.a3_fast_future_motion_ids = inst.motion_ids.repeat_interleave(
+            inst.a3_fast_num_future_frames
+        )
+
         # Encoder sampling (not used offline, but set for compat)
         inst.encoder_sample_probs_dict = None
         inst.encoder_sample_probs = None
@@ -756,6 +971,24 @@ class TrackingCommand(CommandTerm):
         """Toggle evaluation mode, which disables reset randomizations."""
         self.is_evaluating = is_evaluating
 
+    def _invalidate_reference_cache(self):
+        """Invalidate motion-library values tied to the current frame."""
+        cache = getattr(self, "_current_reference_cache", None)
+        if cache is not None:
+            cache.clear()
+
+    def _cached_reference(self, key: str, factory):
+        """Return one lazily computed motion-library value for this frame."""
+        if not getattr(self, "cache_current_references", False):
+            return factory()
+        cache = getattr(self, "_current_reference_cache", None)
+        if cache is None:
+            cache = {}
+            self._current_reference_cache = cache
+        if key not in cache:
+            cache[key] = factory()
+        return cache[key]
+
     def forward_motion_samples(self, env_ids: Sequence[int]):
         """Assign sequential motion IDs and reset time steps for given envs.
 
@@ -766,6 +999,7 @@ class TrackingCommand(CommandTerm):
         Args:
             env_ids: Environment indices to reassign motions for.
         """
+        self._invalidate_reference_cache()
         self.motion_ids[env_ids] = (
             torch.arange(self.num_envs).to(self.device)
             % self.motion_lib._num_motions  # noqa: SLF001
@@ -779,7 +1013,7 @@ class TrackingCommand(CommandTerm):
             sampled_times = torch.randint(
                 0, n_frames, (len(env_ids),), dtype=sampled_times.dtype, device=self.device
             )
-        elif self.cfg.start_from_first_frame:
+        elif self._start_from_first_frame:
             sampled_times.zero_()
         self.motion_start_time_steps[env_ids] = sampled_times
         self.motion_num_steps[env_ids] = self.motion_lib.get_motion_num_steps(
@@ -915,6 +1149,26 @@ class TrackingCommand(CommandTerm):
             Tensor of shape ``(num_envs, 2 * num_future_frames * num_dof)``.
         """
         return torch.cat([self.joint_pos_multi_future, self.joint_vel_multi_future], dim=1)
+
+    @property
+    def command_multi_future_a3_fast(self) -> torch.Tensor:
+        """Return A3-fast joint positions and velocities for its shorter future window."""
+        joint_pos = _zero_pad_a3_fast_future_frames(
+            self.joint_pos_multi_future_for_a3_fast,
+            self.a3_fast_num_future_frames,
+            self.a3_fast_valid_future_frames,
+            self.a3_fast_zero_pad_invalid_frames,
+        )
+        joint_vel = _zero_pad_a3_fast_future_frames(
+            self.joint_vel_multi_future_for_a3_fast,
+            self.a3_fast_num_future_frames,
+            self.a3_fast_valid_future_frames,
+            self.a3_fast_zero_pad_invalid_frames,
+        )
+        return torch.cat(
+            [joint_pos, joint_vel],
+            dim=1,
+        )
 
     @property
     def command_multi_future_joint_pos(self) -> torch.Tensor:
@@ -1691,8 +1945,11 @@ class TrackingCommand(CommandTerm):
         Returns:
             Tensor of shape ``(num_envs, num_dof)``.
         """
-        return self.motion_lib.get_dof_pos(
-            self.motion_ids, self.motion_start_time_steps + self.time_steps
+        return self._cached_reference(
+            "joint_pos",
+            lambda: self.motion_lib.get_dof_pos(
+                self.motion_ids, self.motion_start_time_steps + self.time_steps
+            ),
         )
 
     @property
@@ -1702,8 +1959,11 @@ class TrackingCommand(CommandTerm):
         Returns:
             Tensor of shape ``(num_envs, num_future_frames * num_dof)``.
         """
-        return self.motion_lib.get_dof_pos(self.future_motion_ids, self.future_time_steps).view(
-            self.num_envs, -1
+        return self._cached_reference(
+            "joint_pos_multi_future",
+            lambda: self.motion_lib.get_dof_pos(
+                self.future_motion_ids, self.future_time_steps
+            ).view(self.num_envs, -1),
         )
 
     @property
@@ -1711,6 +1971,15 @@ class TrackingCommand(CommandTerm):
         return self.motion_lib.get_dof_pos(
             self.smpl_future_motion_ids, self.smpl_future_time_steps
         ).view(self.num_envs, -1)
+
+    @property
+    def joint_pos_multi_future_for_a3_fast(self) -> torch.Tensor:
+        return self._cached_reference(
+            "joint_pos_multi_future_for_a3_fast",
+            lambda: self.motion_lib.get_dof_pos(
+                self.a3_fast_future_motion_ids, self.a3_fast_future_time_steps
+            ).view(self.num_envs, -1),
+        )
 
     @property
     def joint_pos_lower_body_multi_future(self) -> torch.Tensor:
@@ -1725,8 +1994,11 @@ class TrackingCommand(CommandTerm):
         Returns:
             Tensor of shape ``(num_envs, num_dof)``.
         """
-        return self.motion_lib.get_dof_vel(
-            self.motion_ids, self.motion_start_time_steps + self.time_steps
+        return self._cached_reference(
+            "joint_vel",
+            lambda: self.motion_lib.get_dof_vel(
+                self.motion_ids, self.motion_start_time_steps + self.time_steps
+            ),
         )
 
     @property
@@ -1736,9 +2008,27 @@ class TrackingCommand(CommandTerm):
         Returns:
             Tensor of shape ``(num_envs, num_future_frames * num_dof)``.
         """
-        return self.motion_lib.get_dof_vel(self.future_motion_ids, self.future_time_steps).view(
-            self.num_envs, -1
+        return self._cached_reference(
+            "joint_vel_multi_future",
+            lambda: self.motion_lib.get_dof_vel(
+                self.future_motion_ids, self.future_time_steps
+            ).view(self.num_envs, -1),
         )
+
+    @property
+    def joint_vel_multi_future_for_a3_fast(self) -> torch.Tensor:
+        return self._cached_reference(
+            "joint_vel_multi_future_for_a3_fast",
+            lambda: self.motion_lib.get_dof_vel(
+                self.a3_fast_future_motion_ids, self.a3_fast_future_time_steps
+            ).view(self.num_envs, -1),
+        )
+
+    @property
+    def joint_vel_multi_future_for_a3_fast(self) -> torch.Tensor:
+        return self.motion_lib.get_dof_vel(
+            self.a3_fast_future_motion_ids, self.a3_fast_future_time_steps
+        ).view(self.num_envs, -1)
 
     @property
     def root_pos_multi_future(self) -> torch.Tensor:
@@ -1777,11 +2067,14 @@ class TrackingCommand(CommandTerm):
         Returns:
             Tensor of shape ``(num_envs, num_bodies, 3)``.
         """
-        return (
-            self.motion_lib.get_body_pos_w(
-                self.motion_ids, self.motion_start_time_steps + self.time_steps
+        return self._cached_reference(
+            "body_pos_w",
+            lambda: (
+                self.motion_lib.get_body_pos_w(
+                    self.motion_ids, self.motion_start_time_steps + self.time_steps
+                )
+                + self._env.scene.env_origins[:, None, :]
             )
-            + self._env.scene.env_origins[:, None, :]
         )
 
     @property
@@ -1804,12 +2097,7 @@ class TrackingCommand(CommandTerm):
         Returns:
             Tensor of shape ``(num_envs, num_bodies, 3)``.
         """
-        body_pos_w = self.motion_lib.get_body_pos_w(
-            self.motion_ids, self.motion_start_time_steps + self.time_steps
-        )
-        body_pos_w_env = body_pos_w + self._env.scene.env_origins[:, None, :]
-        body_pos_dif = body_pos_w_env - self.robot_body_pos_w
-        return body_pos_dif
+        return self.body_pos_w - self.robot_body_pos_w
 
     @property
     def body_pos_dif_w_multi_future(self) -> torch.Tensor:
@@ -1876,8 +2164,11 @@ class TrackingCommand(CommandTerm):
         Returns:
             Tensor of shape ``(num_envs, num_bodies, 4)``.
         """
-        return self.motion_lib.get_body_quat_w(
-            self.motion_ids, self.motion_start_time_steps + self.time_steps
+        return self._cached_reference(
+            "body_quat_w",
+            lambda: self.motion_lib.get_body_quat_w(
+                self.motion_ids, self.motion_start_time_steps + self.time_steps
+            ),
         )
 
     @property
@@ -1888,10 +2179,7 @@ class TrackingCommand(CommandTerm):
 
     @property
     def body_quat_dif_w(self) -> torch.Tensor:
-        body_quat_w = self.motion_lib.get_body_quat_w(
-            self.motion_ids, self.motion_start_time_steps + self.time_steps
-        )
-        body_quat_dif = quat_mul(quat_inv(body_quat_w), self.robot_body_quat_w)
+        body_quat_dif = quat_mul(quat_inv(self.body_quat_w), self.robot_body_quat_w)
         return body_quat_dif
 
     @property
@@ -1975,6 +2263,29 @@ class TrackingCommand(CommandTerm):
         mat = matrix_from_quat(root_rot_dif)
         root_rot_dif_l_mat = mat[..., :2].reshape(mat.shape[0], -1)
         return root_rot_dif_l_mat
+
+    @property
+    def root_rot_dif_l_a3_fast_multi_future(self) -> torch.Tensor:
+        """Return reference root orientation relative to robot for A3-fast frames."""
+        ref_root_quat = self.motion_lib.get_root_quat_w(
+            self.a3_fast_future_motion_ids, self.a3_fast_future_time_steps
+        )
+        root_rot_dif = quat_mul(
+            quat_inv(
+                self.robot_anchor_quat_w.view(self.num_envs, 1, 4).repeat(
+                    1, self.a3_fast_num_future_frames, 1
+                )
+            ),
+            ref_root_quat.view(self.num_envs, self.a3_fast_num_future_frames, 4),
+        )
+        mat = matrix_from_quat(root_rot_dif)
+        values = mat[..., :2].reshape(mat.shape[0], -1)
+        return _zero_pad_a3_fast_future_frames(
+            values,
+            self.a3_fast_num_future_frames,
+            self.a3_fast_valid_future_frames,
+            self.a3_fast_zero_pad_invalid_frames,
+        )
 
     @property
     def root_rot_dif_heading_multi_future(self) -> torch.Tensor:
@@ -2067,8 +2378,11 @@ class TrackingCommand(CommandTerm):
 
     @property
     def body_lin_vel_w(self) -> torch.Tensor:
-        return self.motion_lib.get_body_lin_vel_w(
-            self.motion_ids, self.motion_start_time_steps + self.time_steps
+        return self._cached_reference(
+            "body_lin_vel_w",
+            lambda: self.motion_lib.get_body_lin_vel_w(
+                self.motion_ids, self.motion_start_time_steps + self.time_steps
+            ),
         )
 
     @property
@@ -2095,8 +2409,11 @@ class TrackingCommand(CommandTerm):
 
     @property
     def body_ang_vel_w(self) -> torch.Tensor:
-        return self.motion_lib.get_body_ang_vel_w(
-            self.motion_ids, self.motion_start_time_steps + self.time_steps
+        return self._cached_reference(
+            "body_ang_vel_w",
+            lambda: self.motion_lib.get_body_ang_vel_w(
+                self.motion_ids, self.motion_start_time_steps + self.time_steps
+            ),
         )
 
     @property
@@ -2128,12 +2445,7 @@ class TrackingCommand(CommandTerm):
         Returns:
             Tensor of shape ``(num_envs, 3)``.
         """
-        return (
-            self.motion_lib.get_body_pos_w(
-                self.motion_ids, self.motion_start_time_steps + self.time_steps
-            )[:, self.motion_anchor_body_index]
-            + self._env.scene.env_origins
-        )
+        return self.body_pos_w[:, self.motion_anchor_body_index]
 
     @property
     def anchor_pos_w_multi_future(self) -> torch.Tensor:
@@ -2155,9 +2467,7 @@ class TrackingCommand(CommandTerm):
         Returns:
             Tensor of shape ``(num_envs, 4)``.
         """
-        return self.motion_lib.get_body_quat_w(
-            self.motion_ids, self.motion_start_time_steps + self.time_steps
-        )[:, self.motion_anchor_body_index]
+        return self.body_quat_w[:, self.motion_anchor_body_index]
 
     @property
     def anchor_quat_w_multi_future(self) -> torch.Tensor:
@@ -2203,9 +2513,7 @@ class TrackingCommand(CommandTerm):
 
     @property
     def anchor_lin_vel_w(self) -> torch.Tensor:
-        return self.motion_lib.get_body_lin_vel_w(
-            self.motion_ids, self.motion_start_time_steps + self.time_steps
-        )[:, self.motion_anchor_body_index]
+        return self.body_lin_vel_w[:, self.motion_anchor_body_index]
 
     @property
     def anchor_lin_vel_w_multi_future(self) -> torch.Tensor:
@@ -2215,9 +2523,7 @@ class TrackingCommand(CommandTerm):
 
     @property
     def anchor_ang_vel_w(self) -> torch.Tensor:
-        return self.motion_lib.get_body_ang_vel_w(
-            self.motion_ids, self.motion_start_time_steps + self.time_steps
-        )[:, self.motion_anchor_body_index]
+        return self.body_ang_vel_w[:, self.motion_anchor_body_index]
 
     @property
     def anchor_ang_vel_w_multi_future(self) -> torch.Tensor:
@@ -2227,15 +2533,11 @@ class TrackingCommand(CommandTerm):
 
     @property
     def vr_3point_body_quat_w(self) -> torch.Tensor:
-        return self.motion_lib.get_body_quat_w(
-            self.motion_ids, self.motion_start_time_steps + self.time_steps
-        )[:, self.vr_3point_body_indices_motion]
+        return self.body_quat_w[:, self.vr_3point_body_indices_motion]
 
     @property
     def reward_point_body_quat_w(self) -> torch.Tensor:
-        return self.motion_lib.get_body_quat_w(
-            self.motion_ids, self.motion_start_time_steps + self.time_steps
-        )[:, self.reward_point_body_indices_motion]
+        return self.body_quat_w[:, self.reward_point_body_indices_motion]
 
     @property
     def vr_3point_body_quat_w_multi_future(self) -> torch.Tensor:
@@ -2251,13 +2553,8 @@ class TrackingCommand(CommandTerm):
 
     @property
     def reward_point_body_pos_w(self) -> torch.Tensor:
-        reward_point_original = self.motion_lib.get_body_pos_w(
-            self.motion_ids, self.motion_start_time_steps + self.time_steps
-        )[:, self.reward_point_body_indices_motion]
-        return (
-            reward_point_original
-            + quat_apply(self.reward_point_body_quat_w, self.reward_point_body_offsets)
-            + self._env.scene.env_origins[:, None, :]
+        return self.body_pos_w[:, self.reward_point_body_indices_motion] + quat_apply(
+            self.reward_point_body_quat_w, self.reward_point_body_offsets
         )
 
     @property
@@ -2270,13 +2567,8 @@ class TrackingCommand(CommandTerm):
         Returns:
             Tensor of shape ``(num_envs, 3, 3)``.
         """
-        vr_3point_original = self.motion_lib.get_body_pos_w(
-            self.motion_ids, self.motion_start_time_steps + self.time_steps
-        )[:, self.vr_3point_body_indices_motion]
-        return (
-            vr_3point_original
-            + quat_apply(self.vr_3point_body_quat_w, self.vr_3point_body_offsets)
-            + self._env.scene.env_origins[:, None, :]
+        return self.body_pos_w[:, self.vr_3point_body_indices_motion] + quat_apply(
+            self.vr_3point_body_quat_w, self.vr_3point_body_offsets
         )
 
     @property
@@ -2853,6 +3145,16 @@ class TrackingCommand(CommandTerm):
         Args:
             env_ids: Environment indices being reset.
         """
+        # ``_update_command`` calls this method every control step, even when no
+        # motion has expired.  Most of the reset path below intentionally builds
+        # full-environment tensors, so letting an empty index through still pays
+        # for clones, random samples, and simulator write setup.  The relative
+        # reference cache is the only part that must run on every step.
+        if len(env_ids) == 0:
+            self._update_relative_reference()
+            return
+
+        self._invalidate_reference_cache()
         self.time_steps[env_ids] = 0
         # Variable frames: resample per-env num_frames at episode reset
         if self.variable_frames_enabled and len(env_ids) > 0:
@@ -2865,11 +3167,22 @@ class TrackingCommand(CommandTerm):
                     % self.motion_lib._num_motions  # noqa: SLF001
                 )[env_ids]
                 self.motion_start_time_steps[env_ids] = 0
-            elif self.cfg.use_paired_motions:
+            elif self._use_paired_motions:
                 self.motion_ids[env_ids] = (
                     torch.arange(self.num_envs).to(self.device)
                     % self.motion_lib._num_motions  # noqa: SLF001
                 )[env_ids]
+                if self.use_adaptive_sampling:
+                    sampled_times = self.motion_lib.sample_time_steps_for_paired_motion_ids(
+                        self.motion_ids[env_ids]
+                    )
+                else:
+                    sampled_times = self.motion_lib.sample_time_steps(
+                        self.motion_ids[env_ids], truncate_time=None
+                    )
+                if self._start_from_first_frame and not self.use_adaptive_sampling:
+                    sampled_times.zero_()
+                self.motion_start_time_steps[env_ids] = sampled_times
 
             elif self._multi_object_mode:
                 # MULTI-OBJECT MODE: Resetting envs sample a new motion (and corresponding object)
@@ -2900,7 +3213,7 @@ class TrackingCommand(CommandTerm):
                     sampled_times = torch.randint(
                         0, n_frames, (len(env_ids),), dtype=sampled_times.dtype, device=self.device
                     )
-                elif self.cfg.start_from_first_frame:
+                elif self._start_from_first_frame:
                     sampled_times.zero_()
 
                 # Contact-based initialization: sample timestamps before first contact frame
@@ -2910,25 +3223,31 @@ class TrackingCommand(CommandTerm):
                 self.motion_start_time_steps[env_ids] = sampled_times
 
             if self.encoder_sample_probs is not None:
-                has_smpl = self.motion_lib.motion_has_smpl[self.motion_ids[env_ids]]
-                if self.soma_encoder_index is not None and hasattr(
-                    self.motion_lib, "motion_has_soma"
-                ):
-                    has_soma = self.motion_lib.motion_has_soma[self.motion_ids[env_ids]]
-                    sampling_cases = [
-                        (env_ids[has_smpl & has_soma], self.encoder_sample_probs),
-                        (env_ids[has_smpl & ~has_soma], self.encoder_sample_probs_no_soma),
-                        (env_ids[~has_smpl & has_soma], self.encoder_sample_probs_no_smpl),
-                        (
-                            env_ids[~has_smpl & ~has_soma],
-                            self.encoder_sample_probs_no_smpl_no_soma,
-                        ),
-                    ]
+                if not self._requires_encoder_availability_filter:
+                    # Only nonzero modes are G1 and A3-fast, both of which exist
+                    # for every robot motion. Avoid dynamic boolean subsets and
+                    # their host-visible lengths on every reset.
+                    sampling_cases = [(env_ids, self.encoder_sample_probs)]
                 else:
-                    sampling_cases = [
-                        (env_ids[has_smpl], self.encoder_sample_probs),
-                        (env_ids[~has_smpl], self.encoder_sample_probs_no_smpl),
-                    ]
+                    has_smpl = self.motion_lib.motion_has_smpl[self.motion_ids[env_ids]]
+                    if self.soma_encoder_index is not None and hasattr(
+                        self.motion_lib, "motion_has_soma"
+                    ):
+                        has_soma = self.motion_lib.motion_has_soma[self.motion_ids[env_ids]]
+                        sampling_cases = [
+                            (env_ids[has_smpl & has_soma], self.encoder_sample_probs),
+                            (env_ids[has_smpl & ~has_soma], self.encoder_sample_probs_no_soma),
+                            (env_ids[~has_smpl & has_soma], self.encoder_sample_probs_no_smpl),
+                            (
+                                env_ids[~has_smpl & ~has_soma],
+                                self.encoder_sample_probs_no_smpl_no_soma,
+                            ),
+                        ]
+                    else:
+                        sampling_cases = [
+                            (env_ids[has_smpl], self.encoder_sample_probs),
+                            (env_ids[~has_smpl], self.encoder_sample_probs_no_smpl),
+                        ]
                 for subset_ids, probs in sampling_cases:
                     if len(subset_ids) > 0:
                         encoder_index = torch.multinomial(
@@ -2972,6 +3291,20 @@ class TrackingCommand(CommandTerm):
                                 | sample_teleop.long()
                             )
 
+                # When teleop is sampled, optionally also activate G1 so the same
+                # samples have paired latents for g1-teleop alignment. Teleop
+                # tokens still drive the policy because they overwrite G1 tokens
+                # during token assembly.
+                if (
+                    self.teleop_encoder_index is not None
+                    and self.coactivate_g1_when_teleop
+                    and not self.optimize_encoders_ratio_for_CHIP
+                ):
+                    use_teleop = self.encoder_index[env_ids, self.teleop_encoder_index]
+                    self.encoder_index[env_ids, self.g1_encoder_index] = (
+                        self.encoder_index[env_ids, self.g1_encoder_index] | use_teleop
+                    )
+
                 # When soma is sampled, also activate g1 (for g1-soma latent alignment)
                 if (
                     self.soma_encoder_index is not None
@@ -2982,26 +3315,43 @@ class TrackingCommand(CommandTerm):
                         self.encoder_index[env_ids, self.g1_encoder_index] | use_soma
                     )
 
+                # A3-fast follows the existing student/teacher latent-pairing pattern.
+                if (
+                    self.a3_fast_encoder_index is not None
+                    and self.coactivate_g1_when_a3_fast
+                    and not self.optimize_encoders_ratio_for_CHIP
+                ):
+                    use_a3_fast = self.encoder_index[env_ids, self.a3_fast_encoder_index]
+                    self.encoder_index[env_ids, self.g1_encoder_index] = (
+                        self.encoder_index[env_ids, self.g1_encoder_index] | use_a3_fast
+                    )
+
             self.motion_num_steps[env_ids] = self.motion_lib.get_motion_num_steps(
                 self.motion_ids[env_ids]
             )
             if self.num_future_frames > 1:
-                self.future_motion_ids = self.motion_ids.repeat_interleave(self.num_future_frames)
+                self.future_motion_ids = self.motion_ids.repeat_interleave(
+                    self.num_future_frames
+                )
                 self.smpl_future_motion_ids = self.motion_ids.repeat_interleave(
                     self.smpl_num_future_frames
                 )
-                self.motion_num_steps[env_ids] = self.motion_lib.get_motion_num_steps(
-                    self.motion_ids[env_ids]
+                self.a3_fast_future_motion_ids = self.motion_ids.repeat_interleave(
+                    self.a3_fast_num_future_frames
                 )
 
             # Update per-env first contact frame based on assigned motion
             if self._first_contact_frame is not None:
                 self._update_per_env_first_contact(env_ids)
 
-        root_pos = self.body_pos_w[:, 0].clone()
-        root_ori = self.body_quat_w[:, 0].clone()
-        root_lin_vel = self.body_lin_vel_w[:, 0].clone()
-        root_ang_vel = self.body_ang_vel_w[:, 0].clone()
+        # Reset only the requested environments.  This path normally receives a
+        # small timeout/reset subset, so cloning and randomizing all environments
+        # creates large transient tensors that are immediately discarded.
+        root_pos = self.body_pos_w[env_ids, 0].clone()
+        root_ori = self.body_quat_w[env_ids, 0].clone()
+        root_lin_vel = self.body_lin_vel_w[env_ids, 0].clone()
+        root_ang_vel = self.body_ang_vel_w[env_ids, 0].clone()
+        root_pos[:, 2] += self._init_z_offset
 
         self.running_ref_root_height[env_ids] = self.anchor_pos_w[env_ids, 2]
 
@@ -3016,11 +3366,11 @@ class TrackingCommand(CommandTerm):
             rand_samples = sample_uniform(
                 ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device
             )
-            root_pos[env_ids] += rand_samples[:, 0:3]
+            root_pos += rand_samples[:, 0:3]
             orientations_delta = quat_from_euler_xyz(
                 rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5]
             )
-            root_ori[env_ids] = quat_mul(orientations_delta, root_ori[env_ids])
+            root_ori = quat_mul(orientations_delta, root_ori)
             range_list = [
                 self.cfg.velocity_range.get(key, (0.0, 0.0))
                 for key in ["x", "y", "z", "roll", "pitch", "yaw"]
@@ -3029,20 +3379,20 @@ class TrackingCommand(CommandTerm):
             rand_samples = sample_uniform(
                 ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device
             )
-            root_lin_vel[env_ids] += rand_samples[:, :3]
-            root_ang_vel[env_ids] += rand_samples[:, 3:]
+            root_lin_vel += rand_samples[:, :3]
+            root_ang_vel += rand_samples[:, 3:]
 
         # Handle DOF mismatch between motion library and robot
-        motion_lib_joint_pos = self.joint_pos.clone()  # Shape: [num_envs, motion_lib_num_dof]
-        motion_lib_joint_vel = self.joint_vel.clone()  # Shape: [num_envs, motion_lib_num_dof]
+        motion_lib_joint_pos = self.joint_pos[env_ids].clone()
+        motion_lib_joint_vel = self.joint_vel[env_ids].clone()
 
         if self.has_dof_mismatch:
-            # Create full robot joint tensors and map using name-based indices
+            # Create reset-subset robot joint tensors and map using name-based indices.
             joint_pos = torch.zeros(
-                self.num_envs, self.robot_num_dof, dtype=torch.float32, device=self.device
+                len(env_ids), self.robot_num_dof, dtype=torch.float32, device=self.device
             )
             joint_vel = torch.zeros(
-                self.num_envs, self.robot_num_dof, dtype=torch.float32, device=self.device
+                len(env_ids), self.robot_num_dof, dtype=torch.float32, device=self.device
             )
             joint_pos[:, self.body_joint_indices] = motion_lib_joint_pos
             joint_vel[:, self.body_joint_indices] = motion_lib_joint_vel
@@ -3053,27 +3403,39 @@ class TrackingCommand(CommandTerm):
             joint_vel = motion_lib_joint_vel
 
         if not self.is_evaluating:
-            joint_pos += sample_uniform(
-                *self.cfg.joint_position_range, joint_pos.shape, joint_pos.device
-            )
-            joint_vel += sample_uniform(
-                *self.cfg.joint_velocity_range, joint_vel.shape, joint_vel.device
-            )
+            if self.has_dof_mismatch:
+                joint_pos[:, self.body_joint_indices] += sample_uniform(
+                    *self.cfg.joint_position_range,
+                    (len(env_ids), self.motion_lib_num_dof),
+                    joint_pos.device,
+                )
+                joint_vel[:, self.body_joint_indices] += sample_uniform(
+                    *self.cfg.joint_velocity_range,
+                    (len(env_ids), self.motion_lib_num_dof),
+                    joint_vel.device,
+                )
+            else:
+                joint_pos += sample_uniform(
+                    *self.cfg.joint_position_range, joint_pos.shape, joint_pos.device
+                )
+                joint_vel += sample_uniform(
+                    *self.cfg.joint_velocity_range, joint_vel.shape, joint_vel.device
+                )
 
         soft_joint_pos_limits = self.robot.data.soft_joint_pos_limits[env_ids]
-        joint_pos[env_ids] = torch.clip(
-            joint_pos[env_ids], soft_joint_pos_limits[:, :, 0], soft_joint_pos_limits[:, :, 1]
+        joint_pos = torch.clip(
+            joint_pos, soft_joint_pos_limits[:, :, 0], soft_joint_pos_limits[:, :, 1]
         )
 
         ####### Resetting Humaonid States #######
-        self.robot.write_joint_state_to_sim(joint_pos[env_ids], joint_vel[env_ids], env_ids=env_ids)
+        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
         self.robot.write_root_state_to_sim(
             torch.cat(
                 [
-                    root_pos[env_ids],
-                    root_ori[env_ids],
-                    root_lin_vel[env_ids],
-                    root_ang_vel[env_ids],
+                    root_pos,
+                    root_ori,
+                    root_lin_vel,
+                    root_ang_vel,
                 ],
                 dim=-1,
             ),
@@ -3194,24 +3556,30 @@ class TrackingCommand(CommandTerm):
                 table_root_pose = torch.cat([table_pos, table_quat], dim=-1)
                 table.write_root_pose_to_sim(table_root_pose, env_ids=env_ids)
 
-        anchor_pos_w_repeat = self.anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
-        anchor_quat_w_repeat = self.anchor_quat_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
-        robot_anchor_pos_w_repeat = self.robot_anchor_pos_w[:, None, :].repeat(
-            1, len(self.cfg.body_names), 1
-        )
-        robot_anchor_quat_w_repeat = self.robot_anchor_quat_w[:, None, :].repeat(
-            1, len(self.cfg.body_names), 1
+        self._update_relative_reference()
+
+    def _update_relative_reference(self):
+        """Update the current reference poses in the robot anchor frame."""
+        num_bodies = len(self.cfg.body_names)
+        anchor_pos_w = self.anchor_pos_w[:, None, :]
+        anchor_quat_w = self.anchor_quat_w[:, None, :].expand(-1, num_bodies, -1)
+        robot_anchor_quat_w = self.robot_anchor_quat_w[:, None, :].expand(
+            -1, num_bodies, -1
         )
 
-        delta_pos_w = robot_anchor_pos_w_repeat  # Root position of the robot
-        delta_pos_w[..., 2] = anchor_pos_w_repeat[..., 2]
+        # Only delta_pos is mutated. Broadcast the other root tensors as views
+        # instead of materializing four repeated Bxbody tensors every step.
+        delta_pos_w = self.robot_anchor_pos_w[:, None, :].expand(
+            -1, num_bodies, -1
+        ).clone()
+        delta_pos_w[..., 2] = anchor_pos_w[..., 2]
         delta_ori_w = torch_transform.get_heading_q(
-            quat_mul(robot_anchor_quat_w_repeat, quat_inv(anchor_quat_w_repeat))
+            quat_mul(robot_anchor_quat_w, quat_inv(anchor_quat_w))
         )
 
         self.body_quat_relative_w = quat_mul(delta_ori_w, self.body_quat_w)
         self.body_pos_relative_w = delta_pos_w + quat_apply(
-            delta_ori_w, self.body_pos_w - anchor_pos_w_repeat
+            delta_ori_w, self.body_pos_w - anchor_pos_w
         )
 
     def _update_command(self):
@@ -3233,6 +3601,7 @@ class TrackingCommand(CommandTerm):
                     )
                     # A snapshot is valid for exactly one physics step.
                     self._adp_snapshot_valid = False
+        self._invalidate_reference_cache()
         self.time_steps += 1
         env_ids = torch.where(
             self.time_steps + self.motion_start_time_steps
@@ -3247,7 +3616,7 @@ class TrackingCommand(CommandTerm):
             ema_alpha * self.anchor_pos_w[:, 2] + (1 - ema_alpha) * self.running_ref_root_height
         )
 
-        if self.cfg.use_height_map:
+        if self.cfg.use_height_map and self._rank_uses_terrain:
             root_pos_w = self.robot.data.root_pos_w
             root_quat_w = self.robot.data.root_quat_w
 
@@ -3290,15 +3659,18 @@ class TrackingCommand(CommandTerm):
         Returns:
             Flattened tensor of shape ``(num_envs * num_future_frames,)``.
         """
-        return (
-            torch.clip(
-                self.future_time_steps_init
-                + self.time_steps[:, None]
-                + self.motion_start_time_steps[:, None],
-                max=self.motion_num_steps[:, None] - 1,
+        return self._cached_reference(
+            "future_time_steps",
+            lambda: (
+                torch.clip(
+                    self.future_time_steps_init
+                    + self.time_steps[:, None]
+                    + self.motion_start_time_steps[:, None],
+                    max=self.motion_num_steps[:, None] - 1,
+                )
+                .flatten()
+                .long()
             )
-            .flatten()
-            .long()
         )
 
     @property
@@ -3310,16 +3682,36 @@ class TrackingCommand(CommandTerm):
         Returns:
             Flattened tensor of shape ``(num_envs * smpl_num_future_frames,)``.
         """
-        return (
-            torch.clip(
-                self.smpl_future_time_steps_init
-                + self.time_steps[:, None]
-                + self.motion_start_time_steps[:, None],
-                max=self.motion_num_steps[:, None] - 1,
+        return self._cached_reference(
+            "smpl_future_time_steps",
+            lambda: (
+                torch.clip(
+                    self.smpl_future_time_steps_init
+                    + self.time_steps[:, None]
+                    + self.motion_start_time_steps[:, None],
+                    max=self.motion_num_steps[:, None] - 1,
+                )
+                .flatten()
+                .long()
             )
-            .flatten()
-            .long()
         )
+
+    @property
+    def a3_fast_future_time_steps(self) -> torch.Tensor:
+        """Compute absolute time-step indices for A3-fast future reference frames."""
+        def compute_time_steps():
+            time_steps = (
+                self.a3_fast_future_time_steps_init
+                + self.time_steps[:, None]
+                + self.motion_start_time_steps[:, None]
+            )
+            time_steps = torch.clamp(time_steps, min=0)
+            time_steps = torch.minimum(
+                time_steps, self.motion_num_steps[:, None] - 1
+            )
+            return time_steps.flatten().long()
+
+        return self._cached_reference("a3_fast_future_time_steps", compute_time_steps)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         """Create or toggle visibility of debug visualization markers.
@@ -3354,7 +3746,7 @@ class TrackingCommand(CommandTerm):
             for i in range(len(self.cfg.feet_body_names)):
                 self.feet_contact_goal_visualizers[i].set_visibility(True)
 
-            if self.cfg.use_height_map:
+            if self.cfg.use_height_map and self._rank_uses_terrain:
                 if not hasattr(self, "height_map_visualizer"):
                     height_map_cfg = VisualizationMarkersCfg(
                         prim_path="/Visuals/height_map",
@@ -3417,7 +3809,7 @@ class TrackingCommand(CommandTerm):
                         marker_indices=self.feet_r.int().reshape(-1),
                     )
 
-        if self.cfg.use_height_map:
+        if self.cfg.use_height_map and self._rank_uses_terrain:
             self.height_map_visualizer.visualize(
                 translations=self.scan_dot_pos_w.view(-1, 3),
             )
@@ -3471,6 +3863,7 @@ class TrackingCommand(CommandTerm):
 
     def set_motion_state(self, motion_ids, time_steps, motion_start_time_steps=None):
         """Update which motion clip/frame this command serves (for offline use)."""
+        self._invalidate_reference_cache()
         self.motion_ids = motion_ids
         self.time_steps = time_steps
         self.motion_start_time_steps = (
@@ -3480,6 +3873,9 @@ class TrackingCommand(CommandTerm):
         )
         self.future_motion_ids = motion_ids.repeat_interleave(self.num_future_frames)
         self.smpl_future_motion_ids = motion_ids.repeat_interleave(self.smpl_num_future_frames)
+        self.a3_fast_future_motion_ids = motion_ids.repeat_interleave(
+            self.a3_fast_num_future_frames
+        )
         self.motion_num_steps = self.motion_lib.get_time_step_total(motion_ids)
 
 
@@ -4071,10 +4467,17 @@ class TrackingCommandCfg(CommandTermCfg):
     asset_name: str = dataclasses.MISSING
 
     motion_lib_cfg: dict = None
+    # Cache repeated motion-library lookups within one simulation frame.  This
+    # changes repeated-property aliasing, so experiments opt in explicitly.
+    cache_current_references: bool = False
     motion_file: str = None
     smpl_motion_file: str = None
     filter_motion_keys: list[str] = None
     use_paired_motions: bool = False
+    paired_object_usd_path: str = None
+    # Optional DDP partition: equal-sized ranks provide an exact flat:terrain
+    # rollout ratio while keeping each terrain motion paired to a fixed USD.
+    rank_partitioned_terrain: dict = None
     # Contact-based initialization: sample timestamps before first contact frame
     # Path to contact pickle file (e.g., data/motion_lib_grab/contact/s2_apple_lift.pkl)
     contact_file: str = None
@@ -4118,7 +4521,21 @@ class TrackingCommandCfg(CommandTermCfg):
     smpl_num_future_frames: int = None  # noqa: PIE794
     smpl_dt_future_ref_frames: float = None  # noqa: PIE794
 
+    a3_fast_num_future_frames: int = None
+    a3_fast_dt_future_ref_frames: float = None
+    # If set, the first slots reference frames before the current command time.
+    # Experiment 008 uses 5 history + 5 current/future slots.
+    a3_fast_num_history_frames: int = None
+    # If set, slots after this count repeat the last available future sample.
+    # For the 100 ms distilled encoder: 10 slots, 20 ms spacing, valid=5.
+    a3_fast_valid_future_frames: int = None
+    # Keep the legacy input width but replace slots after valid_future_frames
+    # with zeros instead of repeated reference samples.
+    a3_fast_zero_pad_invalid_frames: bool = False
+    coactivate_g1_when_a3_fast: bool = True
+
     encoder_sample_probs: dict[str, float] = None
+    coactivate_g1_when_a3_fast: bool = True
 
     # ==========================================================================
     # CHIP Compliance Training Optimization Flag
@@ -4139,6 +4556,10 @@ class TrackingCommandCfg(CommandTermCfg):
     # Probability to also sample teleop mode when smpl mode is active
     # This enables teleop-smpl and g1-teleop latent alignment losses
     teleop_sample_prob_when_smpl: float = 0.0
+
+    # Also compute G1 latents for teleop-native samples so g1-teleop latent
+    # alignment has paired samples. Teleop tokens remain the policy input.
+    coactivate_g1_when_teleop: bool = False
 
     # Always start from the first frame of the motion file during resampling
     # Useful for debugging and replaying specific motions from the beginning
@@ -4169,6 +4590,7 @@ class TrackingCommandCfg(CommandTermCfg):
 
     joint_position_range: tuple[float, float] = (-0.52, 0.52)
     joint_velocity_range: tuple[float, float] = (-0, 0)
+    init_z_offset: float = 0.0
 
     body_pos_visualizer_cfg: VisualizationMarkersCfg = DEFORMABLE_TARGET_MARKER_CFG.replace(
         prim_path="/Visuals/goal_marker_sphere"

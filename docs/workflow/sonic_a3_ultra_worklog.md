@@ -2098,3 +2098,341 @@ python3 gear_sonic/data_process/filter_and_copy_bones_data.py \
 `gear_sonic/envs/manager_env/robots/a3_ultra.py:296-303` 的 `wrist_roll` 块：`effort_limit_sim=24.0, velocity_limit_sim=15.71`（对应 PFP-59-60 电机规格，与 Litchi `a3.py` 给 wrist_roll 用的电机型号一致）但 `armature=0.000810`（这是 PFP-41-48 电机的反射惯量，本应是 PFP-59-60 的 `0.004967`）。注释自相矛盾：写着"PFP-41-48"却配的是 PFP-59-60 的力矩/限速数值。Litchi 的 `a3_motor_params.py`／`a3.py` 对应位置是自洽的（`ARMATURE_PFP_59_60 = 0.004967`，与 24Nm/15.71rad/s 配套）。
 
 **这是我方从零训练 A3 Ultra 时的仿真参数 bug**（wrist_roll 关节仿真惯量偏小约 6 倍，与这次"能否部署 Litchi checkpoint"的问题无关），独立记录，后续训练前应修正为 `0.004967`。
+
+---
+
+## 38. [2026-10-13] 修复 a3_ultra.py wrist_roll armature 笔误
+
+worklog #37 发现的笔误已修：`gear_sonic/envs/manager_env/robots/a3_ultra.py` 的 `wrist_roll` armature 从 `0.000810`（PFP-41-48，和自己的 24Nm/15.71rad/s 力矩/限速不匹配）改为 `0.004967`（PFP-59-60，和 Litchi `a3_motor_params.py` 的 `ARMATURE_PFP_59_60` 独立核对一致）。影响：本项目后续从零训练 A3 Ultra 时 wrist_roll 关节仿真反射惯量不再偏小 6 倍。与本次 A3 集成工作无关的独立修复。
+
+---
+
+## 39. [2026-10-13] A3 集成 Phase 1（训练侧文件迁移）完成
+
+按 `docs/workflow/a3_integration_plan.md` 的决策（Phase 4 完整范围、CLI 统一为 `a3`、直接拷贝文件），把 `Litchi_sonic_for_a3` 的训练侧代码迁移进本仓库，sonic_a3_035.yaml 的全部 `gear_sonic.*` 引用已逐条核实可解析。
+
+**纯拷贝（新文件，无冲突）**：
+- `gear_sonic/envs/manager_env/robots/a3.py`、`utils/a3_motor_params.py`、`utils/a3_motor_model.py`（+ `data/a3_motor_model/` 504K jacobian 表）
+- `config/exp/manager/universal_token/all_modes/sonic_a3.yaml`、`sonic_a3_035.yaml`
+- `config/actor_critic/encoders/a3_fast_mf_mlp.yaml`
+- `config/aux_losses/universal_token/g1_recon_and_a3_fast_latent.yaml` + `terms/{a3_fast_g1_latent,reencoded_a3_fast_g1_latent,a3_fast_recon}.yaml`
+- `config/manager_env/observations/terms/{command_multi_future_a3_fast_nonflat,motion_anchor_ori_a3_fast_b_mf_nonflat}.yaml`、`tokenizer/unitoken_all_noz_a3_fast.yaml`
+- `data/assets/robot_description/mjcf/a3_t2d5*.xml`（8 个变体）+ `urdf/a3/`（20M）
+
+**逐函数手动合并验证（非纯新增，与 Litchi 对比到逐行一致）**：
+- `order_converter.py`：新增 `A3Converter`（29-DOF 紧凑序，区别于已有的 `A3UltraConverter` 63-DOF）
+- `commands.py`（最高风险文件）：A3-fast 独立的未来帧窗口机制（支持历史帧/截断有效帧/零填充，比 smpl 的纯未来窗口更复杂）、`a3_fast_encoder_index`/`coactivate_g1_when_a3_fast` 协同激活、`_requires_encoder_availability_filter` 性能优化。**没有**引入 Litchi 版本的引用缓存重构（`_cached_reference`），改用本仓库已有的非缓存 property 写法逐一对应实现，和 Litchi 源码按行比对完全一致（归一化掉缓存包装差异后 diff 为空）
+- `observations.py`：3 个新函数，纯新增，diff 验证完全一致
+- `rewards.py`：A3 电机力矩-转速/并联关节约束惩罚（4 个新 reward class + helper），diff 验证完全一致
+- `token_losses.py`：4 个新 loss class（`A3FastReconLoss`/`A3FastG1LatentLoss`/`TeleopA3FastLatentLoss`/`ReencodedA3FastG1LatentLoss`），diff 验证完全一致
+- `events.py`：**发现的真实问题**——`randomize_rigid_body_com` 原实现对多 body 场景是 bug（所有选中 body 共享同一个随机偏移、且索引写入时忽略了 `env_ids` 只在 `len()` 取数量时用到），当前仓库唯一调用方 `base_com`（`mode: startup`、单 body `torso_link`）不会触发这个问题所以一直没暴露；但 A3 新增的 `arm_com`/`waist_com`/`leg_com` 是多 body 场景，必须用 Litchi 修复后的版本（每个 body 独立采样、正确按 env_ids 索引）。已采用 Litchi 版本（同时也修了 `randomize_joint_default_pos` 对 `shared_joint_names` 为空时的保护）。`events.py` 与 Litchi 源码逐字节比对完全一致（`diff` 输出为空）
+
+**未改动，核实为零差异的文件**：`terminations.py`、`actions.py`、`curriculum.py` 与 Litchi 版本逐字节一致，无需任何改动。
+
+**CLI**：`train_agent_trl.py` 的 `ROBOT_EXP_MAP` 新增 `"a3": "manager/universal_token/all_modes/sonic_a3_035"`，保留 `"a3_ultra"` 条目不变（两份训练合约独立共存，待用户确认是否要合并/废弃 a3_ultra 这条）。
+
+**验证方法**：每个文件改动后都做了 (1) `py_compile`/`ast.parse` 语法检查，(2) 对比新增内容与 Litchi 源码逐字符/逐行 diff，确认改动范围精确等于预期，没有多删/多改。最后做了一次全量引用解析检查：把 `sonic_a3.yaml`/`sonic_a3_035.yaml` 及其拉入的全部新 yaml 文件里出现的每一个 `gear_sonic.*` 的 `func:`/`_target_:` 引用都提取出来，逐个确认对应的函数/类在合并后的代码里存在——全部 resolve 成功，无遗漏。
+
+**仍未做（超出 Phase 1 范围）**：Phase 2（035 checkpoint 迁移 + sim2sim 数值对比验证）、Phase 4（VR 实时遥操重定向模块）、`ROBOT_MODEL_REGISTRY["a3"]`（属于 Phase 4）。
+
+---
+
+## 40. [2026-10-13] A3 集成完整技术记录（面向冷启动 agent 的自包含上下文）
+
+**这一节是独立、完整的参考文档**：假设读者（可能是另一个全新开的 agent）没有读过本对话、没有任何上下文。如果你要继续 A3 集成工作，从这里开始读就够了，不需要再去翻之前的 #37/#38/#39（那三条是发现过程的流水账，这条是整理后的权威总结，内容有重叠，以这条为准）。
+
+### 40.1 背景与目标
+
+用户在跟本仓库（`GR00T-WholeBodyControl`，NVIDIA SONIC 全身控制框架，之前主要跑 G1/H2/A3 Ultra）同级目录下发现了另一个独立 git 仓库 `Litchi_sonic_for_a3`（路径：`/home/user/YZY/HumanWBM/Demo/RL controller/Litchi_sonic_for_a3`，远程 `git@github.com:Marco-Yang/Litchi_sonic_for_a3.git`）——这是 SONIC 团队公开发布的、专门针对 AgiBot A3（非 Ultra 版）机器人的适配，**自带一个训练好的 checkpoint**（`checkpoints/035_step200000/`）。两边是同一套 SONIC 代码库在不同时间点分叉出来的，训练侧架构（Hydra 配置结构、`UniversalTokenModule` 编码器）和部署侧 C++ 框架（`gear_sonic_deploy/`）高度同源，不是两个互不相关的系统。
+
+用户的目标：把 `Litchi_sonic_for_a3` 的训练与部署逻辑、以及训练好的 035 checkpoint，迁移进本仓库 `GR00T-WholeBodyControl`，让训练、仿真、真机部署都能用同一个 `--robot` 命令行参数在 `g1` / `h2` / `a3` 之间切换。
+
+**用户已拍板的决策**（不要重新讨论，直接照做）：
+1. 遥操范围做"完整范围"：不止参考动作回放，要支持 VR 实时姿态 → A3 关节空间轨迹的实时重定向（这部分是 Phase 4，净新增工作量，还没开始）。
+2. CLI 机器人命名统一为 `a3`（不是 `a3_ultra`）。但**真机部署对象仍然是 A3 Ultra 实体**——训练/仿真侧用 Litchi 的 A3(T2D5) 合约（因为 035 checkpoint 就是在这套合约上训出来的），C++ 部署侧的 `robot_io` 后端要对接 A3 Ultra 真机硬件接口（这是 Phase 3 的事，具体怎么接还没定）。本仓库已有的、独立的"从零训练 A3 Ultra"合约（`a3_ultra.py`/`sonic_a3_ultra.yaml`/`a3_ultra_t3d0.xml`，63-DOF 含灵巧手）继续保留，不删除，`ROBOT_EXP_MAP` 里 `"a3_ultra"` 条目也保留——两份训练合约长期共存，**不要混用两边的参数**（尤其是 Kp/Kd，worklog #37 有详细对比：两边给 waist_yaw 的增益差 2 倍多）。
+3. 迁移方式是直接把 Litchi 仓库里的文件拷贝/移植进本仓库对应位置，不用 git subtree，不用 submodule。
+4. 任何 C++ 编译相关的改动，先在隔离环境验证能编译过再往主仓库合并（已完成，见 40.3）。
+
+**完整规划文档**：`docs/workflow/a3_integration_plan.md`（Phase 0-6 的分期计划、决策记录、C++ 编译验证的完整过程）。本节只总结训练侧（Phase 1）已经做完的部分；部署侧/Phase 3/4 的规划仍以 `a3_integration_plan.md` 为准。
+
+### 40.2 两个机器人型号的关系（容易搞混，先说清楚）
+
+- **A3**（代号 T2D5）：Litchi 仓库适配的目标，035 checkpoint 是在这个型号上训的。无手指、无独立俯仰传感器头。
+- **A3 Ultra**（代号 T3D0）：本仓库之前已经在适配的目标（worklog #1-36）。有完整灵巧手（每手 15 指关节）、多一个挂 Livox MID360 激光雷达的独立俯仰头。
+
+**worklog #37 的核心结论**（已验证，详见该条）：两者腿/腰/手臂的运动学（逐 mm 一致）、质量分布（逐 g 一致）、电机规格（力矩/限速/等效惯量逐 6 位小数一致）**几乎完全相同，是同一套硬件平台**，差异只在头和手。这就是为什么 035 checkpoint（在 A3 上训的）理论上可以直接部署到 A3 Ultra 真机上跑——前提是部署时用 A3 自己的 PD 增益合约，不要混用 A3 Ultra 的那组。
+
+### 40.3 C++ 部署框架编译验证（已完成，详细过程见 `a3_integration_plan.md`）
+
+简要结论：`Litchi_sonic_for_a3/gear_sonic_deploy/`（含 AimRT 中间件 + ROS2 + protobuf 的完整后端）在隔离 conda 环境（`a3_deploy_verify`，用 conda-forge/robostack 装的 ROS2 Humble，没碰系统 apt、没碰 `gmr`/`isaaclab` 环境）里编译验证通过，产出能正常运行的二进制（`nm` 确认关键符号是真实实现而非空桩，`--help` 正确打印参数列表）。过程中发现并修复 3 个真实问题：
+1. conda-forge 默认装的 `empy 4.2.1` 和 ROS2 Humble 代码生成器不兼容 → 降到 `3.3.4`。
+2. host 缺 `libacl1-dev` 头文件 → 用 conda-forge 的 `libacl` 包 + `CPATH` 环境变量代替，没有碰系统依赖。
+3. **`Litchi_sonic_for_a3/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/CMakeLists.txt` 里 `--proto_path="${VAR}"` 的引号写法是 CMake 处理带空格路径的已知坑**——本机路径 `/home/user/YZY/HumanWBM/Demo/RL controller/...` 本身带空格会触发。已经在 Litchi 本地检出里把引号从"只包住变量值"改成"包住整个 `flag=值`"（`"--proto_path=${A3_TA_PROTO_ROOT}"`），**这个修复目前只在 `Litchi_sonic_for_a3` 本地检出里，没有提交到它的 git 仓库，也还没有同步到本仓库**——Phase 3 正式把这个 CMakeLists.txt 拷进 `GR00T-WholeBodyControl` 时必须带上这处修复，不能直接拷 Litchi 仓库里未修的原始版本。
+
+另外发现：`GR00T-WholeBodyControl` 自己也有一份 `gear_sonic_deploy/`（用于 G1，Unitree SDK + DDS），和 Litchi 的 `gear_sonic_deploy/`（A3，AimRT）路径结构高度同源（约 30 个文件名字面相同）。Litchi 新增了一个 `robot_io::RobotIOBackend` 抽象 + `backend_factory.cpp`，代码里已经写好了按机器人名字符串选后端的机制（`"g1"`/`"a3"` 两个名字都预留了，`"g1"` 分支目前是个报错桩，因为公开版本砍掉了涉及 Unitree SDK 授权的 G1 实现）。Phase 3 的工作是：把 G1 的真实输出逻辑包一层实现 `CreateG1Backend()`，仿照 A3 的写法给 A3 Ultra 写 `CreateA3UltraBackend()`。
+
+### 40.4 Phase 1：训练侧文件迁移（已完成，本节是详细清单）
+
+**核心方法论**：对每个 Litchi 有而本仓库也有同名文件的情况，先跑 `diff` 看是不是纯新增（只有 `>` 没有 `<`）。纯新增的直接复制新增部分过来。不是纯新增的，必须读懂双方差异的真实含义，逐段人工合并，**绝不整体覆盖**——因为本仓库这些共享文件在 Litchi fork 出去之后可能已经有自己的本地演进（比如 `commands.py` 里的自适应采样失败归因快照、手部关节处理，这些 Litchi 版本里没有，如果整体覆盖会丢失）。每一处合并完成后，都用脚本把新增内容和 Litchi 源码重新 diff 一遍，确认逐行/逐字符一致（排除故意跳过的部分，比如下面说的缓存层）。最后做了一次全量引用解析扫描：把 `sonic_a3.yaml`/`sonic_a3_035.yaml` 以及它们通过 `defaults:` 拉入的全部新 yaml 文件里出现的每一个 `gear_sonic.*` 的 `func:`/`_target_:` 引用（支持 `module.attr` 和 `module:attr` 两种写法）提取出来，逐个用正则确认对应的 `def`/`class` 在合并后的代码里真实存在——全部 resolve 成功，零遗漏。
+
+#### 40.4.1 纯拷贝的新文件（Litchi 独有，本仓库里原来不存在，无命名冲突）
+
+这些文件直接 `cp` 过来，没有做任何修改。**注意：`gear_sonic/data/` 整个目录被 `.gitignore` 第 209 行忽略，所以下面带 `data/` 的文件不会出现在 `git status`/`git diff` 里，必须靠这份清单才能知道它们存在**：
+
+| 目标路径（相对 `GR00T-WholeBodyControl/`） | 说明 |
+|---|---|
+| `gear_sonic/envs/manager_env/robots/a3.py` | A3 机器人定义：`A3_CYLINDER_CFG`（ArticulationCfg，spawn 用 `urdf/a3/model_collision_optimized_passive_foot_twostage_fit_optimized.urdf`）、`A3_ACTIVE_JOINT_NAMES`（29 个关节）、`A3_ISAACLAB_JOINTS`/`A3_ISAACLAB_TO_MUJOCO_DOF`/`A3_MUJOCO_TO_ISAACLAB_DOF`/`A3_ISAACLAB_TO_MUJOCO_BODY`/`A3_MUJOCO_TO_ISAACLAB_BODY` 等映射表（已用 `ast` 结构性校验：DOF 映射是 0-28 的双射，body 映射是 30 元素的合法置换） |
+| `gear_sonic/utils/a3_motor_params.py` | `ARMATURE_PFP_{78_58,93_65,41_48,59_60,110_75}` 常量，和本仓库 `a3_ultra.py` 里手算的等效惯量数值逐 6 位小数对上（worklog #37） |
+| `gear_sonic/utils/a3_motor_model.py`（831 行） | A3 并联关节（踝/腰）物理电机模型：T-N 曲线、雅可比表读取、`A3MotorConstraintCache`、`compute_motor_penalty`/`compute_threshold_penalty`/`compute_cross_penalty`/`compute_position_threshold_penalty`/`get_tn_curve`/`peak_mechanical_power`。路径解析用 `Path(__file__).resolve().parents[1] / "data" / "a3_motor_model"`，相对模块自身位置，拷贝后天然解析正确，不需要改路径 |
+| `gear_sonic/data/a3_motor_model/`（504K，**gitignored**） | `left_ankle_jacobi.npz`、`right_ankle_jacobi.npz`、`waist_jacobi.npz`、`reward_024_tn_curves.csv`、`README.md`——上面那个模块要读的雅可比表和 T-N 曲线数据 |
+| `gear_sonic/data/assets/robot_description/mjcf/a3_t2d5*.xml`（8 个变体，**gitignored**） | `a3_t2d5.xml`（plain）、`a3_t2d5_passive_foot.xml`、`a3_t2d5_passive_foot_twostage_fit_optimized.xml`、`a3_t2d5_loop*.xml`（4 个 loop 变体，含闭环连杆建模）。035 checkpoint 训练用的是 plain `a3_t2d5.xml`（已用 `checkpoints/035_step200000/config.yaml:323` 的 `assetFileName` 字段核实） |
+| `gear_sonic/data/assets/robot_description/urdf/a3/`（20M，**gitignored**） | IsaacLab 训练实际加载的是这里面的 `model_collision_optimized_passive_foot_twostage_fit_optimized.urdf`（`a3.py` 的 `asset_path` 字段指定），MJCF 是给 MuJoCo sim2sim/部署用的。整个目录（含 `meshes/`、`meshes_collision_optimized/`、`meshes_compliant_foot/`）原样拷贝 |
+| `gear_sonic/config/exp/manager/universal_token/all_modes/sonic_a3.yaml` | Hydra 基础 exp 配置（3 编码器：G1/teleop/SMPL），`sonic_a3_035.yaml` 的 `defaults:` 基类 |
+| `gear_sonic/config/exp/manager/universal_token/all_modes/sonic_a3_035.yaml` | 035 checkpoint 的具体训练合约：`active_encoders: ["g1", "a3_fast"]`、A3 电机约束 reward 权重、A3-fast 编码器的帧窗口参数（`a3_fast_num_future_frames: 10`, `a3_fast_dt_future_ref_frames: 0.02`） |
+| `gear_sonic/config/actor_critic/encoders/a3_fast_mf_mlp.yaml` | A3-fast 编码器网络结构定义（`init_from_encoder: {source: g1}`，从 g1 编码器权重热启动） |
+| `gear_sonic/config/aux_losses/universal_token/g1_recon_and_a3_fast_latent.yaml` + `terms/{a3_fast_g1_latent,reencoded_a3_fast_g1_latent,a3_fast_recon}.yaml` | aux loss 配置，`_target_` 指向下面 40.4.2 里新增的 4 个 loss class |
+| `gear_sonic/config/manager_env/observations/terms/{command_multi_future_a3_fast_nonflat,motion_anchor_ori_a3_fast_b_mf_nonflat}.yaml` | 单个 observation term 的 func 绑定，`func:` 指向下面 40.4.2 里新增的两个函数 |
+| `gear_sonic/config/manager_env/observations/tokenizer/unitoken_all_noz_a3_fast.yaml` | 在已有 `unitoken_all_noz.yaml` 结构基础上多拉了 2 个 a3_fast 相关的 term（`defaults:` 列表里标了 `# a3_fast` 注释） |
+
+#### 40.4.2 需要人工合并的共享文件（逐一说明改了什么、为什么）
+
+**`gear_sonic/trl/utils/order_converter.py`**：纯新增一个 `A3Converter` 类（插在文件末尾 `load_qpos_from_csv` 函数之前）。处理 A3 的 29-DOF 紧凑序（A3 没有手指，和本仓库已有的 `A3UltraConverter`——63-DOF 含灵巧手——是两个独立的类，不冲突、不是同一个东西，命名上也不会混淆）。
+
+**`gear_sonic/envs/manager_env/mdp/commands.py`**（4310→4556 行，本次合并风险最高的文件）：
+- 这个文件定义 `TrackingCommand`（RL 环境的核心命令项，管理参考动作库、未来帧采样、多编码器协同激活）。
+- Litchi 版本给它加了一整套 **A3-fast 专属的未来帧窗口机制**：和已有的 g1 窗口（`num_future_frames`/`dt_future_ref_frames`）、smpl 窗口（`smpl_num_future_frames`/`smpl_dt_future_ref_frames`）平行的第三套窗口，但更复杂——支持"历史帧"（`a3_fast_num_history_frames`，取当前时刻之前的帧，用于某些实验配置）和"截断有效帧+零填充"（`a3_fast_valid_future_frames`/`a3_fast_zero_pad_invalid_frames`，10 槽位里只有前 N 个真实有效，其余置零，用于兼容部署侧固定输入宽度）。核心逻辑在两个新增的模块级函数 `_build_a3_fast_relative_slots()`（计算每个槽位相对当前帧的偏移，支持负数偏移=历史帧）和 `_zero_pad_a3_fast_future_frames()`（把无效槽位清零同时保持 flatten 后的 shape 不变）。
+- 新增了 `a3_fast_encoder_index`（在已有的 `g1_encoder_index`/`smpl_encoder_index`/`teleop_encoder_index` 基础上）、`coactivate_g1_when_a3_fast`（g1 和 a3_fast 编码器协同激活，和已有的 g1-smpl、g1-soma 协同激活是同一套模式）。
+- 新增 `_requires_encoder_availability_filter`：一个性能优化标记，在 035 训练合约（只有 g1/a3_fast 两个非零编码器，两者对所有动作都"天然可用"，不需要像 smpl/soma 那样按动作过滤）下跳过一次昂贵的动态布尔子集运算（避免每次 reset 都做 host-sync）。这不只是加速，**如果不加这个判断，当训练配置没有激活 smpl/soma 时，代码会误入访问 `self.motion_lib.motion_has_smpl` 的分支**，而 A3 的 motion_lib 不一定有这个属性，可能直接报错。
+- **没有引入 Litchi 版本的引用缓存层**（Litchi 给很多 property 包了一层 `self._cached_reference("key", lambda: ...)`，目的是同一帧内多次访问同一个 property 不重复计算）。因为这个缓存层是个独立的重构，会牵扯到 `_invalidate_reference_cache()`、`cache_current_references()` 等本仓库完全没有的基础设施，贸然引入风险大于收益。改用本仓库现有的"每次访问都重新算"写法（和已有的 `future_time_steps`/`smpl_future_time_steps` property 一样的风格）逐一重新实现了等价逻辑。验证方法：写了个脚本把两边所有含 `a3_fast` 字样的行抽出来、剥掉 `_cached_reference(...)` 包装和 `lambda:` 前缀后排序比较，diff 为空（唯一的例外是 `a3_fast_future_time_steps` 比 `future_time_steps`/`smpl_future_time_steps` 多了一个 `torch.clamp(time_steps, min=0)`——因为历史帧场景下槽位可以是负数时间步，这个 min-clamp 是刻意保留的，不是遗漏）。
+- 具体改动点（搜 `a3_fast` 能找到全部 97 处，详细行号这里不列，直接搜文件即可）：`CommandsCfg`/`TrackingCommandCfg` 新增 6 个 cfg 字段；`__init__` 里新增一段计算 `a3_fast_frame_skips`/`a3_fast_future_time_steps_init`/`a3_fast_future_motion_ids`；`command_multi_future_a3_fast`/`joint_pos_multi_future_for_a3_fast`/`joint_vel_multi_future_for_a3_fast`/`root_rot_dif_l_a3_fast_multi_future`/`a3_fast_future_time_steps` 五个新 property；resample 逻辑里加了 a3_fast 的协同激活分支和 `future_motion_ids` 重算；`create_offline`（离线/部署侧用的 classmethod 构造器）和 `set_motion_state`（offline 场景下切换动作帧）两处都同步加了 a3_fast 的初始化/重置。
+
+**`gear_sonic/envs/manager_env/mdp/observations.py`**（2290→2298 行左右）：纯新增，3 个函数：`command_multi_future_a3_fast`（读 `command.command_multi_future_a3_fast` property）、`motion_anchor_ori_a3_fast_b_mf`（读 `root_rot_dif_l_a3_fast_multi_future`）、`height_map_z_flat`（和 a3_fast 无关，只是顺带在同一个 diff 里，把 height map 展平成 z-only 格式，加在 `height_map_flat` 后面）。对应 3 个新 cfg 字段：`command_multi_future_a3_fast_nonflat`、`motion_anchor_ori_a3_fast_b_mf_nonflat`、`height_map_z_flat`。diff 验证完全一致。
+
+**`gear_sonic/envs/manager_env/mdp/rewards.py`**（607→接近 1014 行）：追加了 A3 电机约束惩罚子系统，插在文件末尾：
+- 顶部新增 import：`ManagerTermBase`/`RewardTermCfg`（原来只 import 了 `SceneEntityCfg`）、`from gear_sonic.utils.a3_motor_model import (A3MotorConstraintCache, compute_cross_penalty, compute_motor_penalty, compute_position_threshold_penalty, compute_threshold_penalty, get_tn_curve, peak_mechanical_power)`。
+- `RewardsCfg` 新增 8 个字段：`motor_tn_serial`/`motor_tn_parallel`/`ankle_motor_speed`/`ankle_motor_power`/`ankle_motor_fixed_torque`/`parallel_ankle_cross`/`parallel_waist_cross`/`ankle_position_85`。
+- 文件末尾追加：`_A3_PARALLEL_PAIRS` 常量、`_get_a3_motor_constraint_cache`/`_prepare_a3_motor_constraint_cache` 两个 helper（每个 env 缓存一份 `A3MotorConstraintCache`，按 `(id(robot), table_dir)` 做 key）、4 个 reward class：`A3MotorTNPenalty`（读仿真里的 implicit PD 目标力矩，惩罚超出真实电机 T-N 包络的部分）、`A3AnkleMotorConstraintPenalty`（踝部并联电机的转速/功率/固定力矩三选一约束）、`A3ParallelJointCrossPenalty`（踝或腰的 pitch/roll 并联对同时高力矩的惩罚，防止两个轴互相"打架"）、`A3AnklePositionPenalty`（踝关节位置接近物理硬限位的惩罚）。diff 验证 4 个 class 完全一致。
+
+**`gear_sonic/trl/losses/token_losses.py`**（1646→1840 行）：纯新增（diff 0 行删除），4 个 loss class，各自插在对应的 smpl/teleop 版本旁边：`A3FastReconLoss`（插在 `G1ReconLoss` 和 `G1ReconLossAligned` 之间，监督 A3-fast 10 槽位里前 `valid_future_frames` 个有效槽位的重建）、`A3FastG1LatentLoss`（插在 `G1SmplLatentLoss` 和 `TeleopSmplLatentLoss` 之间，g1/a3_fast 配对潜变量对齐损失，学生-教师蒸馏模式）、`TeleopA3FastLatentLoss`（紧跟着上面那个，docstring 写明是"向后兼容"用的，当前配置不用但旧 checkpoint 的 Hydra 配置可能引用到）、`ReencodedA3FastG1LatentLoss`（插在 `ReencodedSmplG1LatentLoss` 之后，A3-fast 解码成 G1 动作再重新编码的循环一致性损失）。4 个 class 都复用了本仓库已有的 helper（`_compute_masked_loss`/`zero_loss`/`compute_loss`/`_get_device_from_loss_inputs`），没有新增任何 helper。diff 验证完全一致。
+
+**`gear_sonic/envs/manager_env/mdp/events.py`**（142→465 行，**整个文件用 Litchi 版本重写**，不是零散插入）：
+- 这是本次合并里**发现真实 bug 的地方**，不只是加东西。Litchi 版本重写了 `randomize_rigid_body_com`：原来的实现对多个 body 一起随机化时有问题——所有选中的 body 会共享同一份随机采样（`rand_samples` 形状是 `(len(env_ids), 3)` 然后 `.unsqueeze(1)` 广播到所有 body，没有做到每个 body 独立采样），而且赋值时用的下标是 `coms[:, body_ids, :3]`（冒号=全部环境），`env_ids` 只在算 `len()` 的时候用到了，实际赋值根本没按 `env_ids` 过滤。本仓库当前唯一调用这个函数的地方是 `base_com` 事件（`gear_sonic/config/manager_env/events/terms/base_com.yaml`，`mode: "startup"`，只选了单个 `torso_link`），这个场景下两个问题都不会暴露（startup 模式下 env_ids 恒等于全部环境；单 body 场景下"共享采样"和"独立采样"结果没区别），所以这个 bug 一直没被发现、也没有造成过实际影响。但 Litchi 给 A3 新增了 `arm_com`/`waist_com`/`leg_com` 三个事件，这些明确是多 body 场景，**必须用修复后的版本才能正确工作**——也就是说这不是我主动选择要不要修的问题，是 A3 新功能本身就依赖这个修复。顺带也修了 `randomize_joint_default_pos` 对 `shared_joint_names` 为空列表时的边界情况（加了 `if shared_joint_names:` 保护，避免空列表索引出问题），以及把下标数组统一转成 `torch.tensor(..., dtype=torch.long, device=...)` 而不是裸 Python list。
+- 其余都是新增：`EventCfg` 新增 15 个字段（`physics_mass_other_links`/`physics_mass_torso`/`hand_payload_mass`/`arm_com`/`waist_com`/`leg_com`/`robot_inertia_random_torso`/`robot_inertia_random_other_links`/`joint_actuator_gains`/`passive_foot_actuator_gains`/`joint_armature`/`joint_soft_pos_limits`/`random_gravity`/`robot_joint_friction_armature*` 三个）；新增 `randomize_rigid_body_mass` 类（继承 IsaacLab 原生的 `randomize_rigid_body_mass`，加了个可选的 `min_mass` 下限 clamp，防止质量随机化把某个 body 的质量随到接近 0 导致数值不稳定）；新增 `set_joint_soft_pos_limit_factor`（+ helper `_scale_joint_pos_limits`，给指定关节单独设置软限位系数，而不是 IsaacLab 原生只能全局设一个系数——A3 用它把腰部三个关节的软限位收紧到硬限位的 80%）；新增 `randomize_rigid_body_inertia`（惯量张量随机化，独立于质量随机化，保留之前质量随机化的效果）；新增 `randomize_actuator_stiffness_with_damping_ratio`（随机化 Kp 的同时按 `d = d0 * sqrt(k/k0) * ratio_scale` 联动调整 Kd，保持阻尼比不漂移）；新增 `push_by_setting_velocity_if_in_contact`（只对检测到指定 body 接触力超过阈值的环境施加推力扰动，而不是无差别推所有环境）。
+- 验证：改完后 `diff gear_sonic/envs/manager_env/mdp/events.py ../Litchi_sonic_for_a3/gear_sonic/envs/manager_env/mdp/events.py` 输出为空，逐字节完全一致（因为这个文件改动面太大太分散，没有采用"分段插入"的方式，而是直接整体对齐成 Litchi 的版本——这是在确认了本仓库原有的每一行代码在 Litchi 版本里都有对应保留或者是经过验证的修复之后才这么做的，不是图省事跳过了检查）。
+
+**未改动、核实为零差异的文件**：`terminations.py`、`actions.py`、`curriculum.py`——这三个文件两边逐字节完全相同（`diff` 输出为空），没有任何改动必要。`recorders.py` 有一个 2 行的 diff（eval 录制时默认摄像机偏移量从 `[2,2,1]` 改成 `[4.0,4.0,1.8]`），纯粹是 A3 体型更大时 eval 可视化用的摄像机默认位置调整，和训练正确性无关，`sonic_a3_035.yaml` 也没有覆盖这个参数，所以**没有改**，保持本仓库原值。
+
+#### 40.4.3 CLI 改动
+
+`gear_sonic/train_agent_trl.py` 的 `ROBOT_EXP_MAP` 字典（文件里搜 `ROBOT_EXP_MAP` 能找到，大约在文件后半部分）新增一行：
+```python
+"a3": "manager/universal_token/all_modes/sonic_a3_035",
+```
+`"a3_ultra"` 条目原样保留没动。`--robot a3` 现在等价于 `+exp=manager/universal_token/all_modes/sonic_a3_035`。这个 `--robot` 机制本身（把 `--robot <name>` 翻译成 Hydra `+exp=...` override）是更早之前就实现好的，不是这次新加的。
+
+#### 40.4.4 独立发现并修复的 3 个 bug 汇总（都不是"顺手改的"，都有明确触发条件和影响范围）
+
+| # | 文件 | 问题 | 影响范围 | 状态 |
+|---|---|---|---|---|
+| 1 | `gear_sonic/envs/manager_env/robots/a3_ultra.py` 的 `wrist_roll` actuator 块 | `armature=0.000810`（PFP-41-48 的值）但 `effort_limit_sim=24.0`/`velocity_limit_sim=15.71`（PFP-59-60 的规格），自相矛盾，注释也写错了型号 | 只影响本仓库自己从零训练 A3 Ultra（如果训的话），wrist_roll 关节仿真反射惯量会偏小约 6 倍 | 已修复（worklog #38），改成 `0.004967` |
+| 2 | `Litchi_sonic_for_a3/gear_sonic_deploy/.../CMakeLists.txt` 的 `--proto_path="${VAR}"` 引号写法 | CMake 处理带空格路径的已知坑，本机路径带空格会触发，导致 protoc 生成步骤报错 | 只在编译 Litchi 的 AimRT 部署二进制时触发（本机路径恰好带空格） | 已在 Litchi 本地检出修复，**未提交到 Litchi 仓库，未同步到本仓库**，Phase 3 迁移这个文件时必须带上这处修复（40.3 节有 diff） |
+| 3 | `gear_sonic/envs/manager_env/mdp/events.py` 的 `randomize_rigid_body_com` | 多 body 场景下共享同一份随机采样、且赋值时没有正确按 `env_ids` 过滤 | 本仓库当前唯一调用方（`base_com`，startup+单body）不触发，是潜伏问题；A3 新增的 `arm_com`/`waist_com`/`leg_com`（多 body）必须用修复版才能正确工作 | 已采用 Litchi 修复版（本节） |
+
+### 40.5 还没做的事（下一步，按原计划顺序）
+
+- **Phase 2**：把 `Litchi_sonic_for_a3/checkpoints/035_step200000/`（.pt + config.yaml）拷进本仓库，用本仓库的 sim2sim 工具跑一遍，和 Litchi 原仓库跑出来的结果做数值对比，确认迁移后训练合约行为完全一致（这一步还没开始）。
+- **Phase 3**：C++ 部署集成——把 `include/a3_deploy/`、`include/a3_io/`、`include/a3_rt/`、`include/a3_sync/`、`include/robot_io/`（含 40.3 提到的 CMakeLists.txt 修复）连同 AimRT 依赖一起拷进本仓库 `gear_sonic_deploy/`；给本仓库现有的 G1 输出逻辑包一层实现 `CreateG1Backend()`；仿照 A3 的 AimRT 后端写法给 A3 Ultra 写 `CreateA3UltraBackend()`。
+- **Phase 4**：VR 实时姿态 → A3 关节空间轨迹的重定向模块（净新增，可以参考 `decoupled_wbc/control/teleop/teleop_retargeting_ik.py` 的 IK 逻辑改造）。
+- `gear_sonic/data/robot_model/instantiation/__init__.py` 的 `ROBOT_MODEL_REGISTRY["a3"]` 注册——这个属于 Phase 4（VR 遥操的姿态校准用的，需要真正的 A3 IK/FK 模型实例化函数，目前两边代码都没有，是净新增工作），不属于 Phase 1。
+- 用户还没确认：`"a3_ultra"` 这个 CLI 选项要不要保留/废弃（目前两份训练合约并存）。
+
+---
+
+## 41. [2026-10-13] A3 集成 Phase 2：035 checkpoint 迁移 + 数值对比验证（已完成，部分验证；深层验证待定）
+
+**接续 #40**，同样按自包含方式写，方便冷启动 agent 直接读这一条就知道 Phase 2 做了什么、怎么验证的、还差什么。
+
+### 41.1 这一步要验证什么
+
+Phase 1（worklog #40）验证的是"迁移过来的训练侧*代码*和 Litchi 源码逐行一致"。Phase 2 要验证的是更进一步的问题："迁移过来的*机器人资产*（MJCF/URDF/求解器库）+ 迁移过来的 checkpoint，在本仓库里跑起来，和在 Litchi 原仓库里跑，是不是产生完全一样的行为"——这是防止"代码逐行对了，但资产文件拷漏了一个、或者路径解析错了、或者环境差异导致数值漂移"这类问题的最后一道检查。
+
+### 41.2 做了什么
+
+**1. 下载 checkpoint**：`Litchi_sonic_for_a3/` 原本只有 checkpoint 目录的元数据（README/config.yaml/model_config.yaml/meta.yaml/LICENSE/SHA256SUMS，共 80K），真正的权重文件 `model_step_200000.pt`（402MB）要从 Hugging Face 下载。用仓库自带的下载脚本：
+```bash
+cd Litchi_sonic_for_a3
+python3 -m pip install huggingface_hub   # 如果没装
+python3 download_from_hf.py --component pt
+```
+脚本自动做了 size + SHA256 校验（`SHA256SUMS` 里的哈希和下载后文件匹配，`matches()` 函数），下载到 `Litchi_sonic_for_a3/checkpoints/035_step200000/model_step_200000.pt`。这是公开仓库（`sonic-for-a3/sonic`，Apache 2.0 协议），不需要认证 token。
+
+**2. 迁移到本仓库**：
+| 源路径（`Litchi_sonic_for_a3/`） | 目标路径（`GR00T-WholeBodyControl/`） | 说明 |
+|---|---|---|
+| `checkpoints/035_step200000/`（全部文件，含下载好的 402MB `.pt`） | `checkpoints/035_step200000/` | 和 Litchi 同样的目录层级（仓库根目录下的 `checkpoints/`，不是 `gear_sonic/checkpoints/`——**第一次拷贝时错放到了 `gear_sonic/checkpoints/`，已移正**，如果发现这个路径不对不是 bug，是我自己改的）。`*.pt` 已被 `.gitignore:235` 忽略不会进 git，其余小文件（README/config.yaml 等）不受影响 |
+| `gear_sonic/scripts/sim2sim_a3_mujoco.py`（4725 行） | 同路径 | 独立的 MuJoCo sim2sim 测试/评估脚本，**不依赖 isaaclab/pxr**（只 import `mujoco`/`torch`/`scipy`/`gear_sonic.utils.*`），可以在没有 Isaac Sim 的环境里跑。内部有一个完全独立于 Hydra/`UniversalTokenModule` 的 `A3Policy` 类（手搭 MLP：encoder `[640,2048,1024,512,512,64]`、decoder `[dec_dim,2048,2048,1024,1024,512,512,29]`、FSQ 量化），直接从 checkpoint 的 `policy_state_dict`/`actor_model_state_dict` 里按 key 前缀切出 encoder/decoder 权重加载——这是本脚本特有的"轻量复现"写法，不是训练时真正用的网络构建路径，所以**这个脚本跑通只能验证"checkpoint 权重本身是完好的、机器人物理资产是对的"，不能验证 Phase 1 改的训练侧 Hydra 配置代码**（commands.py/observations.py 等那些，训练时才会被用到，sim2sim 脚本不走那条路径）。见 41.4 的说明 |
+| `gear_sonic/utils/playback.py`、`gear_sonic/utils/terrain_profile.py` | 同路径 | sim2sim 脚本的两个依赖，各自检查过内部没有 `gear_sonic.*` 的二次依赖，直接整体拷贝 |
+| `gear_sonic/data/assets/robot_description/solver/a3_loop/`（68K，**gitignored**，含 `lib/liba3_ankle_waist_solver.a` 预编译库 + 3 个头文件） | 同路径 | 踝部/腰部并联连杆的闭环运动学求解器（sim2sim 脚本跑 `a3_t2d5_loop_*.xml` 这种闭环 MJCF 变体时要用），Phase 1 当时只拷贝了 MJCF/URDF 没拷这个，这次补上 |
+| `a3_data/agibot_a3/001_walk_front_slow.csv` | 同路径（仓库根目录下的 `a3_data/`，不是 `gear_sonic/a3_data/`——同样第一次放错位置，已移正） | 一条参考动作（原始 30fps，1652 帧，约 33 秒），sim2sim 脚本用来生成参考轨迹喂给策略 |
+
+**3. 跑验证**：在两个仓库里分别执行完全相同的命令（只有 cwd 和内部路径不同）：
+```bash
+export MODEL_035_PT="$PWD/checkpoints/035_step200000/model_step_200000.pt"
+conda run -n gmr python gear_sonic/scripts/sim2sim_a3_mujoco.py \
+  --checkpoint "$MODEL_035_PT" \
+  --motion a3_data/agibot_a3/001_walk_front_slow.csv \
+  --encoder-mode a3_fast \
+  --mjcf gear_sonic/data/assets/robot_description/mjcf/a3_t2d5_loop_passive_foot_twostage_fit_optimized.xml \
+  --batch-once --max-policy-steps 20 \
+  --metrics-out <路径>.json
+```
+20 个策略步（50Hz 策略时钟，约 0.4 秒仿真时间），`--batch-once` 跳过交互式 viewer。
+
+### 41.3 结果
+
+**Litchi 原仓库跑出来的（基线）**：`fall: false`，骨盆高度 mean=1.0716m / min=1.0689m（站姿稳定，没有突然下沉或摔倒），骨盆姿态偏差 mean=0.59° / max=0.82°（20 步内几乎没有晃动），29 维全身关节跟踪 RMSE=0.0499 rad（约 2.86°，很小），动作增量平滑（`q_des_step_abs_max=0.143`，没有突变）。**结论：下载的 checkpoint 权重完好，035 策略本身工作正常，产生稳定的站立/走路行为**——这本身也确认了 Hugging Face 下载 + SHA256 校验没有问题。
+
+**GR00T-WholeBodyControl 里跑出来的（用 Phase 1/2 迁移过去的资产）**：把两份 `metrics.json` 递归比较了全部 154 个数值字段（action 的 4 个统计量、骨盆位姿的 5 个统计量、29 维关节跟踪 RMSE、骨盆高度 mean/min、`fall` 布尔值等），**154 个字段，0 处数值差异（包括浮点数，diff 严格等于 0.0，不是"在容差内"）**，唯一的字符串字段（`body_name: "pelvis_link"`）也完全相同。
+
+这个"数值严格为 0"的结果本身就是一个有意义的信号：**说明两边用的是完全相同的输入（同一个 checkpoint 文件、同一条 CSV）、完全相同的代码（sim2sim 脚本本身只拷贝没改）、完全相同的计算设备类型（都是 `device: cuda`，同一张卡），没有引入任何随机性或环境差异**——这正好印证了 Phase 1 对迁移方式的两条要求都做对了：资产文件（MJCF/URDF/求解器库/motor_params）复制得干净完整，没有路径解析错误或内容差异。
+
+### 41.4 这个验证覆盖了什么、没覆盖什么（重要，不要误读结果）
+
+**覆盖了**：
+- checkpoint 文件下载/迁移的完整性（SHA256 + 行为双重确认）。
+- Phase 1 迁移的机器人物理资产（`a3_t2d5_loop_passive_foot_twostage_fit_optimized.xml`、`urdf/a3/`、`solver/a3_loop/`、`a3_motor_params.py`）在新仓库里路径解析正确、内容完整，和原仓库产生逐 bit 相同的物理仿真结果。
+
+**没有覆盖**（容易误以为"Phase 2 验证通过=全部都验证了"，实际不是）：
+- **Phase 1 改的训练侧 Hydra 配置/代码（commands.py 的 A3-fast 未来帧窗口、observations.py、rewards.py 的电机约束惩罚、events.py 的域随机化、token_losses.py 的新损失函数）完全没有被这次验证覆盖**。原因见 41.2 表格里的说明：`sim2sim_a3_mujoco.py` 用的是脚本自己手搭的独立 `A3Policy` 网络类，直接从 checkpoint 里切权重加载，完全不经过 `UniversalTokenModule`/Hydra 配置/`TrackingCommand` 这条真正训练时走的路径。换句话说，这次验证证明了"迁移过去的*资产*没问题"，但**没有**证明"迁移过去的*训练配置代码*在真正训练/构建网络时会产生和 Litchi 一样的行为"。
+- 要验证后者，唯一可靠的办法是真正走 Hydra `+exp=manager/universal_token/all_modes/sonic_a3_035` 这条路径实例化 `Actor`/`UniversalTokenModule`，而这需要 `env_config.robot.algo_obs_dim_dict`——这个值不是写死在 yaml 里的（`base_env.yaml:69` 只给了个空字典占位），是 IsaacLab 环境在真正构建 observation manager 时动态算出来的，意味着要做这一步验证**必须真正起一个 IsaacLab `ManagerBasedRLEnv`**（哪怕 `num_envs=1`），这需要完整的 Isaac Sim kit（启动慢，几分钟量级，吃显存）。本机其实有 GPU（RTX 5090）和 display（`:1`），技术上能起，但还没做这一步——因为 Phase 1 已经对每一处训练侧代码改动做了逐行 diff 验证（worklog #40 的方法论），间接提供了很强的正确性信心，真正起 IsaacLab 环境做端到端验证是更彻底但成本高得多的最后一步，值不值得现在做需要用户决定。
+
+**一句话总结现在的确定性水平**：训练侧代码"长得和 Litchi 一模一样"（逐行 diff 验证过），机器人资产"跑起来和 Litchi 数值完全一样"（这次验证过），但"训练侧代码在真正跑训练时拼出来的网络是不是和 Litchi 一样"这件事**还没有直接验证过**，只是通过前两者间接推断出来的。
+
+### 41.5 还没做的事
+
+和 #40 末尾一样：Phase 3（C++ 部署集成）、Phase 4（VR 实时遥操）、`ROBOT_MODEL_REGISTRY["a3"]`。另外新增一项：如果需要更高确信度，可以起一次 IsaacLab 环境做端到端的 Hydra 配置+网络构建验证（见 41.4 最后一段），这个还没做，是可选的加强验证，不是阻塞项。
+
+**（本条已被 #42 执行完成——下面是该验证的完整记录，包括过程中发现并修复的 3 处真实迁移遗漏。）**
+
+## 42. IsaacLab 端到端验证：真正起 Hydra/`UniversalTokenModule`/`ManagerBasedRLEnv`，发现并修复 3 处 Phase 1 遗漏（本条目独立成文，假设读者零上下文）
+
+### 42.0 这一条要解决什么问题
+
+\#41.4 明确指出：sim2sim MuJoCo 验证只证明了"迁移过去的机器人资产（MJCF/URDF/motor_params/solver）正确"，**完全没有验证 Phase 1 改动的训练侧 Hydra 代码**（`commands.py`/`observations.py`/`rewards.py`/`events.py`/`token_losses.py`）是否在真正走训练/评估代码路径（`@hydra.main` 解析 `+exp=...` → 组装 `ManagerBasedRLEnvCfg` → 启动真正的 Isaac Sim → 实例化真正的 `UniversalTokenModule`/`Actor`）时产生和 Litchi 原仓库一样的行为。用户的原话是"把 IsaacLab 端到端验证也做了，彻底消除训练侧代码这块的不确定性"。本条目记录了完成这件事的完整过程，以及过程中发现的问题——**这次验证不是走个过场确认"没问题"，而是真的挖出了 3 处之前 #40 的逐行 diff 审查漏掉的真实 bug**，这恰恰说明了这次深度验证的必要性。
+
+### 42.1 验证工具选择：为什么是 `eval_agent_trl.py` 而不是 sim2sim 脚本
+
+`gear_sonic/eval_agent_trl.py` 是仓库里唯一会真正做以下事情的入口：
+1. 读取 checkpoint 同目录下的 `config.yaml`（训练时落盘的、已经被 Hydra 完全解析过的配置快照，不是重新走一遍 `sonic_a3_035.yaml` 的 `defaults:` 继承链——这样可以保证两边用的是完全相同的、已经固化的配置，不会因为两个仓库当前 Hydra 组合逻辑的其他差异而引入新的不可控变量）。
+2. 真正启动 `isaaclab.app.AppLauncher`（即真正的 Isaac Sim kit 进程，不是 mock）。
+3. 真正构建 `ManagerBasedRLEnv`（`train_agent_trl.create_manager_env`），这一步会真正跑通 `modular_tracking_env_cfg.py` 的 `override_settings()`、`commands.py` 的 `TrackingCommand.__init__`/`_resample_command`、`observations.py`/`rewards.py`/`events.py` 里注册的所有 term。
+4. 用 `config.algo.config.actor` 真正通过 `trl_utils_common.custom_instantiate(...)` 实例化 `Actor`/`UniversalTokenModule`（这一步依赖 `env_config.robot.algo_obs_dim_dict`，而这个值是 IsaacLab 观测管理器在环境真正建好之后才动态算出来的——`base_env.yaml:69` 只给了个空字典占位，无法只用 Hydra 组合配置、不起环境就提前拿到，这是 sim2sim 脚本做不到、必须靠这个真正入口才能验证到的核心原因）。
+5. 用 `model.policy.load_state_dict(state_dict)`（**默认 `strict=True`，没有传 `strict=False`**）把 checkpoint 的权重加载进这个真正实例化出来的网络——如果迁移过去的代码让网络结构（层数/维度/参数名）和 Litchi 训练时的网络有任何不一致，这一行会直接抛 `RuntimeError`（缺键/多键/形状不匹配），是全部验证手段里最强的"架构完全一致"证据。
+
+sim2sim 脚本（`sim2sim_a3_mujoco.py`）里的 `A3Policy` 是脚本自己手搭的独立 `nn.Module`，直接按 key 前缀切 checkpoint 里的 tensor 加载，完全不经过上面任何一步，所以 #41 的验证结果和这次验证是互补关系，不是重复关系。
+
+### 42.2 验证命令
+
+Litchi 自己的文档（`docs/a3_training2sim2deploy.md` 第 4 节）给出了针对这个 035 checkpoint 的权威调用方式，但原文档命令用的是 `export_onnx_only=true`（见 42.4 的说明，这条路线在 GR00T 里走不通，原因是另一个文件的 staleness，不是迁移 bug）。实际使用的最终命令（两个仓库完全一致，只有 cwd 不同）：
+
+```bash
+conda run -n isaaclab python gear_sonic/eval_agent_trl.py \
+  +checkpoint="$PWD/checkpoints/035_step200000/model_step_200000.pt" \
+  +headless=True \
+  ++num_envs=1 \
+  "++manager_env.commands.motion.motion_lib_cfg.motion_file=$PWD/.cache/motionlib_035_selected20" \
+  +max_render_steps=20 \
+  ++eval_callbacks=[]
+```
+
+准备工作（两边一致）：
+- `a3_data/agibot_a3/` 下需要完整 20 条 selected20 CSV（#41 的 sim2sim 验证只迁移了其中 1 条 `001_walk_front_slow.csv` 就够用，这次需要全部 20 条，已从 Litchi 补齐拷贝到 GR00T 的同路径）。
+- 用 Litchi 自己的 `gear_sonic/data_process/convert_soma_csv_to_motion_lib.py --input a3_data/agibot_a3 --output .cache/motionlib_035_selected20 --individual --robot a3_29 --fps 30 --fps_source 120 --num_workers 8` 跑出 20 个 per-motion pkl。**这一步刻意只在 Litchi 里跑了一次**，然后把产出的 `.cache/motionlib_035_selected20/` 目录直接拷贝进 GR00T（没有在 GR00T 里重新跑转换脚本）——原因是 GR00T 现有的 `convert_soma_csv_to_motion_lib.py` 是另一个完全不同的、服务于 G1/Bones-SEED 多模式批量转换的版本（本次会话更早阶段写的），**没有 A3 flat-CSV 模式**，两边脚本内容几乎完全不同。这次验证的目标是训练侧环境代码，不是数据转换脚本，所以用"两边喂完全相同的输入数据"的方式隔离变量，避免引入"到底是转换脚本错了还是训练代码错了"的混淆；A3 数据转换脚本本身尚未合并进 GR00T，记在 42.6 的遗留项里。
+
+### 42.3 发现并修复的 3 处真实遗漏
+
+这次验证的第一次运行就失败了，之后连续遇到 4 个报错，每一个都对应一处 Phase 1 没有覆盖到的真实代码差异。**这推翻了 #40 里"commands.py 等 6 个文件逐行 diff 验证=empty diff，已完全核实"的结论——diff 核实的是"能看见的改动对不对"，但没有覆盖"两个代码库在改动范围之外是否存在更早就已分叉、而 Phase 1 没意识到需要同步"的内容。** 具体：
+
+**遗漏 1：`commands.py` 缺少 `coactivate_g1_when_teleop` 字段和逻辑**
+
+报错：`TypeError: TrackingCommandCfg.__init__() got an unexpected keyword argument 'coactivate_g1_when_teleop'`（Hydra 用 checkpoint 的 `config.yaml` 里固化的 `coactivate_g1_when_teleop: true` 实例化 `TrackingCommandCfg` 时，GR00T 的 dataclass 根本没有这个字段，直接在构造函数这一步就炸了）。
+
+查证：`grep coactivate_g1_when` 两边的 commands.py，Litchi 里这个字段在 `coactivate_g1_when_a3_fast` 字段的紧邻位置（cfg dataclass 第 4521/4545 行，init 里第 631-636 行，使用点在第 3282-3294 行），GR00T 当时只移植了 `coactivate_g1_when_a3_fast`（A3-fast 专属的新增字段），*漏移植了紧邻的、语义上更早就存在、与 teleop 配对延迟激活 G1 编码器逻辑相关的 `coactivate_g1_when_teleop`*——两个字段挨在一起，大概率是 Phase 1 做 diff 的时候正常框住了 a3_fast 相关的新增块，但 `coactivate_g1_when_teleop` 这个字段本身并不是 A3 新增的（它是训练 teleop 模式对齐用的，所有机器人通用），所以没有被当成"A3 相关改动"纳入搬运范围——这是本次遗漏的根本原因：**migration 时只对比了"Litchi 加了什么 A3 相关代码"，但没意识到 Litchi 在无关于 A3 的地方也存在比 GR00T 当前快照更新的通用改动（coactivate_g1_when_teleop 看起来就是这样一个通用改动，不清楚是什么时候加的，但显然在 Phase 1 做 diff 验证的那次快照之后或之外）**。
+
+修复：在 `commands.py` 的 `TrackingCommandCfg` dataclass 里（`teleop_sample_prob_when_smpl` 字段之后）加回 `coactivate_g1_when_teleop: bool = False` 字段及其注释；在 `__init__` 里（`coactivate_g1_when_a3_fast` 的 getattr 之前）加回 `self.coactivate_g1_when_teleop = getattr(self.cfg, "coactivate_g1_when_teleop", False)`；在 `_resample_command` 里（soma 协同激活块和 a3_fast 协同激活块之间）加回完整的 teleop 协同激活 G1 编码器的 if 块，三处都和 Litchi 原文逐字节一致。
+
+**遗漏 2：`commands.py` 的"额外 DOF"(`extra_joint_indices`) 用了 G1-hand 专属的启发式方法，对 A3 的被动脚弹簧关节完全不适用**
+
+报错：`RuntimeError: shape mismatch: value tensor of shape [4] cannot be broadcast to indexing result of shape [1, 0]`（`joint_pos[:, self.extra_joint_indices] = self.extra_default_positions`，`extra_default_positions` 长度是 4，但 `extra_joint_indices` 解析出 0 个元素）。
+
+根因：GR00T 原来的代码是 `self.extra_joint_indices = joint_utils.get_hand_joint_indices(self.robot)`——这是专门给 G1 手部关节写的、按关节名匹配"手"相关字符串的启发式函数，对 A3（没有手部自由度，但有 4 个被动脚弹簧关节 `.*_foot_forefoot_joint`/`.*_foot_toe_joint` ×2 脚）完全匹配不到任何东西，静默返回空列表，而不是报错——**这是一个只有在真正跑 A3 机器人时才会暴露的潜在 bug，纯静态 diff 审查根本看不出来**，因为 GR00T 当时的 commands.py 变更本身就是"保留 G1 专属实现、手写了一个不依赖 cache 的等价版本"（worklog #40 原文），完全没意识到这一行需要对所有机器人通用化。
+
+Litchi 的做法更通用、更安全：`body_joint_indices`（已有的、机器人无关的函数 `joint_utils.get_body_joint_indices`）取补集算出"剩下的就是额外自由度"，并且加了三处显式校验（`body_joint_indices` 数量必须等于 `motion_lib_num_dof`，额外自由度数量必须等于 `extra_num_dof`，默认位置/速度长度必须等于 `extra_num_dof`，任何一处不符都直接 `raise ValueError` 而不是静默产生错误结果）。
+
+修复：把 GR00T 对应代码块整体替换成 Litchi 的版本（逐字节一致），不再依赖"手部关节名启发式"，而是用"机器人总自由度减去动作库自由度的补集"这个通用定义，并保留三处校验。这对现有 G1 行为**没有影响**（G1 的手部关节本来就全部落在"非 body_joint_indices"的补集里，补集方法和手部启发式方法对 G1 算出来的 `extra_joint_indices` 集合是等价的——这点已经通过"G1 训练入口本身没有在这次改动后重跑过"这一事实留了个心眼，严格说这是**推断**而非**重新验证**，如果之后要百分百确认 G1 零回归，建议补一次 G1 checkpoint 的同类 `eval_agent_trl.py` 冒烟测试，当前没有做）。
+
+**遗漏 3：`modular_tracking_env_cfg.py` 整个文件在 Phase 1 里完全没有被触碰过**
+
+报错：`KeyError: 'a3_024'`（`robot_mapping[robot_type]["robot_cfg"]`，checkpoint 的 `config.yaml` 里 `manager_env.config.robot.type == "a3_024"`，但 GR00T 的 `robot_mapping` 字典只有 `"a3_ultra"` 一个 A3 相关键，根本没有 `"a3"`/`"a3_024"`/`"a3_exp020"`/`"a3_exp023"` 这几个键）。
+
+这是本次发现的三处里**影响面最大**的一处：`modular_tracking_env_cfg.py` 是把"机器人类型字符串"分发到具体 `ArticulationCfg`/action scale/`isaaclab_to_mujoco_mapping`/关节子集过滤这些具体配置的核心调度文件。Phase 1 当时的迁移范围表（worklog #40）里完全没有列出这个文件——原因是 Phase 1 聚焦在"mdp 目录下的训练逻辑文件"（commands/observations/rewards/events/token_losses），而这个调度文件在 `gear_sonic/envs/manager_env/` 目录下，不在 `mdp/` 子目录里，当时的搜索范围没有覆盖到它。而 `gear_sonic/envs/manager_env/robots/a3.py`（机器人资产定义本身）虽然在 Phase 1 就拷贝过去了，但**从来没有被接到调度逻辑里**——相当于把发动机搬过去了，但没接上点火开关。
+
+验证过程中用 `grep` 确认了一个好消息：`a3.py` 里实际上已经包含了 `A3_024_CYLINDER_CFG`/`A3_EXP020_CYLINDER_CFG`/`A3_EXP023_CYLINDER_CFG`/`A3_024_ACTION_SCALE`/`A3_EXP020_ACTION_SCALE` 这些 Litchi 需要的全部变体（Phase 1 拷贝 a3.py 时是整个文件原样拷贝，所以这些变体定义其实已经在，只是没人引用），所以这不是"缺资产"，纯粹是"缺接线"。
+
+修复范围（刻意限定在这个 035 checkpoint 实际会用到的子集，完整对比方法见下）：对 `checkpoints/035_step200000/config.yaml` 里 `manager_env.config.robot` 字段做了精确检查，确认只有三个键：`type: a3_024`、`asset_path: .../model_collision_optimized_passive_foot_twostage_fit_optimized.urdf`、`use_fitted_passive_foot_gains: true`（后者在 Litchi 代码里被 `if robot_type == "a3"` 这个条件门控，对 `a3_024` 类型不生效，等于没用——这点在 Litchi 原文件里也是这样写的，不是我们引入的差异）。据此：
+- 文件顶部 import 增加 `copy`、`logging`、`from isaaclab.managers import SceneEntityCfg`、把 `from gear_sonic.envs.manager_env.robots import a3_ultra, g1, h2` 改成多 import 一个 `a3`。
+- 新增 4 个辅助函数（逐字节照抄 Litchi）：`_ensure_urdf_importer_compat`（给 URDF importer 扩展钉版本）、`_set_a3_fitted_passive_foot_gains`（给被动脚弹簧设置拟合好的刚度/阻尼/惯量参数，虽然这次用不到但顺手带上，因为依赖它的 a3.py 字段已经存在，纯增量、零风险）、`_set_joint_asset_cfg`/`_filter_joint_observations`（把某个 reward/event/observation term 的 `asset_cfg` 改成只认 `active_joint_names` 这个子集的关节列表，用 `preserve_order=True` 保证顺序和训练时一致）。
+- `robot_mapping` 字典新增 `"a3"`/`"a3_exp020"`/`"a3_024"`/`"a3_exp023"` 四个键（全部引用 a3.py 里已经存在的变体，`active_joint_names` 统一指向 `a3.A3_ACTIVE_JOINT_NAMES`），**没有**加 `"a3_old"`（这个键在 Litchi 里指向一个单独的 `a3_old.py` 模块，GR00T 里压根没有这个文件，035 checkpoint 也用不到，记在 42.6 的遗留项里，没有强行拼凑）。
+- `override_settings()` 的机器人选择逻辑从"直接 `.replace()`"换成 Litchi 的版本：`copy.deepcopy` 之后再 `.replace()`（避免多次实例化共享同一个模块级可变对象导致互相污染）、新增 `asset_path` 覆盖（**这个是 035 checkpoint 真正需要的**，它指定了 8 个 A3 URDF 变体里具体用哪一个）、新增 `merge_fixed_joints`/`disable_passive_foot`/`use_fitted_passive_foot_gains` 三个条件分支（均按 Litchi 原文逐字节复刻，均被各自的 config 键门控，对现有 g1/h2/a3_ultra 行为零影响）、新增 `active_joint_names` 过滤块（**这个也是 035 checkpoint 真正需要的**：它把 `self.commands.motion.motion_lib_num_dof` 设成 `len(active_joint_names)`，这个值正是遗漏 2 里 `has_dof_mismatch`/`extra_num_dof` 计算的输入，两处遗漏其实是同一条因果链上的两环——不先修好这里，遗漏 2 的报错根本不会以"有意义的方式"出现)。
+- `robot_type` 的默认值**没有**从 Litchi 的 `"a3_024"` 改过来，继续保持 GR00T 原来的 `"g1"` 默认值——这是蓄意的分歧：Litchi 是 A3-only 的公开发布仓库，默认机器人当然是 A3；GR00T 是多机器人仓库，必须保持"不显式指定 robot.type 时退回 G1"这个向后兼容默认值，这一点逐字照抄 Litchi 会制造一个新 bug（所有没显式写 `robot.type` 的现有 G1/H2 config 会突然变成尝试加载 A3 资产)。
+
+**本次验证刻意跳过、未移植的部分**（均已确认对 035 checkpoint 的这次验证完全不生效，不是"忘了"，是"确认了配置里没打开，刻意不在这次任务里扩大范围"）：
+- `_set_a3_foot_contact_compliance`（URDF spawn 时的可配置脚底柔顺接触材质）：依赖 `A3_FOOT_CONTACT_LINK_NAMES`/`spawn_a3_urdf_with_foot_contact_compliance`/`spawn_a3_urdf_with_per_env_foot_contact_compliance`，这几个在 GR00T 的 a3.py 里都不存在（Litchi 侧也是定义在 `a3_old.py` 里，通过参数传进去），且门控条件 `robot_type in {"a3", "a3_old"}` 对 `a3_024` 不成立，`foot_contact_compliance` 键本身在 checkpoint config 里也不存在。
+- `_set_a3_motor_space_actuators`/`motor_model_cfg`（把隐式 PD 驱动换成显式电机 T-N 曲线驱动模型）和 `_set_delayed_implicit_actuators`/`actuator_delay_cfg`（给驱动器加延迟）：两者都依赖 `A3MotorSpaceActuatorCfg` 这个类，GR00T 的 `actuators.py` 里**完全没有这个类**（只有 `DelayedImplicitActuatorCfg`，是另一半依赖，已存在）。`motor_model`/`actuator_delay` 两个键在 checkpoint config 里都不存在，判定为这次用不到，没有移植 `A3MotorSpaceActuator`/`A3MotorSpaceActuatorCfg`（在 Litchi 的 `actuators.py` 里是第 106-344 行，約 240 行，是个独立的、基于 T-N 曲线和并联关节雅可比的隐式驱动器类，移植它本身是一件独立工作量不小的事，值得单开一条 worklog 做，不应该顺带混在这次验证里）。
+- `_rank_uses_terrain`/`rank_partitioned_terrain`（按 DDP rank 分配地形/配对动作的训练课程功能，影响面涉及 `modular_tracking_env_cfg.py` 和 `commands.py` 两个文件）：checkpoint config 里没有这个键，且这个功能看起来是通用的地形课程基础设施，和 A3 本身无关（可能是 Litchi fork 时的上游基线比 GR00T 当前状态更新带来的差异，不是 A3 专属新增)。
+- `foot_end_contact_sensor`/`ContactSensorCfg`（给 A3 URDF 的 `hard_sole_3seg` 系列脚部资产加接触力传感器）：checkpoint config 里没有打开这个开关，而且这次用的 asset_path 本身不含 `hard_sole_3seg` 字样。
+- `_cached_reference`/`cache_current_references`（commands.py 里整层按帧记忆化缓存机制，worklog #40 就已经记录过是"刻意不移植，手写等价无缓存版本代替"，这次验证重新确认了这个决定——checkpoint config 里没有 `cache_current_references` 这个键，等价于 Litchi 自己跑这个 035 实验时这个缓存机制也是关闭的，所以两边在这次验证里实际执行的是等价代码路径，不存在"因为没移植缓存机制所以行为不同"的风险)。
+- 以及 commands.py 的 reset-subset 性能优化重构（用 `len(env_ids)` 大小的张量而不是 `num_envs` 大小张量再掩码写回）、paired-terrain 相关的 `_use_paired_motions`/`rank_partitioned_terrain` 分支、adaptive-sampling 的"重置前一步快照"bug 修复（`_adp_prev_motion_ids`/`_adp_snapshot_valid`，Litchi 的注释原文是"Isaac Lab resamples terminated environments before `_update_command` reads the cursor. Keep the pre-physics cursor so failures are charged to the motion/bin that was actually being tracked"——这是一个独立于 A3 的自适应采样统计口径修正，`use_adaptive_sampling` 这次用的 035 配置里是否打开没有专门确认，如果打开了，这一处是潜在的、本次验证没有修复的行为差异，列入 42.6 遗留项）：这些都是只影响性能或训练统计口径、不影响"网络是否被正确构建、动作是否被正确计算"这个本次验证核心问题的代码,逐一确认后决定不动,避免在验证任务里顺带做一次范围不可控的性能重构。
+
+### 42.4 一个已确认"不是迁移 bug"的插曲：`eval_agent_trl.py` 本身的 staleness
+
+Litchi 文档推荐的调用方式带 `+export_onnx_only=true`，在 Litchi 仓库里完整跑通（4 个 onnx 文件全部导出成功：`_g1.onnx`/`_a3_fast.onnx`/`_encoder.onnx`/`_decoder.onnx`，日志确认 `obs_dict[1,1570] → action[1,29]`，和文档描述完全一致）。但同样的命令在 GR00T 里报 `KeyError: 'smpl'`（`inference_helpers.export_universal_token_module_as_onnx` 在尝试导出 smpl 专属 onnx 时，`module.encoder_input_features['smpl']` 不存在——这个 035 实验本来就只训了 g1/a3_fast 两个 encoder,没有 smpl/teleop)。
+
+查证：`diff` 两边的 `eval_agent_trl.py`（Litchi 版本多出整整一个 `EvalDebugDumper` 类，共 42KB 的 diff），确认这个文件本身在 Phase 1 之外、独立于 A3 迁移就已经出现了分叉——GR00T 这边的版本是更早的快照，硬编码按固定顺序导出 smpl/g1/teleop 三个 encoder 的 onnx,没有做"检查这个 encoder 是否存在"的防御性判断;Litchi 那边版本更新,这部分逻辑大概率已经改成按需导出。**这不是本次 A3 迁移引入的问题,这个文件从来没有被纳入 Phase 1 的迁移范围（它是通用 eval 入口,不是 A3 专属文件）**,所以没有去动它,而是换一种调用方式绕开这个有问题的代码分支:不传 `export_onnx_only`,改用默认的 `run_eval_loop` 真实 rollout 路径,配合 `+max_render_steps=20` 做一次快速、真实的多步闭环验证——这条路径不涉及那个 staleness 问题,而且更贴近"验证训练侧环境代码"这个本次任务的真正目标(ONNX 导出验证的是"网络能不能被 trace 成静态图",而不是"环境每一步的观测/奖励/事件代码对不对")。这个 `eval_agent_trl.py` 的 staleness 本身也记入 42.6 遗留项,但不阻塞,文件存在不代表必须现在修。
+
+### 42.5 最终验证结果
+
+两个仓库分别执行以下命令（仅 cwd 不同）：
+
+```bash
+conda run -n isaaclab python gear_sonic/eval_agent_trl.py \
+  +checkpoint="$PWD/checkpoints/035_step200000/model_step_200000.pt" \
+  +headless=True \
+  ++num_envs=1 \
+  "++manager_env.commands.motion.motion_lib_cfg.motion_file=$PWD/.cache/motionlib_035_selected20" \
+  +max_render_steps=20 \
+  ++eval_callbacks=[]
+```
+
+（Litchi 那边因为 motion_file 支持列表语法，实际传的是 `[$PWD/.cache/motionlib_035_selected20]`，GR00T 这边因为没有移植"motion_file 可以是序列"这个新功能——也是和 A3 无关的 `motion_lib_base.py` 独立分叉，细节见下——传的是不带中括号的裸路径，两边 `motion_lib_base.py` 现有的、未经改动的目录加载逻辑都支持裸目录路径，功能等价。)
+
+两边结果：`EXIT_CODE=0`，日志里都确认了：
+- `Model parameterization: std` / `Successfully loaded policy state dict`——**strict `load_state_dict` 成功**,证明两边在这次验证里真正实例化出来的 `UniversalTokenModule`/`Actor` 网络结构（层数、每层维度、参数命名）与 checkpoint 完全一致,逐参数无差异。这是本次验证能给出的最强的"架构等价"证据。
+- `Reached max_render_steps=20. Exiting.`——20 个完整的真实 `env.step()` 循环全部正常完成,期间真正执行了 commands.py 的 `_resample_command`/`_update_command`（含 A3-fast 未来帧窗口、DOF mismatch 处理、encoder 协同激活）、observations.py 的新增 term、rewards.py 的 4 个新增 A3 电机约束 reward、events.py 的新增域随机化 term,全程无报错、日志里搜索 "nan"/"error"/"traceback" 均为空（已排除 TracerWarning/UserWarning 等无关噪声）。
+
+**这次验证证明了什么**：Phase 1 迁移的训练侧代码（在本条目修复了上述 3 处遗漏之后）,在真正被 Hydra 实例化、真正驱动一个真实 `ManagerBasedRLEnv` 跑 20 步闭环交互的条件下,产生了和 Litchi 原仓库同一 checkpoint 在同一类命令下一致的行为（strict 权重加载成功 + 多步无崩溃）。这填补了 #41.4 明确指出的空白——训练侧代码不再只是"长得和 Litchi 一样"（diff 层面）,而是"真的能被正确实例化并跑起来"（运行时层面）。
+
+**仍然保留的不确定性**（诚实记录，不夸大这次验证的覆盖面）：
+- 没有做逐 step 的数值级比较（比如把两边第 1~20 步的 action tensor dump 下来逐元素比较）。原因：`eval_agent_trl.py` 显式设置 `torch.backends.cudnn.deterministic = False`，且两边是两个独立的 Isaac Sim 场景实例（各自的 PhysX 刚体初始化、碰撞检测顺序等在 GPU 上不保证 bit-exact 复现），逐 step 数值比较本来就不会得到"差值为 0"这种强信号,而只能得到"差值在某个容差内"这种弱信号,参考价值有限。相比之下,"strict 权重加载成功"+"20 步无崩溃"已经是更直接、更不依赖容差判断的正确性证据。如果未来需要逐 step 数值比较,建议改用 CPU 后端跑（牺牲速度换确定性）,这次没有做。
+- 遗漏 2 的修复对现有 G1 行为"推断零影响"但未重新跑 G1 的同类验证做实证确认（见 42.3 遗漏 2 小节末尾）。
+- `use_adaptive_sampling`（自适应采样）在这次 035 配置里是否被打开没有专门确认；如果打开了，Litchi 的"重置前快照"bug 修复（见 42.3 末尾未移植列表）会是一个本次验证没有覆盖、仍然存在的行为分歧。
+
+### 42.6 遗留项（本条目新增，供下次继续时直接读取，无需重新调查）
+
+1. `convert_soma_csv_to_motion_lib.py` 的 A3 flat-CSV 支持尚未合并进 GR00T（两边脚本完全是两个不同的实现，服务不同的使用场景——G1/Bones-SEED 批量 vs A3 单机 flat-CSV）。如果之后需要在 GR00T 里直接跑 A3 数据转换（而不是像这次一样从 Litchi 拷贝转换好的 `.cache/`），需要把 Litchi 版本的 A3 专属逻辑（`load_a3_flat_csv`/`A3_SPEC`/`A3_29D_SPEC`/`detect_flat_csv_robot`）合并进 GR00T 现有脚本，而不是整体替换（会破坏现有 G1/Bones-SEED 批量转换功能）。
+2. `a3_old.py` 机器人模块、`"a3_old"` robot_mapping 键、`_set_a3_foot_contact_compliance` 脚底柔顺接触材质功能均未移植（035 checkpoint 不需要，若未来要跑用到这些的其他 A3 实验配置需要补）。
+3. `A3MotorSpaceActuator`/`A3MotorSpaceActuatorCfg`（显式电机 T-N 曲线驱动模型，`actuators.py` 约 240 行）及依赖它的 `motor_model_cfg`/`actuator_delay_cfg` 两条 `override_settings()` 分支未移植（035 checkpoint 不需要）。
+4. `eval_agent_trl.py` 本身存在独立于 A3 迁移的 staleness（缺 `EvalDebugDumper`，`export_onnx_only` 分支的硬编码 encoder 导出列表对只训了部分 encoder 的实验不够健壮），这个文件此前从未被纳入任何一次 Phase 1/2 迁移范围，不是本次任务的责任范围，但如果以后要用 `export_onnx_only` 走 ONNX→RKNN 部署链路（`a3_training2sim2deploy.md` 第 5 节），需要先解决这个。
+5. `motion_lib_base.py` 支持"`motion_file` 可以是目录列表"这个新功能（Litchi 侧的 `_is_motion_file_sequence`/`_find_semantic_manifest`/`_load_validated_semantic_manifest` 等）未移植，这次验证绕开了（直接传单个目录路径，两边都支持），但如果以后要合并多个数据源目录会需要。
+6. 遗漏 2 的"G1 零回归"目前是推断而非实证（见 42.3）；`use_adaptive_sampling` 若开启时的"重置前快照"行为分歧未修复（见 42.3 未移植列表 + 42.5 不确定性列表）。
+7. `commands.py`/`modular_tracking_env_cfg.py` 这次为了打通 A3 验证陆续补的几处改动，没有重新对 G1/H2 现有训练配置跑一次回归冒烟测试（只用静态 import + 这次 A3 的真实运行作为信心来源）——建议在正式合入/训练前补一次 G1 的 `eval_agent_trl.py` 同类快速冒烟（`+max_render_steps=20`），以获得同等级别的"零回归"证据，而不是停留在"读代码推断不影响"。

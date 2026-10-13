@@ -265,6 +265,18 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
             )
             self.total_aux_loss_stats[ppo_epoch_idx, minibatch_idx, microbatch_idx] = total_aux_loss
 
+    def _get_train_metric_stats(self):
+        """Append auxiliary tensors to the parent's packed metric reduction."""
+        mean_stats, variance_stats = super()._get_train_metric_stats()
+        if self.compute_aux_loss:
+            for loss_name, loss_stats in self.aux_loss_stats.items():
+                mean_stats[f"loss/aux_{loss_name}_avg"] = loss_stats
+            mean_stats["loss/total_aux_loss_unscaled_avg"] = (
+                self.total_aux_loss_unscaled_stats
+            )
+            mean_stats["loss/total_aux_loss_avg"] = self.total_aux_loss_stats
+        return mean_stats, variance_stats
+
     def _get_train_metrics(self):
         """Collect training metrics including auxiliary loss averages.
 
@@ -284,23 +296,7 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         """
         metrics = super()._get_train_metrics()
 
-        # Add auxiliary loss metrics if enabled
         if self.compute_aux_loss:
-            # Add metrics for each individual auxiliary loss
-            for loss_name, loss_stats in self.aux_loss_stats.items():
-                metrics[f"loss/aux_{loss_name}_avg"] = (
-                    self.accelerator.gather_for_metrics(loss_stats).mean().item()
-                )
-
-            # Add total auxiliary loss metrics
-            metrics["loss/total_aux_loss_unscaled_avg"] = (
-                self.accelerator.gather_for_metrics(self.total_aux_loss_unscaled_stats)
-                .mean()
-                .item()
-            )
-            metrics["loss/total_aux_loss_avg"] = (
-                self.accelerator.gather_for_metrics(self.total_aux_loss_stats).mean().item()
-            )
             metrics["aux_loss_scale"] = self.aux_loss_scale
 
         return metrics

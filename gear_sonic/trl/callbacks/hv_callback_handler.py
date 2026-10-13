@@ -1,6 +1,8 @@
 from transformers.trainer_callback import *
 from trl.trainer.ppo_trainer import *
 
+from gear_sonic.trl.utils import logger_utils
+
 
 class HVCallbackHandler(TrainerCallback):
     """Internal class that just calls the list of callbacks in order."""
@@ -128,6 +130,12 @@ class HVCallbackHandler(TrainerCallback):
 
     def call_event(self, event, args, state, control, **kwargs):
         for callback in self.callbacks:
+            callback_kwargs = kwargs
+            if event == "on_log" and callback.__class__.__name__ == "TensorBoardCallback":
+                callback_kwargs = {
+                    **kwargs,
+                    "logs": logger_utils.filter_scalar_logs(kwargs.get("logs", {})),
+                }
             result = getattr(callback, event)(
                 args,
                 state,
@@ -140,7 +148,7 @@ class HVCallbackHandler(TrainerCallback):
                 eval_dataloader=self.eval_dataloader,
                 env=self.env,
                 accelerator=self.accelerator,
-                **kwargs,
+                **callback_kwargs,
             )
             # A Callback can skip the return of `control` if it doesn't change it.
             if result is not None:

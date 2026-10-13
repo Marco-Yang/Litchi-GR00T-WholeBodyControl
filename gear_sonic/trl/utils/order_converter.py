@@ -197,6 +197,7 @@ class H2Converter(IsaacLabMuJoCoConverter):
             ("isaaclab", "mujoco"): H2_ISAACLAB_TO_MUJOCO_BODY,
             ("mujoco", "isaaclab"): H2_MUJOCO_TO_ISAACLAB_BODY,
         }
+        self._motion_lib_mujoco_to_isaaclab_dof = A3_MUJOCO_TO_ISAACLAB_DOF
 
     VR_3POINTS_BODY_NAMES = ["torso_link", "left_wrist_pitch_link", "right_wrist_pitch_link"]
     FOOT_BODY_NAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
@@ -283,6 +284,75 @@ class A3UltraConverter(IsaacLabMuJoCoConverter):
         }
 
 
+class A3Converter(IsaacLabMuJoCoConverter):
+    """Convert the compact 29-DOF A3 policy order to compact MuJoCo order.
+
+    A3's MJCF has two non-actuated head joints, so its full FK output is 31D
+    while the policy ABI is 29D.  ``convert()`` deliberately operates on the
+    compact 29D MuJoCo order (with those head joints removed), which makes the
+    two directions a true round trip.  The full 31D gather selectors remain
+    available through :meth:`get_isaaclab_to_mujoco_mapping` for
+    ``MotionLibRobot`` to consume its FK output.
+
+    Distinct from :class:`A3UltraConverter`: this targets the AgiBot A3
+    (T2D5) hardware/checkpoint ABI that ``Litchi_sonic_for_a3``'s 035
+    checkpoint was trained on (29 DOF, no fingers); ``A3UltraConverter``
+    targets this project's own from-scratch A3 Ultra (T3D0) training (63 DOF,
+    includes fingers). See docs/workflow/a3_integration_plan.md.
+    """
+
+    def __init__(self):
+        from gear_sonic.envs.manager_env.robots.a3 import (
+            A3_ISAACLAB_JOINTS,
+            A3_ISAACLAB_TO_MUJOCO_BODY,
+            A3_ISAACLAB_TO_MUJOCO_DOF,
+            A3_MUJOCO_TO_ISAACLAB_BODY,
+            A3_MUJOCO_TO_ISAACLAB_DOF,
+        )
+
+        self.JOINT_NAMES = A3_ISAACLAB_JOINTS
+
+        # ``A3_MUJOCO_TO_ISAACLAB_DOF`` indexes the *full* 31-DOF MuJoCo
+        # output, including the two head slots.  It cannot be the inverse used
+        # by ``convert`` because that helper receives/returns compact 29D
+        # vectors.  Build the compact inverse from the bijective 29D mapping.
+        compact_mujoco_to_isaaclab_dof = [0] * len(A3_ISAACLAB_TO_MUJOCO_DOF)
+        for isaaclab_idx, mujoco_idx in enumerate(A3_ISAACLAB_TO_MUJOCO_DOF):
+            compact_mujoco_to_isaaclab_dof[mujoco_idx] = isaaclab_idx
+        self.DOF_MAPPINGS = {
+            ("isaaclab", "mujoco"): A3_ISAACLAB_TO_MUJOCO_DOF,
+            ("mujoco", "isaaclab"): compact_mujoco_to_isaaclab_dof,
+        }
+        self.BODY_MAPPINGS = {
+            ("isaaclab", "mujoco"): A3_ISAACLAB_TO_MUJOCO_BODY,
+            ("mujoco", "isaaclab"): A3_MUJOCO_TO_ISAACLAB_BODY,
+        }
+        self._motion_lib_mujoco_to_isaaclab_dof = A3_MUJOCO_TO_ISAACLAB_DOF
+
+    @property
+    def isaaclab_to_mujoco_dof(self):
+        """29D IsaacLab policy order -> compact 29D MuJoCo order."""
+        return self.DOF_MAPPINGS[("isaaclab", "mujoco")]
+
+    @property
+    def mujoco_to_isaaclab_dof(self):
+        """Full 31D MuJoCo FK output -> 29D IsaacLab policy order."""
+        return self._motion_lib_mujoco_to_isaaclab_dof
+
+    @property
+    def isaaclab_to_mujoco_body(self):
+        """30-body IsaacLab order -> compact 30-body MuJoCo order."""
+        return self.BODY_MAPPINGS[("isaaclab", "mujoco")]
+
+    @property
+    def mujoco_to_isaaclab_body(self):
+        """Full 32-body MuJoCo FK output -> 30-body IsaacLab order."""
+        return self.BODY_MAPPINGS[("mujoco", "isaaclab")]
+
+    VR_3POINTS_BODY_NAMES = ["torso_Link", "left_wrist_yaw_Link", "right_wrist_yaw_Link"]
+    FOOT_BODY_NAMES = ["left_ankle_roll_Link", "right_ankle_roll_Link"]
+
+
 def load_qpos_from_csv(csv_path: str) -> torch.Tensor:
     """Load qpos [T, D] from CSV."""
     import pandas as pd
@@ -298,7 +368,32 @@ def save_qpos_to_csv(qpos: torch.Tensor, csv_path: str):
     pd.DataFrame(data).to_csv(csv_path, index=False)
 
 
+# Robot-name -> converter registry.  Names follow the unified ``--robot`` CLI:
+#   g1 (GR00T release), h2, a3 (Litchi 035 checkpoint ABI, 29 DOF),
+#   a3_ultra (project's own T3D0 63-DOF contract).
+CONVERTER_BY_ROBOT = {
+    "g1": G1Converter,
+    "h2": H2Converter,
+    "a3": A3Converter,
+    "a3_ultra": A3UltraConverter,
+}
+
+
+def get_converter(robot_type: str = "g1") -> "IsaacLabMuJoCoConverter":
+    """Instantiate the IsaacLab<->MuJoCo order converter for ``robot_type``."""
+    try:
+        return CONVERTER_BY_ROBOT[robot_type]()
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown robot_type '{robot_type}'. Choices: {sorted(CONVERTER_BY_ROBOT)}"
+        ) from exc
+
+
 if __name__ == "__main__":
+    import argparse
+    import os
+    import sys
+
     from isaacsim import SimulationApp
 
     _sim_app = SimulationApp({"headless": True})

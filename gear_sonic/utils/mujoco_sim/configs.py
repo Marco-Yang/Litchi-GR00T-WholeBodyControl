@@ -121,10 +121,11 @@ class BaseConfig(ArgsConfigTemplate):
     dataset_version: str = "sonic_model12"
 
     # Robot Selection
-    robot: Literal["g1", "a3_ultra", "h2"] = "g1"
+    robot: Literal["g1", "a3", "a3_ultra", "h2"] = "g1"
     """Which robot to load (urdf/mjcf, wbc yaml, and IK robot model). Only "g1" has a
-    wbc yaml + trained policy today; the others raise a clear error until added
-    (see docs/source/user_guide/new_embodiments.md)."""
+    wbc yaml for the Unitree-SDK2 MuJoCo sim loop today; "a3"/"a3_ultra" simulate via
+    gear_sonic/scripts/sim2sim_a3_mujoco.py (see run_sim_loop.py); the rest raise a
+    clear error until added (see docs/source/user_guide/new_embodiments.md)."""
 
     # WBC Configuration
     wbc_version: Literal[tuple(WBC_VERSIONS)] = "sonic_model12"

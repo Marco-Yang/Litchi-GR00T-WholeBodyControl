@@ -291,15 +291,18 @@ A3_ULTRA_CFG = ArticulationCfg(
             damping=3.0,
             armature=0.004967,
         ),
-        # PFP-41-48: J_motor=1.359e-6, N=24.415 → J_output=0.000810 kg·m²
+        # PFP-59-60: J_motor=10.1374e-6, N=22.136 → J_output=0.004967 kg·m²
         # Kp=40, Kd=3, effort=24 Nm, vel=15.71 rad/s
+        # (same motor class as shoulder_yaw/elbow — effort/vel limits match
+        # PFP-59-60, not PFP-41-48; cross-checked against Litchi_sonic_for_a3's
+        # independently-derived ARMATURE_PFP_59_60 for this joint, worklog #37)
         "wrist_roll": ImplicitActuatorCfg(
             joint_names_expr=[".*_wrist_roll_joint"],
             effort_limit_sim=24.0,
             velocity_limit_sim=15.71,
             stiffness=40.0,
             damping=3.0,
-            armature=0.000810,
+            armature=0.004967,
         ),
         # PFP-41-48: same motor → J_output=0.000810 kg·m²
         # Kp=15, Kd=1, effort=6 Nm, vel=12.78 rad/s

@@ -39,6 +39,8 @@ find_path(
   NAMES NvInfer.h
   PATHS ${TensorRT_ROOT} ENV TensorRT_ROOT
   PATH_SUFFIXES include
+                include/aarch64-linux-gnu
+                include/x86_64-linux-gnu
 )
 
 string(FIND ${TensorRT_INCLUDE_DIR} "NOTFOUND" _include_dir_notfound)
@@ -71,6 +73,10 @@ function(_find_trt_component component)
     TensorRT_${component}_LIBRARY
     NAMES ${component}
     PATHS ${TensorRT_ROOT} ${TENSORRT_LIBRARY_DIR} ENV TensorRT_ROOT
+    PATH_SUFFIXES lib
+                  lib64
+                  lib/aarch64-linux-gnu
+                  lib/x86_64-linux-gnu
   )
 
   string(FIND ${TensorRT_${component}_LIBRARY} "NOTFOUND" _library_not_found)
@@ -114,4 +120,3 @@ endforeach()
 
 include(FindPackageHandleStandardArgs)
 find_package_handle_standard_args(TensorRT HANDLE_COMPONENTS VERSION_VAR TensorRT_VERSION REQUIRED_VARS TensorRT_INCLUDE_DIR)
-

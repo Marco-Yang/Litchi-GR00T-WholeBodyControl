@@ -44,6 +44,7 @@ class Actor(nn.Module):
         has_aux_loss=False,
         output_original_obs_dict=False,
         backbone_kwargs={},
+        skip_rollout_attnmask_for_history_one=False,
     ):
         """Initialize the Actor.
 
@@ -67,6 +68,9 @@ class Actor(nn.Module):
                 in the output TensorDict.
             backbone_kwargs: Extra keyword arguments forwarded to the backbone
                 constructor.
+            skip_rollout_attnmask_for_history_one: Skip constructing the
+                trivial ``(B, 1, 1)`` attention mask during one-step rollout.
+                Enable only for backbones that do not consume attention masks.
         """
         super().__init__()
 
@@ -81,6 +85,9 @@ class Actor(nn.Module):
         self.aux_loss_coef = None
         self.output_original_obs_dict = output_original_obs_dict
         self.max_rollout_history = max_rollout_history
+        self.skip_rollout_attnmask_for_history_one = bool(
+            skip_rollout_attnmask_for_history_one
+        )
         self.actor_module = custom_instantiate(
             backbone,
             env_config=env_config,
@@ -280,11 +287,19 @@ class Actor(nn.Module):
 
         # Get std using the property that handles both parameterizations
         std = self.get_std
-        # Safety check for NaN or negative values
-        if torch.any(torch.isnan(std)) or torch.any(std <= 0):
-            print(f"[WARNING] Invalid std detected! std: {std}")
-            std = torch.clamp(std, min=1e-6)
-        self.distribution = Normal(mean, (mean * 0.0 + std).clamp(min=1e-6))
+        # Keep validation on-device. Python truth-value checks on CUDA tensors
+        # synchronize every actor forward and serialize the rollout stream.
+        # Preserve the legacy 1e-6 lower bound while also repairing NaNs/Infs,
+        # which the old clamp left unchanged.
+        std = torch.where(
+            torch.isfinite(std),
+            std.clamp_min(1.0e-6),
+            torch.full_like(std, 1.0e-6),
+        )
+        # ``Normal`` broadcasts the per-action scale as a stride-zero view.
+        # Materializing ``mean * 0 + std`` launched an extra BxA kernel on
+        # every rollout and PPO forward for an otherwise identical scale.
+        self.distribution = Normal(mean, std)
 
     def act(self, obs_dict, episode_attnmask=None, **kwargs):
         """Sample actions from the current policy for a single timestep.
@@ -372,6 +387,27 @@ class Actor(nn.Module):
             ``(batch, history_len, history_len)`` or None.
         """
         update_episode_attnmask = False
+
+        # With one-step history, concatenating the old and new full observation
+        # tensors only to slice the old tensor away is pure allocation/copy
+        # overhead. Keep views of the current observations instead.
+        if self.max_rollout_history == 1:
+            update_episode_attnmask = any(key in self.obs_dict_buffer for key in obs_dict)
+            for key, value in obs_dict.items():
+                self.obs_dict_buffer[key] = value.unsqueeze(1)
+
+            if episode_attnmask is not None and update_episode_attnmask:
+                episode_attnmask = episode_attnmask[:, -1:, -1:]
+
+            if cur_dones is not None and not self.skip_rollout_attnmask_for_history_one:
+                episode_attnmask_from_dones = (
+                    self.update_dones_buffer_and_compute_episode_attnmask(cur_dones)
+                )
+                if episode_attnmask is not None:
+                    assert (episode_attnmask == episode_attnmask_from_dones).all()
+                else:
+                    episode_attnmask = episode_attnmask_from_dones
+            return episode_attnmask
 
         for key in obs_dict.keys():
             if key not in self.obs_dict_buffer:

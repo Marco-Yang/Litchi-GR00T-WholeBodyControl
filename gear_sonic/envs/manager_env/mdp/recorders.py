@@ -87,7 +87,7 @@ class RenderEnvsRecorderTerm(recorder_manager.RecorderTerm):
 
         # Set camera position based on robot root position
         root_pos = self.env.command_manager.get_term("motion").robot_body_pos_w[:, 0]
-        camera_offset = self.env.wrapper.config.get("eval_camera_offset", [2, 2, 1])
+        camera_offset = self.env.wrapper.config.get("eval_camera_offset", [4.0, 4.0, 1.8])
         fix_camera = self.env.wrapper.config.get("fix_camera_after_first_frame", False)
         cam = self.env.scene["eval_camera"]
 

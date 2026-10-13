@@ -1,0 +1,25 @@
+{
+  "format_version": 1,
+  "project": "SONIC for A3",
+  "release": "035_step200000",
+  "checkpoint_step": 200000,
+  "robots": [
+    "A3",
+    "A3 Ultra"
+  ],
+  "policy_joints": 29,
+  "encoders": [
+    "g1",
+    "a3_fast"
+  ],
+  "formats": [
+    "pt",
+    "onnx",
+    "rknn"
+  ],
+  "training_config": "035_step200000/config.yaml",
+  "model_config": "035_step200000/model_config.yaml",
+  "release_checksums": "035_step200000/SHA256SUMS",
+  "source_repository": "https://github.com/AgibotTech/sonic_for_a3",
+  "note": "Release metadata for the custom SONIC policy; not a Transformers AutoModel configuration."
+}

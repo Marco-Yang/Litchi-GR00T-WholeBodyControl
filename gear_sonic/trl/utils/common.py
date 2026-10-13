@@ -1,10 +1,12 @@
 """Miscellaneous training utilities: W&B helpers, dynamic imports, OmegaConf tools, and timers."""
 
-import wandb
+import hashlib
 import importlib
 import os
 import time
-from omegaconf import OmegaConf, DictConfig, ListConfig
+
+from omegaconf import DictConfig, ListConfig, OmegaConf
+import wandb
 
 
 def wandb_run_exists():
@@ -48,6 +50,135 @@ def materialize_lazy_params(policy, env):
         dummy_obs = env.reset()
         with torch.no_grad():
             policy.act(dummy_obs)
+
+
+def _distributed_rank_context(accelerator=None):
+    global_rank = getattr(accelerator, "process_index", os.environ.get("RANK", 0))
+    local_rank = getattr(accelerator, "local_process_index", os.environ.get("LOCAL_RANK", 0))
+    world_size = getattr(accelerator, "num_processes", os.environ.get("WORLD_SIZE", 1))
+    return (
+        f"global_rank={global_rank} local_rank={local_rank} "
+        f"world_size={world_size} pid={os.getpid()}"
+    )
+
+
+def distributed_stage(stage, function, *, accelerator=None, log_fn=None):
+    """Run one startup stage with rank-aware begin/complete/failure markers."""
+
+    def emit(message):
+        if log_fn is None:
+            print(message, flush=True)
+        else:
+            log_fn(message)
+
+    context = _distributed_rank_context(accelerator)
+    started_at = time.monotonic()
+    emit(f"[DistributedStage] begin stage={stage} {context}")
+    try:
+        result = function()
+    except Exception as exc:
+        emit(
+            f"[DistributedStage] failed stage={stage} {context} "
+            f"elapsed_seconds={time.monotonic() - started_at:.3f} "
+            f"error_type={type(exc).__name__} error={exc!r}"
+        )
+        raise
+    emit(
+        f"[DistributedStage] complete stage={stage} {context} "
+        f"elapsed_seconds={time.monotonic() - started_at:.3f}"
+    )
+    return result
+
+
+def _tensor_structure_line(module_name, tensor_kind, tensor_name, tensor):
+    try:
+        shape = tuple(tensor.shape)
+        numel = tensor.numel()
+    except RuntimeError:
+        shape = ("uninitialized",)
+        numel = 0
+    requires_grad = getattr(tensor, "requires_grad", False)
+    return (
+        f"{module_name}|{tensor_kind}|{tensor_name}|{shape}|{tensor.dtype}|"
+        f"requires_grad={requires_grad}"
+    ), numel
+
+
+def build_module_parameter_signature(modules):
+    """Hash parameter and buffer structure without depending on initialized values."""
+
+    digest = hashlib.sha256()
+    parameter_tensors = 0
+    parameter_numel = 0
+    buffer_tensors = 0
+    buffer_numel = 0
+
+    for module_name, module in modules.items():
+        if module is None:
+            digest.update(f"{module_name}|none\n".encode())
+            continue
+        for parameter_name, parameter in module.named_parameters():
+            line, numel = _tensor_structure_line(
+                module_name, "parameter", parameter_name, parameter
+            )
+            digest.update(f"{line}\n".encode())
+            parameter_tensors += 1
+            parameter_numel += numel
+        for buffer_name, buffer in module.named_buffers():
+            line, numel = _tensor_structure_line(module_name, "buffer", buffer_name, buffer)
+            digest.update(f"{line}\n".encode())
+            buffer_tensors += 1
+            buffer_numel += numel
+
+    return {
+        "digest": digest.hexdigest(),
+        "parameter_tensors": parameter_tensors,
+        "parameter_numel": parameter_numel,
+        "buffer_tensors": buffer_tensors,
+        "buffer_numel": buffer_numel,
+    }
+
+
+def verify_distributed_model_signatures(modules, accelerator):
+    """Fail before DDP wrapping when ranks constructed different model structures."""
+
+    import torch.distributed as dist
+
+    signature = build_module_parameter_signature(modules)
+    print(
+        "[DistributedSignature] local "
+        f"{_distributed_rank_context(accelerator)} "
+        f"digest={signature['digest']} "
+        f"parameter_tensors={signature['parameter_tensors']} "
+        f"parameter_numel={signature['parameter_numel']} "
+        f"buffer_tensors={signature['buffer_tensors']} "
+        f"buffer_numel={signature['buffer_numel']}",
+        flush=True,
+    )
+
+    world_size = int(getattr(accelerator, "num_processes", 1))
+    if world_size <= 1:
+        return signature
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError(
+            "Distributed model signature verification requires an initialized process group"
+        )
+
+    gathered = [None] * world_size
+    dist.all_gather_object(gathered, signature)
+    if any(candidate != gathered[0] for candidate in gathered[1:]):
+        per_rank = ", ".join(
+            f"rank={rank}:{candidate}" for rank, candidate in enumerate(gathered)
+        )
+        raise RuntimeError(f"Model parameter signatures differ across ranks: {per_rank}")
+
+    if accelerator.is_main_process:
+        print(
+            "[DistributedSignature] matched "
+            f"world_size={world_size} digest={signature['digest']}",
+            flush=True,
+        )
+    return signature
 
 
 def get_filtered_state_dict(state_dict, state_dict_key):

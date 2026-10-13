@@ -22,12 +22,142 @@ include(CheckLanguage)
 
 # Optional builds
 option(BUILD_SRCS "Build sources" ON)
+# TensorRT/CUDA inference is ON by default so the stock G1 (Jetson/x86 + TensorRT)
+# build behaves exactly as upstream GR00T.  A3 / Rockchip (RK3588S) builds pass
+# -DENABLE_TRT_INFERENCE=OFF (see scripts/build_a3_deploy_pkg.sh).
+option(ENABLE_TRT_INFERENCE "Build TensorRT/CUDA inference targets" ON)
+# The G1 deploy executable (g1_deploy_onnx_ref) needs Unitree SDK2 + TensorRT.
+# It follows ENABLE_TRT_INFERENCE by default and can be switched off explicitly
+# for A3-only builds.  The A3 executable (a3_deploy_onnx_ref) is always built.
+option(ENABLE_G1_BACKEND "Build the G1 deploy executable (Unitree SDK2 + TensorRT)"
+       ${ENABLE_TRT_INFERENCE})
+if(ENABLE_G1_BACKEND AND NOT ENABLE_TRT_INFERENCE)
+  message(FATAL_ERROR "ENABLE_G1_BACKEND=ON requires ENABLE_TRT_INFERENCE=ON")
+endif()
+option(ENABLE_RKNN_INFERENCE "Build Rockchip RKNN inference backend" OFF)
+option(USE_BUNDLED_ONNXRUNTIME_AARCH64
+       "Use an explicitly supplied aarch64 ONNX Runtime archive on aarch64/arm64" ON)
+set(GS_ONNXRUNTIME_AARCH64_TARBALL "" CACHE FILEPATH
+    "Explicit path to a target-compatible aarch64 ONNX Runtime archive")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
-find_package(TensorRT REQUIRED)
 find_package(Threads REQUIRED)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64"
+   AND USE_BUNDLED_ONNXRUNTIME_AARCH64)
+  if(GS_ONNXRUNTIME_AARCH64_TARBALL STREQUAL "")
+    message(FATAL_ERROR
+      "AArch64 ONNX Runtime archive is required when "
+      "USE_BUNDLED_ONNXRUNTIME_AARCH64=ON. Set "
+      "GS_ONNXRUNTIME_AARCH64_TARBALL to a target-compatible archive, or set "
+      "USE_BUNDLED_ONNXRUNTIME_AARCH64=OFF and provide onnxruntime separately.")
+  endif()
+  if(NOT EXISTS "${GS_ONNXRUNTIME_AARCH64_TARBALL}")
+    message(FATAL_ERROR
+      "Explicit aarch64 ONNX Runtime archive does not exist: "
+      "${GS_ONNXRUNTIME_AARCH64_TARBALL}")
+  endif()
+
+  set(GS_ONNXRUNTIME_AARCH64_EXTRACT_DIR
+      "${CMAKE_BINARY_DIR}/_deps/onnxruntime_aarch64")
+  set(GS_ONNXRUNTIME_AARCH64_MARKER
+      "${GS_ONNXRUNTIME_AARCH64_EXTRACT_DIR}/.a3_source_sha256")
+  file(SHA256 "${GS_ONNXRUNTIME_AARCH64_TARBALL}"
+       GS_ONNXRUNTIME_AARCH64_ARCHIVE_SHA256)
+  set(GS_ONNXRUNTIME_AARCH64_NEEDS_EXTRACT TRUE)
+  if(EXISTS "${GS_ONNXRUNTIME_AARCH64_MARKER}")
+    file(READ "${GS_ONNXRUNTIME_AARCH64_MARKER}"
+         GS_ONNXRUNTIME_AARCH64_EXTRACTED_SHA256)
+    string(STRIP "${GS_ONNXRUNTIME_AARCH64_EXTRACTED_SHA256}"
+           GS_ONNXRUNTIME_AARCH64_EXTRACTED_SHA256)
+    if(GS_ONNXRUNTIME_AARCH64_EXTRACTED_SHA256 STREQUAL
+       GS_ONNXRUNTIME_AARCH64_ARCHIVE_SHA256)
+      set(GS_ONNXRUNTIME_AARCH64_NEEDS_EXTRACT FALSE)
+    endif()
+  endif()
+
+  if(GS_ONNXRUNTIME_AARCH64_NEEDS_EXTRACT)
+    file(REMOVE_RECURSE "${GS_ONNXRUNTIME_AARCH64_EXTRACT_DIR}")
+    file(MAKE_DIRECTORY "${GS_ONNXRUNTIME_AARCH64_EXTRACT_DIR}")
+    execute_process(
+      COMMAND ${CMAKE_COMMAND} -E tar xzf "${GS_ONNXRUNTIME_AARCH64_TARBALL}"
+      WORKING_DIRECTORY "${GS_ONNXRUNTIME_AARCH64_EXTRACT_DIR}"
+      RESULT_VARIABLE GS_ONNXRUNTIME_EXTRACT_RESULT)
+    if(NOT GS_ONNXRUNTIME_EXTRACT_RESULT EQUAL 0)
+      message(FATAL_ERROR
+        "Failed to extract ${GS_ONNXRUNTIME_AARCH64_TARBALL}")
+    endif()
+    file(WRITE "${GS_ONNXRUNTIME_AARCH64_MARKER}"
+         "${GS_ONNXRUNTIME_AARCH64_ARCHIVE_SHA256}\n")
+  endif()
+
+  file(GLOB_RECURSE GS_ONNXRUNTIME_AARCH64_CONFIG_CANDIDATES
+       LIST_DIRECTORIES FALSE
+       "${GS_ONNXRUNTIME_AARCH64_EXTRACT_DIR}/*/lib/cmake/onnxruntime/onnxruntimeConfig.cmake")
+  list(LENGTH GS_ONNXRUNTIME_AARCH64_CONFIG_CANDIDATES
+       GS_ONNXRUNTIME_AARCH64_CONFIG_COUNT)
+  if(NOT GS_ONNXRUNTIME_AARCH64_CONFIG_COUNT EQUAL 1)
+    message(FATAL_ERROR
+      "The aarch64 ONNX Runtime archive must contain exactly one "
+      "*/lib/cmake/onnxruntime/onnxruntimeConfig.cmake install config: "
+      "${GS_ONNXRUNTIME_AARCH64_TARBALL}")
+  endif()
+  list(GET GS_ONNXRUNTIME_AARCH64_CONFIG_CANDIDATES 0
+       GS_ONNXRUNTIME_AARCH64_CONFIG_FILE)
+  get_filename_component(GS_ONNXRUNTIME_AARCH64_CONFIG_DIR
+                         "${GS_ONNXRUNTIME_AARCH64_CONFIG_FILE}" DIRECTORY)
+  get_filename_component(GS_ONNXRUNTIME_AARCH64_CMAKE_DIR
+                         "${GS_ONNXRUNTIME_AARCH64_CONFIG_DIR}" DIRECTORY)
+  get_filename_component(GS_AARCH64_ONNXRUNTIME_LIB_DIR
+                         "${GS_ONNXRUNTIME_AARCH64_CMAKE_DIR}" DIRECTORY)
+  get_filename_component(GS_ONNXRUNTIME_AARCH64_PREFIX
+                         "${GS_AARCH64_ONNXRUNTIME_LIB_DIR}" DIRECTORY)
+
+  set(onnxruntime_DIR "${GS_ONNXRUNTIME_AARCH64_CONFIG_DIR}" CACHE PATH
+      "Explicit aarch64 ONNX Runtime config dir" FORCE)
+  set(GS_AARCH64_ONNXRUNTIME_LIB_DIR
+      "${GS_AARCH64_ONNXRUNTIME_LIB_DIR}" CACHE INTERNAL
+      "Explicit aarch64 ONNX Runtime library directory" FORCE)
+  list(PREPEND CMAKE_PREFIX_PATH "${GS_ONNXRUNTIME_AARCH64_PREFIX}")
+  message(STATUS
+    "Using explicit aarch64 ONNX Runtime: ${GS_ONNXRUNTIME_AARCH64_PREFIX}")
+endif()
+
 find_package(onnxruntime REQUIRED)
+
+if(ENABLE_RKNN_INFERENCE)
+  if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    message(FATAL_ERROR
+      "ENABLE_RKNN_INFERENCE is only supported for aarch64/arm64 builds")
+  endif()
+
+  set(GS_RKNN_RUNTIME_ROOT
+      "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/rknn_runtime/2.3.2"
+      CACHE PATH "Repo-local RKNN runtime root")
+  set(GS_RKNN_INCLUDE_DIR "${GS_RKNN_RUNTIME_ROOT}/include")
+  set(GS_RKNN_LIBRARY
+      "${GS_RKNN_RUNTIME_ROOT}/lib/aarch64/librknnrt.so")
+
+  if(NOT EXISTS "${GS_RKNN_INCLUDE_DIR}/rknn_api.h")
+    message(FATAL_ERROR "RKNN header not found: ${GS_RKNN_INCLUDE_DIR}/rknn_api.h")
+  endif()
+  if(NOT EXISTS "${GS_RKNN_LIBRARY}")
+    message(FATAL_ERROR "RKNN runtime library not found: ${GS_RKNN_LIBRARY}")
+  endif()
+
+  add_library(rknnrt::rknnrt SHARED IMPORTED GLOBAL)
+  set_target_properties(rknnrt::rknnrt PROPERTIES
+    IMPORTED_LOCATION "${GS_RKNN_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${GS_RKNN_INCLUDE_DIR}")
+  set(GS_RKNN_RUNTIME_LIB_DIR
+      "${GS_RKNN_RUNTIME_ROOT}/lib/aarch64" CACHE INTERNAL
+      "Repo-local RKNN runtime library directory")
+  message(STATUS "Using bundled RKNN runtime: ${GS_RKNN_RUNTIME_ROOT}")
+endif()
+
+if(ENABLE_TRT_INFERENCE)
+find_package(TensorRT REQUIRED)
 # Find CUDA Toolkit with proper environment variable support
 if(DEFINED ENV{CUDAToolkit_ROOT})
     set(CUDAToolkit_ROOT $ENV{CUDAToolkit_ROOT})
@@ -222,8 +352,14 @@ else()
    - Run 'ls -la /usr/local/cuda*' to verify CUDA installation")
     endif()
 endif()
+else()
+  message(STATUS "TensorRT/CUDA inference disabled (ENABLE_TRT_INFERENCE=OFF)")
+  set(CUDA_LINK_DIRS "")
+  set(CUDLA_LIBRARY "")
+endif()
 find_package(ZLIB REQUIRED)
 
+if(ENABLE_G1_BACKEND)
 # Use local unitree_sdk2 subfolder
 # Disable building examples for unitree_sdk2
 set(BUILD_EXAMPLES
@@ -238,6 +374,9 @@ target_include_directories(${PROJECT_NAME}
 
 # Link to unitree_sdk2 which includes all necessary dependencies
 target_link_libraries(${PROJECT_NAME} INTERFACE unitree_sdk2)
+else()
+  message(STATUS "G1 backend disabled (ENABLE_G1_BACKEND=OFF): skipping unitree_sdk2")
+endif()
 
 # Examples
 if(BUILD_SRCS)
