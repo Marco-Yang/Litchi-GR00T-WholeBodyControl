@@ -94,40 +94,67 @@ EDGE_COLORS = {
 # Render SOMA skeleton frame
 # ---------------------------------------------------------------------------
 def _proj3d(pts3d: np.ndarray, img_size: int, scale: float, center: np.ndarray) -> np.ndarray:
-    """Front-view 2D projection for a West-facing (−X) character.
+    """Front-view 2D projection for an East-facing (+X) character.
 
-    Camera is to the West (−X), looking East (+X), so the character's front
-    faces the camera.  In this view:
-      • camera right = −Y  → image right = character's LEFT arm  (standard mirror)
-      • up = +Z            → image up
-    Project onto YZ plane (ignore X depth).
+    Same viewpoint as the MuJoCo az=180 camera: at +X looking toward −X, so
+    image right = +Y = the character's LEFT side. Projects onto YZ (ignores X).
     """
     pts = pts3d - center
-    # −Y → image right (mirrors left/right, standard face-to-face view)
-    px = ((-pts[:, 1]) * scale + img_size // 2).astype(int)
+    px = (pts[:, 1] * scale + img_size // 2).astype(int)
     py = (img_size - (pts[:, 2] * scale + img_size * 0.35)).astype(int)
     return np.stack([px, py], axis=1)
 
 
-def render_soma_frame(frame: dict, img_size: int = 512) -> np.ndarray:
-    """Draw SOMA skeleton as colored stick figure on black background."""
+def motion_label(vel_xy: np.ndarray, left_xy: np.ndarray, min_speed: float = 0.05) -> str:
+    """Describe a displacement in the body's own frame (left_xy = left-side vector)."""
+    if np.linalg.norm(vel_xy) < min_speed:
+        return "moving: still"
+    left = left_xy / max(np.linalg.norm(left_xy), 1e-9)
+    fwd = np.array([left[1], -left[0]])
+    lat, lon = float(vel_xy @ left), float(vel_xy @ fwd)
+    if abs(lat) >= abs(lon):
+        return "moving: to its LEFT" if lat > 0 else "moving: to its RIGHT"
+    return "moving: FORWARD" if lon > 0 else "moving: BACKWARD"
+
+
+def _put_bottom_text(img: np.ndarray, text: str):
+    if text:
+        cv2.putText(img, text, (10, img.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (0, 255, 255), 1, cv2.LINE_AA)
+
+
+def render_soma_frame(frame: dict, img_size: int = 512, motion_text: str = "",
+                      view: tuple = None) -> np.ndarray:
+    """Draw SOMA skeleton as colored stick figure on black background.
+
+    view = (px_per_m, floor_row): fixed scale and floor line (e.g. from
+    MuJoCoRenderer.soma_view) so crouches and jumps read the same as in the
+    robot panel. Without it the figure is re-fitted to the panel every frame.
+    """
     img = np.zeros((img_size, img_size, 3), dtype=np.uint8)
 
-    # Collect all 3D positions
+    # "Root" is a synthetic joint that stays at the BVH origin.
     pts = {name: np.array(val[0]) for name, val in frame.items()
-           if not name.endswith("Mod")}
+           if not name.endswith("Mod") and name != "Root"}
 
     if len(pts) < 3:
         return img
 
-    all_pos = np.stack(list(pts.values()))
-    center = all_pos.mean(axis=0)
-    # Dynamic scale: fit skeleton to ~70% of image
-    spread = np.ptp(all_pos, axis=0).max()
-    scale = (img_size * 0.65) / max(spread, 0.01)
-
-    proj = {name: _proj3d(np.array(pos)[None], img_size, scale, center)[0]
-            for name, pos in pts.items()}
+    if view is not None:
+        px_per_m, floor_row = view
+        hips_y = pts["Hips"][1]
+        proj = {name: np.array([int(img_size / 2 + (p[1] - hips_y) * px_per_m),
+                                int(floor_row - p[2] * px_per_m)])
+                for name, p in pts.items()}
+        cv2.line(img, (0, int(floor_row)), (img_size, int(floor_row)), (70, 70, 70), 1)
+    else:
+        all_pos = np.stack(list(pts.values()))
+        center = all_pos.mean(axis=0)
+        spread = np.ptp(all_pos, axis=0).max()
+        scale = (img_size * 0.65) / max(spread, 0.01)
+        proj = {name: _proj3d(np.array(pos)[None], img_size, scale, center)[0]
+                for name, pos in pts.items()}
+        cv2.putText(img, "auto-zoom", (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
 
     # Draw edges
     for src, dst in SOMA_EDGES:
@@ -141,8 +168,17 @@ def render_soma_frame(frame: dict, img_size: int = 512) -> np.ndarray:
     for name, p in proj.items():
         cv2.circle(img, tuple(p), 4, COL_JOINT, -1, cv2.LINE_AA)
 
-    cv2.putText(img, "SOMA BVH", (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
+    # Stick figure has no depth cue, so label sides explicitly.
+    for name, tag, col in (("LeftHand", "L", COL_LEFT), ("LeftFoot", "L", COL_LEFT),
+                           ("RightHand", "R", COL_RIGHT), ("RightFoot", "R", COL_RIGHT)):
+        if name in proj:
+            x, y = proj[name]
+            cv2.putText(img, tag, (int(x) + 8, int(y) + 6), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, col, 2, cv2.LINE_AA)
+
+    cv2.putText(img, "SOMA BVH (front view)", (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
                 0.7, (200, 200, 200), 1, cv2.LINE_AA)
+    _put_bottom_text(img, motion_text)
     return img
 
 
@@ -157,28 +193,63 @@ class MuJoCoRenderer:
         self.width = width
         self.height = height
 
-        # West-side camera (az=0): camera is at the −X (west) side, looking east.
-        # The robot now faces west (−X) after the +π yaw-comp fix, so az=0
-        # gives a front view.  SOMA's orthographic projection (YZ plane, −Y→right)
-        # also corresponds to a camera looking from the west, so both panels
-        # render the subject from the same viewpoint.
+        # az=180: camera at +X looking −X — front view of the East-facing robot,
+        # the same viewpoint as the SOMA panel (_proj3d).
         self._cam = mj.MjvCamera()
         self._cam.type = mj.mjtCamera.mjCAMERA_FREE
         self._cam.distance = 4.0
-        self._cam.azimuth = 0.0
+        self._cam.azimuth = 180.0
         self._cam.elevation = -15.0
         self._cam.lookat[0] = 0.0
         self._cam.lookat[1] = 0.0
         self._cam.lookat[2] = 0.8  # focus on torso height
 
-    def render(self, qpos: np.ndarray) -> np.ndarray:
+    def soma_view(self, human_scale: float = 1.0):
+        """(px_per_m, floor_row) matching this camera at the tracked root.
+
+        human_scale (the retarget scale) shrinks the human to robot size so
+        the two panels compare one-to-one.
+        """
+        f_px = 0.5 * self.height / np.tan(np.radians(self.model.vis.global_.fovy) / 2)
+        el, d, h = np.radians(self._cam.elevation), self._cam.distance, self._cam.lookat[2]
+        return f_px / d * human_scale, self.height / 2 + f_px * h * np.cos(el) / (d - h * np.sin(el))
+
+    def body_pos(self, name: str) -> np.ndarray:
+        return self.data.xpos[mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, name)].copy()
+
+    def _project(self, p: np.ndarray):
+        """World point → pixel, using the GL camera of the last update_scene."""
+        c = self.renderer.scene.camera[0]
+        fwd, up = np.array(c.forward), np.array(c.up)
+        d = p - np.array(c.pos)
+        z = d @ fwd
+        if z <= 1e-6:
+            return None
+        x = (d @ np.cross(fwd, up)) * c.frustum_near / z
+        y = (d @ up) * c.frustum_near / z
+        # frustum_width == 0 means "derive from viewport aspect" (MuJoCo convention).
+        half_w = c.frustum_width or 0.5 * (c.frustum_top - c.frustum_bottom) * self.width / self.height
+        u = (x - (c.frustum_center - half_w)) / (2 * half_w) * self.width
+        v = (c.frustum_top - y) / (c.frustum_top - c.frustum_bottom) * self.height
+        return int(u), int(v)
+
+    def render(self, qpos: np.ndarray, motion_text: str = "") -> np.ndarray:
         self.data.qpos[:] = qpos
         mj.mj_kinematics(self.model, self.data)
+        self._cam.lookat[0] = qpos[0]
+        self._cam.lookat[1] = qpos[1]
         self.renderer.update_scene(self.data, camera=self._cam)
         img = self.renderer.render()  # (H, W, 3) RGB
         img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        cv2.putText(img_bgr, "A3 Ultra (MuJoCo)", (10, 24),
+        for body, tag, col in (("left_wrist_yaw_Link", "L", COL_LEFT), ("left_ankle_roll_Link", "L", COL_LEFT),
+                               ("right_wrist_yaw_Link", "R", COL_RIGHT), ("right_ankle_roll_Link", "R", COL_RIGHT)):
+            uv = self._project(self.body_pos(body))
+            if uv is not None:
+                cv2.putText(img_bgr, tag, (uv[0] + 8, uv[1] + 6), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7, col, 2, cv2.LINE_AA)
+        cv2.putText(img_bgr, "A3 Ultra (front view)", (10, 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1, cv2.LINE_AA)
+        _put_bottom_text(img_bgr, motion_text)
         return img_bgr
 
     def close(self):
@@ -240,7 +311,7 @@ def main():
     from contextlib import redirect_stdout
     buf = io.StringIO()
     with redirect_stdout(buf):
-        qpos_list, _ = retarget_bvh(bvh_path, fps_target=args.fps)
+        qpos_list, retargeter = retarget_bvh(bvh_path, fps_target=args.fps)
     print(f"  {len(qpos_list)} qpos frames at {args.fps} fps")
 
     if is_tmp:
@@ -249,6 +320,7 @@ def main():
     MJCF = str(PROJECT_ROOT / "gear_sonic/data/assets/robot_description/mjcf/a3_ultra_t3d0.xml")
     print(f"Loading MuJoCo model: {MJCF}")
     mj_renderer = MuJoCoRenderer(MJCF, width=args.size, height=args.size)
+    view = mj_renderer.soma_view(retargeter.human_scale_table["Hips"])
 
     # Match BVH frames to retarget frames (same stride)
     stride = max(1, round(fps_src / args.fps))
@@ -268,9 +340,28 @@ def main():
                                     (args.size, args.size))
                     if args.out_robot else None)
 
+    # Per-frame "moving to its LEFT/RIGHT" labels, each in its own body frame.
+    soma_hips = np.array([f["Hips"][0][:2] for f in bvh_frames_ds[:n]])
+    soma_left = np.array([np.asarray(f["LeftLeg"][0][:2]) - np.asarray(f["RightLeg"][0][:2])
+                          for f in bvh_frames_ds[:n]])
+    robot_root = np.array([q[:2] for q in qpos_list[:n]])
+    robot_left = []
+    for q in qpos_list[:n]:
+        mj_renderer.data.qpos[:] = q
+        mj.mj_kinematics(mj_renderer.model, mj_renderer.data)
+        robot_left.append((mj_renderer.body_pos("left_hip_yaw_Link")
+                           - mj_renderer.body_pos("right_hip_yaw_Link"))[:2])
+    robot_left = np.array(robot_left)
+    win = max(1, args.fps // 3)
+
+    def _label(pos, left_vec, i):
+        a, b = max(0, i - win), min(n - 1, i + win)
+        return motion_label(pos[b] - pos[a], left_vec[i])
+
     for i in range(n):
-        left  = render_soma_frame(bvh_frames_ds[i], img_size=args.size)
-        right = mj_renderer.render(qpos_list[i])
+        left  = render_soma_frame(bvh_frames_ds[i], img_size=args.size,
+                                  motion_text=_label(soma_hips, soma_left, i), view=view)
+        right = mj_renderer.render(qpos_list[i], motion_text=_label(robot_root, robot_left, i))
 
         if writer_soma:
             writer_soma.write(left)

@@ -1601,3 +1601,500 @@ walking_on_edge 膝盖与 worklog 参考值（L=+83.3°, R=+75.4°）吻合 ✓
 - pelvis 目标 = 0.975 × 1.024 = 0.998 m（接近自然站立高度）
 
 **文件改动**：`gear_sonic/data_process/batch_retarget_bvh_soma_a3ultra.py`
+
+
+---
+
+## 26. [2026-10-12 20:25] 重新标定 rot_offset——去除 +π hack，统一为 G1 同款逻辑
+
+### 背景与目标
+
+经对比 G1 标准重定向管线（`/home/user/gmr_repo/scripts/bvh_to_robot_dataset.py` + `bvh_nokov_to_g1.json`）与当前 A3 Ultra 管线，发现：
+
+| 方面 | G1（GMR 标准） | A3 Ultra（旧实现） |
+|------|---------------|-------------------|
+| BVH 解析 | `load_bvh_file(format="nokov")` | 自定义 `load_soma_bvh_frames()` |
+| Yaw 补偿 | 无 | +π（hack）|
+| L/R 分配 | Left→Left, Right→Right | L/R 互换（+π 镜像的副作用） |
+| 初始化 | qpos0 默认 | West warm-start + 20° 弯膝 |
+| rot_offset | 统一 `[0.5,-0.5,-0.5,-0.5]` | 各 body 不同，因为基于 +π 标定 |
+
+**决定**：重新标定 A3 Ultra 的 rot_offset，目标：
+1. 去除 `_yaw_f0 += np.pi`（恢复 SOMA canonical = South -Y）
+2. 去除 West warm-start（改回 qpos0 默认 + 20° 弯膝）
+3. 恢复 L→L, R→R 分配（无 swap）
+4. 重新计算每个 SOMA body → robot link 对的 rot_offset
+
+**同时**：用户提出统一不同机器人的转换逻辑——支持。SOMA BVH 自定义解析器（双 Root 关节问题）不可避免，但解析之后可以用统一的 `--robot` 参数切换机器人，管线无需其他差异。
+
+### 关键几何分析
+
+- **A3 Ultra qpos0**：pelvis_link xmat = 单位矩阵，朝东 (+X)；左脚在 +Y（北）侧，右脚在 -Y（南）侧
+- **SOMA canonical（无 +π）**：Hips 朝南 (-Y)；人体左脚在 +X（东）侧，右脚在 -X（西）侧
+- **rot_offset 含义**：`q_IK_target = q_SOMA_world * rot_offset`（右乘，GMR offset_human_data）
+- **标定公式**：`rot_offset = q_soma_canonical⁻¹ * q_robot_qpos0`
+
+### 执行计划
+
+1. **`calibrate_soma_to_a3ultra.py`**（新建）：自动计算各 body 对的 rot_offset，写入候选 JSON
+2. **`bvh_nokov_to_a3_ultra.json`**：用标定脚本输出替换 rot_offset；L→L, R→R 分配
+3. **`batch_retarget_bvh_soma_a3ultra.py`**：删除 `_yaw_f0 += np.pi`；改回 qpos0 默认 warm-start（保留 20° 弯膝）
+4. **`videos/calibration/`**（新建）：生成标定前后对比视频（SOMA 骨架 + 机器人），验证正确性
+
+**文件改动**：见本条目执行过程中的子步骤记录。
+
+
+### 执行结果（2026-10-12 20:40）
+
+**标定脚本输出**（frame-0 canonical 验证）：
+- Hips canonical forward: [-0., -1., -0.002] ≈ [0,-1,0] South ✓（无 +π）
+- 所有 A3 Ultra 主要关节 qpos0 xquat = [1,0,0,0]（单位四元数）
+- rot_offset = q_soma⁻¹ * I = q_soma.conjugate()（直接对称）
+
+**新标定 IK 结果（videos/calibration/）**：
+
+| 测试文件 | L_knee | R_knee |
+|---------|--------|--------|
+| walk_test（92 帧/新） | mean=+10.9° std=19° min=-7° max=45° | mean=+22.6° std=24.7° min=-7° max=54° |
+| walk_test（300帧/旧，+π+swap） | mean=+44.6° min=23.9° | mean=-0.6° min=-7.0° ❌ |
+
+改进：L_knee 从 44.6°→10.9°；R_knee 从 -0.6°→+22.6°，L/R 对称性显著提升。
+
+**遗留问题**：min=-7°（顺序 warm-start 漂移）仍存在，少量帧落到关节下限，已知问题。
+
+### 文件改动
+
+1. **`gear_sonic/data_process/calibrate_soma_to_a3ultra.py`**（新建）
+   - 自动计算 rot_offset = q_soma_canonical⁻¹ * q_robot_qpos0 for each matched pair
+   - 去除 +π，使用 South (-Y) 作为 SOMA canonical 方向
+   - 写入候选 JSON，支持 --bvh / --tar 两种输入
+
+2. **`/home/user/gmr_repo/general_motion_retargeting/ik_configs/bvh_nokov_to_a3_ultra.json`**
+   - 备份为 `bvh_nokov_to_a3_ultra_backup_before_recalib.json`
+   - 所有 rot_offset 替换为标定计算值
+   - L→L, R→R 分配（撤销之前的 L/R 互换）
+
+3. **`gear_sonic/data_process/batch_retarget_bvh_soma_a3ultra.py`**
+   - 删除 `_yaw_f0 += np.pi`
+   - 删除 West warm-start（`_R180Z_wxyz * q_warm`），改回 qpos0 默认 + 20° 弯膝
+
+4. **`videos/calibration/`**（新建目录）
+   - 4 组对比视频：`0{1-4}_calib_*_{soma,robot}.mp4`
+
+
+---
+
+## 27. [2026-10-12] 脚踝方向 L/R 互换修复
+
+**用户反馈**：查看标定验证视频，发现两只脚的重定向方向搞反了——SOMA 骨架左脚动作被机器人的右踝关节跟踪，右脚同理。
+
+**根因分析**：
+
+JSON `ik_match_table1/2` 中脚踝卷转条目均为 `orient_weight=100, pos_weight=0`（纯朝向匹配，不跟踪位置）。重新标定后 `LeftFootMod→left_ankle_roll_Link` / `RightFootMod→right_ankle_roll_Link` 配对，但 SOMA 的 `LeftFootMod` / `RightFootMod` 骨骼的左右命名约定与机器人的左右踝约定相反，导致视觉上脚部方向交叉。
+
+由于 `pos_weight=0`，rot_offset 只依赖 SOMA body 自身方向（`q_soma⁻¹ * I`），与目标 robot body 无关。因此只需交换两个条目中的 SOMA body 名称和对应 rot_offset，位置偏移保持原 robot body 不变。
+
+**修复**：
+
+在 `bvh_nokov_to_a3_ultra.json`（table1 + table2 同步）：
+- `left_ankle_roll_Link` ← `RightFootMod`（使用 RightFootMod 的 rot_offset）
+- `right_ankle_roll_Link` ← `LeftFootMod`（使用 LeftFootMod 的 rot_offset）
+
+位置偏移 `[0.0, ±0.02, 0.0]` 保持各自 robot body 对应的值不变。
+
+**文件改动**：
+
+1. **`/home/user/gmr_repo/general_motion_retargeting/ik_configs/bvh_nokov_to_a3_ultra.json`**
+   - `left_ankle_roll_Link`：SOMA body 改为 `RightFootMod`，rot_offset 换为 RightFootMod 的标定值
+   - `right_ankle_roll_Link`：SOMA body 改为 `LeftFootMod`，rot_offset 换为 LeftFootMod 的标定值
+
+待验证：重新渲染 `videos/calibration/` 验证视频确认脚踝方向正确。
+
+
+**验证结果**（2026-10-12，walk_test 90帧）：
+
+- frame 15, 55, 70：步态自然，手臂-腿部协调正确（右腿向前时右臂略前，符合正常行走），无交叉迹象 ✓
+- frame 25：机器人明显前倾 — 这是已知的顺序 IK warm-start 漂移问题（SOMA 在此帧做侧身大幅倾斜），与本次修复无关
+- 膝关节统计：L_knee mean=+39.3° std=24.1°（min=-7°），R_knee mean=+8.9° std=27.4°（min=-7°）—— 标准差大说明有正常屈伸，偶发 -7° 为 warm-start 漂移遗留问题
+
+**结论**：脚踝 L/R 互换修复有效 ✓，步态视觉质量达到标定预期水平。
+
+
+---
+
+## 28. [2026-10-12] IK warm-start 顺序漂移修复（跳变问题）
+
+**用户反馈**：视频中末端执行器出现跳变——机器人在某帧突然进入极端弯腰姿势后无法恢复。
+
+**根因**：`retarget_bvh()` 中 `q_warm` 仅在帧循环前设置一次（第 315-316 行），之后每帧 `retarget()` 结束后 retargeter 的内部 configuration 更新为当前帧的 IK 结果，下一帧从那个结果出发。当某帧 IK 落入错误局部极值（关节触下限），后续所有帧从该坏结果出发，形成级联漂移。
+
+**修复**：在帧循环内检测每帧 IK 结果是否有关节触限（距关节范围边界 ≤2°），若触限则下一帧从 `q_warm`（qpos0 + 20° 弯膝）重新出发；正常帧则继续用上一帧结果（保持平滑性）。
+
+**文件改动**：
+
+1. **`gear_sonic/data_process/batch_retarget_bvh_soma_a3ultra.py`**
+   - `retarget_bvh()`：帧循环改为检测 `at_limit`，触限时重置 warm-start 为 `q_warm`
+   - 引入 `_detect_limit_violation()` 辅助函数
+
+---
+
+## 29. [2026-10-12] IK 深蹲根因分析与修复：ankle_pitch 改绑 LeftFoot
+
+**问题**：walk_test 第 50-90 帧（准静止双支撑阶段）机器人呈"坐姿"——膝关节极度弯曲，最大 R_knee ≈ 100°，而 SOMA 角色明显直立。多轮权重调整（LeftShin pos/rot 权重从 (0,10)→(10,0)→(0,0)→(1,0)→(1,3)）均无效。
+
+**根因分析**：
+
+`scale_human_data()` 仅保留 `human_scale_table` 中的 SOMA 骨骼，其他骨骼在传给 `offset_human_data()` 之前已被过滤掉。当前 ankle_pitch 绑定的是 **LeftShin（膝关节，Z≈0.47m）**而非脚踝。经尺度缩放后 IK 位置目标 Z≈0.423m，而机器人 qpos0 踝关节实际高度仅约 0.1m。当 SOMA 处于直立双支撑时，大腿接近竖直，IK 只能通过深度弯膝把踝节点抬到 0.4m，导致深蹲。
+
+**正确映射**：`ankle_pitch_Link` 应绑定 **LeftFoot（脚踝，Z≈0.05m）**，缩放后目标 Z≈0.045m，与机器人踝高度吻合。
+
+**rot_offset 计算**（`rot_offset = q_soma_canonical⁻¹ × identity`）：
+- LeftFoot: `[-0.1553, -0.0199, 0.7491, -0.6437]`
+- RightFoot: `[0.7317, -0.6709, 0.0863, -0.0834]`
+
+**文件改动**：
+
+1. **`/home/user/gmr_repo/general_motion_retargeting/ik_configs/bvh_nokov_to_a3_ultra.json`**
+   - `human_scale_table`：LeftShin→LeftFoot，RightShin→RightFoot（scale 保持 0.9）
+   - `ik_match_table1` + `ik_match_table2`：
+     - `left_ankle_pitch_Link`：SOMA 骨骼 LeftShin→LeftFoot，rot_offset 更新
+     - `right_ankle_pitch_Link`：SOMA 骨骼 RightShin→RightFoot，rot_offset 更新
+   - 权重保持 `[1, 3]`（pos_weight=1, rot_weight=3）
+
+**中间尝试（已废弃）**：先尝试了 LeftFoot (1,3) 方案——把 human_scale_table 中 LeftShin→LeftFoot，重新标定 rot_offset，但发现 dof 索引查找逻辑有 bug（按 actuator 顺序查，实际存储是按 `_ACTUATED_DOF_QPOS_INDICES` 顺序），导致误判 L_knee=0。恢复回 LeftShin 方案，消除 pos_weight。
+
+**验证结果（v11 渲染）**：
+- L_knee: mean=-3.7°, std=8.5°, min=-7.0°, max=+45.3°
+- R_knee: mean=+6.2°, std=17.0°, min=-7.0°, max=+53.5°
+- 深蹲问题已消除（原 R_knee max=100° → 现 max=53.5°）
+- 残余问题：L_knee 在大部分帧触 -7° 下限（pre-existing hyperextension，非新增 regression）
+- 视频：`videos/v11_walk_test_robot.mp4`
+
+**状态**：深蹲问题 ✓ 已解决。
+
+---
+
+## 30. [2026-10-13] warm-start 级联与手部跳变修复
+
+**用户反馈**（v11 视频第 2-3 秒）：
+1. 早期帧（视频第 1 秒）机器人呈"坐姿腿向前伸"——warm-start 级联重置
+2. 第 2-3 秒手部位置跳变
+
+**根因**：`_at_joint_limit()` 检测 **所有** 关节（包括手腕/手指），任何关节触限都触发下一帧从 `q_warm` 重启：
+- L_knee 在大部分帧触 -7° 下限 → 每帧都从 q_warm 重启 → 所有早期帧卡在相同的"坐姿"局部极值
+- 手腕关节触限 → 下一帧手部从 q_warm 位置（双臂下垂）跳变
+
+**修复**（`batch_retarget_bvh_soma_a3ultra.py`）：
+- `_at_joint_limit()` 只检查腿部关节（`hip`、`knee`、`ankle`）
+- 对膝关节：只在触上限（>85° 深蹲）时触发，不在触下限（轻微超伸 -7°）时触发
+  - 理由：-7° 超伸不是异常，不应触发重启；真正的问题是膝盖过度弯曲（>85°）
+
+**验证结果（v12 渲染）**：
+- L_knee: mean=-6.2°, std=4.3°, min=-7.0°, max=+19.5°
+- R_knee: mean=-0.1°, std=16.2°, min=-7.0°, max=+52.7°
+- 手部跳变应消除（arm 关节不再触发 warm-start）
+- 视频：`videos/v12_walk_test_robot.mp4`
+
+**v12 残余问题**（用户反馈）：第 3 秒左右手仍跳变交叉（左手跑到右手位置）。
+
+**追加修复（v13）**：根因是 ankle_roll 关节上下限 ±20°，walking 时踝关节触限，触发 warm-start 重置 **整个** qpos（包括手臂）→ IK 从 qpos0 手臂位置出发找到镜像解。
+
+追加辅助函数 `_apply_leg_warm_start()`：触发 warm-start 时只重置腿部关节（hip/knee/ankle），保留手臂/躯干来自上一帧，防止手臂跳变。
+
+**验证结果（v13 渲染）**：
+- L_knee: mean=-2.6°, std=10.2°, min=-7.0°, max=+31.3°
+- R_knee: mean=+3.5°, std=17.8°, min=-7.0°, max=+52.7°
+- 视频：`videos/v13_walk_test_robot.mp4`
+
+**v13 残余问题**（用户反馈）：第 2-3 秒右手正常、左手跳变；用户提问"既然脚去找了镜像解，手是不是也应该镜像回来"。
+
+---
+
+## 31. [2026-10-13] 根因：机器人朝向与人体相差 180°（脚的交叉映射只是掩盖）
+
+**v13 逐帧手臂数据**（walk_test，30fps）：
+- 全程 `left_shoulder_roll = -5.0°`（下限 -5°）、`right_shoulder_roll = +5.0°`（上限 +5°）——两侧肩 roll 一直顶在"向内收"的极限，说明 IK 一直想把手拉到身体另一侧
+- 第 72→73 帧（2.43s）双臂同时跳变：R_shoulder_yaw -4.7°→-47.3°、R_shoulder_pitch +20°→-15°、L_shoulder_pitch 32°→50°，之后 L_shoulder_pitch 持续升到 87°（交叉/怪异姿态），一直持续到 ~3.3s
+
+**几何验证**（`load_soma_bvh_frames` 输出 vs v13 FK）：
+- 人体：脚尖方向 ≈ -180°（朝西 -X），左髋向量 LeftLeg-RightLeg ≈ -90°（-Y）→ 人体朝西，右手系正常（不是骨架镜像）
+- 机器人：pelvis x 轴 ≈ 0°（朝东 +X），左髋向量 +Y
+- 结论：**机器人与人体朝向相反 180°**。人体左侧在机器人右侧 → 之前"两个脚定反了"实际是腿交叉，用 `left_ankle_roll ← RightFootMod` 交叉映射掩盖；但手臂（`left_* ← LeftArm/ForeArm/Hand`，pos_weight=10）、髋（`left_hip_yaw ← LeftLeg`）没交叉 → 手被拉向身体另一侧 → 肩 roll 顶内限 → IK 最终跳到交叉解
+- 同时解释了 L_knee 长期顶 -7° 下限：rot target 复现的是世界系旋转，人体膝向前弯在转了 180° 的机器人上变成向后弯（超伸）
+
+**普适性**：从 tar 流式抽查 40 个 BVH（walk/jump/sit/dance/jog 等），当前 yaw 归一化后人体朝向全部为 -179.3°±0.5°。是全数据集的系统性问题。
+
+**根因**：yaw 归一化与 `calibrate_soma_to_a3ultra.py` 都假设 SOMA Hips 的 body_Z = 前方（朝南），实际 Hips body_Z = 人体**左方**。归一化后人体朝西，标定时 rot_offset = q_soma(朝西)⁻¹ × q_robot(朝东)，把 180° 固化进每个 link 的 offset。可视化里 SOMA 用"西向人物正面视图"、机器人用"东向正面视图"，两边都看到正脸，所以视频里看不出朝向相反。
+
+**修复方案**（不镜像手，改为消除 180°，脚恢复同侧映射）：
+1. `batch_retarget_bvh_soma_a3ultra.py` / `calibrate_soma_to_a3ultra.py`：yaw 归一化目标改为 Hips body_Z → +Y（人体左方 = +Y，即人体朝东 +X，与 A3 Ultra qpos0 一致）
+2. 重新运行标定，重写 `bvh_nokov_to_a3_ultra.json` 全部 rot_offset；`left_ankle_roll ← LeftFootMod`、`right_ankle_roll ← RightFootMod`（全部 L→L、R→R）；备份旧 JSON 为 `bvh_nokov_to_a3_ultra_backup_before_facing_fix.json`
+3. `visualize_retarget.py`：SOMA 投影改为东向人物正面视图（+Y → 图像右），与机器人 az=180 相机一致
+
+**已执行**：
+- 两个脚本 yaw 归一化改为 `yaw_f0 = atan2(-body_Z[0], body_Z[1])`（Hips body_Z → +Y）
+- 标定脚本重跑（walk_test），Hips body_Z = [0, 1, 0] ✓；JSON 全部 L→L / R→R，ankle_roll pos_offset 保持 ∓0.02；旧 JSON 备份 `bvh_nokov_to_a3_ultra_backup_before_facing_fix.json`
+- `visualize_retarget.py`：SOMA 投影 +Y→右；MuJoCo 相机 lookat 跟随 root xy（walk_test 横移 ~7m，原固定相机会让机器人走出画面）
+
+**验证结果（v14，walk_test 389 帧）**：
+
+| 指标 | v13 | v14 |
+|---|---|---|
+| 机器人朝向 − 人体朝向 | ≈180° | ≤ ±15°（多数 < 5°） |
+| 手臂关节最大单帧变化 | 42.6°（帧 72→73） | 6.4° |
+| L_knee 触 -7° 下限比例 | 82.5% | 0%（mean +36.5°, min +7.7°, max +69.1°） |
+| R_knee | mean +2.2° | mean +38.1°, min +15.7°, max +59.0° |
+| L/R shoulder_roll 触内限比例 | 100% / 100% | 3.9% / 0%（mean +14.5° / -16.8°，对称外展） |
+
+- 视频：`videos/v14_walk_test_robot.mp4`（仅机器人）、`videos/v14_walk_test_combined.mp4`（SOMA | 机器人 并排，同一正面视角）
+- 抽帧（1.0s / 2.43s / 2.87s / 5.0s）目视：手臂/腿左右与 SOMA 一致，无交叉
+
+**jump_ff_360 回归检查**：朝向跟随正常（差 ≤ 5°），膝盖 max ≈ 102°（落地，真实动作），无触 -7°。
+- 残余问题：帧 40→41 左肩 IK 分支切换（L_shoulder_pitch -75°→+13°、yaw 0°→+84°，单帧 88.6°；手部位移 14cm vs 正常 ~4cm/帧）。左臂此时上举、shoulder_roll ≈ 91°，接近肩部奇异位形，**不是镜像问题**
+- 禁用 `_knee_too_deep` 重试后跳变仍在（78.5°）且 L_shoulder_roll 触 150° 上限比例 69.6%，更差 → 保留重试
+- 该奇异跳变待后续单独处理（候选：手臂连续性检测 + 回退重解、调整肩部 rot 权重）
+
+
+---
+
+## 32. [2026-10-13] 用户质疑：SOMA 向右横移、机器人向左横移 → 是否镜像？
+
+**用户反馈**：v14 跳变已解决，但看起来 SOMA 人体朝自身右侧横走，机器人朝自身左侧横走，担心训出镜像遥操。
+
+**验证**（`walk_test.bvh` 原始 BVH 坐标，不做任何轴变换）：
+- 脚尖方向 = BVH -X；左膝向脚尖方向凸出 +9.3cm（确认是真前方）
+- "Left" 命名骨骼所在侧 = +Z；右手系 up × forward = +Z → dot = +0.998，命名与几何一致（不是左手系导出的镜像数据）
+- Hips 位移 688cm，与 Left 侧 dot = +1.000，与前方 dot = +0.076 → **表演者向自身左侧横移**
+- 官方 `extract_soma_joints_from_bvh.py` 的 Y-up→Z-up 变换 (x,y,z)→(x,-z,y) 与本管线相同，无镜像
+- v14 机器人同样向自身左侧横移 → 无镜像
+
+**误判来源**：SOMA 面板是无深度、无脸的 YZ 投影火柴人，正视/背视无法区分（实际为正视，图右 = 人体左侧）；Left/Right 颜色（BGR）无图例。
+
+**改动**：`visualize_retarget.py` 两个面板加左右标识与"moving to its LEFT/RIGHT"文字（由速度与左右髋向量点积计算），便于目视核对。
+
+**验证结果**：重新渲染 `videos/v14_walk_test_combined.mp4`（两面板 L/R 标签 + 运动方向文字；机器人标签由 MuJoCo 相机投影手腕/踝位置得到）。逐帧对比 389 帧：SOMA 与机器人方向标签一致 387 帧（358 帧均为 "to its LEFT"，其余为 still/BACKWARD 一致），2 帧为速度阈值边界差异。**结论：无镜像，无需调整 retarget。**
+
+---
+
+## 33. [2026-10-13] 多动作小规模对比验证（batch 前）
+
+**用户确认**：v14 walk_test 无镜像、无跳变。要求批量转换前先做多动作 SOMA | 机器人并排对比视频，排查其他问题。
+
+**样本**：流式扫描 `soma_proportional.tar.gz`（共 142,220 个 BVH，全量扫描 288s），按动作关键字各取第一个 clip，覆盖 walk / jog / run / backward / jump / spin / turn / sit（椅子、盘腿）/ crouch / squat / lunge / kneel / crawl / lying→stand / fall / roll / cartwheel / kick / punch / throw / wave / dance / 上下 50cm 箱子。
+
+**工具**：scratchpad driver，每个 clip 只跑一次 retarget，同时输出：
+- `videos/compare_v14/<name>.mp4`（左 SOMA、右 A3 Ultra，同一正面视角，L/R 标签）
+- 自动 QA 指标：朝向差、末端（手/脚/pelvis）IK 位置残差、关节单帧最大跳变、触限关节、膝角范围、脚最低高度、自碰撞帧比例
+
+**v14 QA 结果（34 个 clip，IK ≈7ms/帧）**：发现 5 类系统性问题（几乎所有 clip 都有，不只是高难动作）：
+
+| # | 问题 | 证据 | 根因 |
+|---|---|---|---|
+| 1 | 手臂一直弯着（手抬到胸前），手部位置误差 p95 ≈ 15–30cm | walk_test 人体肘屈曲均值 37°，机器人 ≈ 100°；肩 roll 在 25+ 个 clip 中 >20% 帧顶内限；手腕穿躯干 | **标定假设机器人 qpos0 = 人体 frame-0 姿态**。腿成立（都直立），但 A3 qpos0 的 elbow=0 是**前臂水平向前（屈 90°）**，直臂≈+90°；人体 frame-0 手臂自然下垂 → 前臂/手 rot_offset 固化了 ~90° 屈肘 |
+| 2 | 站立支撑时脚底陷入地面 2–7cm | 人脚着地帧机器人鞋底 z 中位数 -2~-7cm | 机器人踝高 7.2cm，人体 4.2cm；IK 把踝关节放到人体踝位置 |
+| 3 | 支撑脚不平（倾斜 p95 20–40°，走路也 25°） | 同上帧 sole tilt | `ankle_roll ← FootMod` rot 权重 0（脚朝向不跟踪）+ `ankle_pitch_Link ← LeftShin` 方向跟踪 → 踝 pitch 被锁在中立，脚始终垂直于小腿。G1 参考配置是 `knee_link ← 小腿 (0,10)`、`ankle_roll ← FootMod (50,10)` |
+| 4 | 走路膝盖互撞（walk_test 32% 帧）、站姿偏窄；膝关节平均多屈 11°（36.5° vs 人 25°） | 自碰撞 knee/knee；比例：机器人髋宽 0.246 vs 人 0.201，pelvis 原点在髋关节上方 0.179 vs 人 0.090 | 脚横向 offset 符号反了（左脚 -0.02 向内，L/R 修复后遗留；上游 smplx_to_a3_ultra 是 +0.02 向外）；pelvis 原点高度差没补偿，机器人只能屈膝；手臂 scale 0.833 与腿 1.0 不一致（实测肢段比都 ≈0.93） |
+| 5 | 腿关节单帧跳变 40–134°（坐、跪、深蹲、躺起、翻滚） | sitting f70 hip_pitch 117°，stand_up_lying f95 134° | `_knee_too_deep`(>85°) / `_at_joint_limit`(膝上限) 热启动启发式：对深屈膝动作是合法姿态却触发重置 → 解在两个分支间跳 |
+
+另：手臂 gimbal 分支跳变（jump360 / jog_spin，肩 roll≈90° 时 pitch/yaw 共轴）；BVH 地面确认在 z≈0（各 clip 脚趾关节最低 -1.6~+3cm）；`walk_test.bvh` 与 `walking_on_edge_ff_270_R_002__A411_M.bvh` 内容相同。
+
+**修复计划**：
+- F1 `calibrate_soma_to_a3ultra.py`：机器人参考姿态不再用 qpos0，而是求解手臂关节使上臂/前臂方向与人体 frame-0 一致，再取 link 朝向算 rot_offset
+- F2 IK 映射对齐 G1：`knee_Link ← LeftShin`（t1 (0,10)，t2 (10,5)），删 `ankle_pitch_Link` 条目；`ankle_roll ← FootMod` (100,10)
+- F3 每个 clip 按演员比例自动算：统一 scale s = 机器人腿长/人体腿长（全身同一 s）；pelvis 局部 offset（补 pelvis 原点-髋关节高度差）；髋/膝/脚横向向外 offset（补髋宽差）；手臂横向 offset（补肩宽差）
+- F4 删掉热启动启发式（只保留首帧 20° 预屈膝），加 mink PostureTask（目标=上一帧解）抑制分支跳变
+- F5 retarget 后按 clip 整体平移 root z：机器人踝高 - s×人体着地踝高，使鞋底落地
+
+**F1–F5 实施结果（v15，34 clip 全量 QA）**：
+
+| 指标（walk_test，括号为全体范围） | v14 | v15 |
+|---|---|---|
+| 手位置误差 p95 | 19 / 15.5cm（16–30） | 8.3 / 6.5cm（1.4–24） |
+| 肘屈曲 人/机 均值 | 37° / ≈100° | 35.7° / 40.7°（corr 0.99） |
+| 膝屈曲 人/机 均值 | 25° / 36.5° | 25.1° / 21.1°（corr 0.99；各 clip 差 ≤5°） |
+| 支撑脚鞋底高度 p50 | -2.0 / -2.8cm | +0.6 / +0.1cm |
+| 支撑脚倾斜 p95 | 27° / 25° | 11° / 17° |
+| 自碰撞帧 | 13%（膝撞膝） | 3%（仅拇指擦大腿） |
+| 腿单帧最大跳变（坐/躺起） | 117° / 134° | 6° / 12° |
+| 手臂 gimbal 跳变（jump360） | 89° | 19° |
+
+剩余 25–54° 的手臂单帧变化对应人体真实快速动作（throw_ball f631 人手 17.6cm/帧 ≈ 5m/s）。
+
+**仍有穿地**（非手指部件）：跪姿膝盖 -11cm（机器人膝盖体积比人大）、深蹲后退 toe -12cm（踝背屈极限 -52° 不够，脚只能斜着）、手撑地时手指/手腕 -10~-20cm。单个 clip 常数平移无法同时满足站立和跪/坐帧。
+
+**F6**：retarget 后逐帧计算非手指碰撞体最低点，穿地超过 2cm 的帧抬高 root；抬高量做 ±0.2s 滑动 max 再滑动 mean（保证不小于所需量、不突跳）。
+
+**F6 结果**：手/手指不参与抬升（手撑地时机器人手臂偏长，按手抬升会让脚悬空）。非手部件最低点全部 ≥ -2cm；跪姿膝盖、深蹲脚尖不再穿地；sitting 双手撑地时鞋底 p50 从 +10cm 回到 -1.9cm。
+
+**可视化**：SOMA 面板改为与机器人相机同比例（× 本 clip 的 retarget scale）+ 固定地面线，并去掉合成的 `Root` 关节（停在 BVH 原点，人走远后把自动缩放拉坏）。原先每帧自动缩放，深蹲在正视图里看起来像"站着"。
+
+**batch 准备**：
+- `data/motion_lib_a3ultra/robot_filtered/` 已有 28,792 个旧 pipeline 的 pkl（2026-10-12，180° 朝向/脚交叉/手臂弯曲），skip_existing 会跳过它们 → 新 batch 输出到 `robot_filtered_v15/`，旧目录不动
+- 修复：tar 模式下 pkl 内 motion key 取自临时文件名（`tmpXXXX`），改为传入真实 clip 名
+- `--workers` 之前未实现（142k clip 单进程 ≈ 4 天）→ 实现进程池，tar 流式读取 + 有界预取（避免 45GB 读进内存）
+- 仓库自带 `filter_and_copy_bones_data.py` 的默认过滤词（box/stair/sitting/chair/walking_on_edge/cartwheel/safety_roll…）正好覆盖 QA 中环境交互类问题 clip；batch 全量转换，训练前按官方流程过滤
+
+**batch 验证**：240 clip 小批量（24 workers）0 失败，12 clip/s；pkl key = clip 名，dof/root 与 QA driver 输出完全一致（差 0.0）。
+
+**对比视频**：`videos/compare_v15/`（33 个，左 SOMA 与机器人同比例 + 地面线，右 A3 Ultra，L/R 标签，关节单帧跳变 >25° 时红字标出）。`videos/compare_v14/` 保留作修复前对照。
+
+**全量 batch 已启动**（2026-10-13）：`--workers 24`，输出 `data/motion_lib_a3ultra/robot_filtered_v15/`，日志 `data/motion_lib_a3ultra/batch_retarget_v15.log`，≈15 clip/s，预计 ≈2.5h。旧目录 `robot_filtered/`（28,792 个旧 pipeline pkl）未动，确认新数据后可删。
+
+**已知限制（接受）**：手撑地时机器人手/手指穿地（手臂相对偏长）；坐盘腿时腿部自碰撞；上/下箱子、走窄边等环境交互 clip 机器人悬空（训练前用 `filter_and_copy_bones_data.py` 默认过滤词剔除）；腰 pitch 限位 [-28°, 24°]，人体大幅弯腰时饱和。
+
+---
+
+## 34. [2026-10-13] 确认：Bones-SEED 数据集无手部局部动作
+
+**用户问题**：bones-seed 数据集里是否包含手部的局部动作。
+
+**检查方法**：BVH 骨架本身定义了完整五指链（每手 Thumb/Index/Middle/Ring/Pinky，每指 3-4 节，共 78 关节/78 关节 x 3 通道）。直接解析每个 clip 的手指关节旋转通道，看数值是否随时间变化。
+
+**结果**：
+- 抽查 34 个动作样本（走/跑/跳/坐/蹲/跪/爬/翻滚/打/扔/舞蹈）：所有手指通道全程 std=0.00°、range=0.00°（完全常量），包括 `throw_ball`、`punch_self_face` 这类理应有手部动作的 clip。手腕本身正常随手臂摆动。
+- 全量扫描 142,220 个 clip（手部相关关键词全量命中 + 每 40 个抽样一个，共解析 23,385 个，1000s）：**0 个 clip 的手指关节变化幅度 > 0.5°**。
+
+**结论**：Bones-SEED 的动捕只采集了身体大关节，手指通道是导出时的常量占位值，不含任何手部精细动作数据。这与当前 retarget pipeline 的处理一致——`_ACTUATED_MAP`（`convert_gmr_a3ultra_to_motion_lib.py`）本就跳过手指索引，`dof` 数组（31维）不含手指自由度，机器人手指保持默认姿态。
+
+---
+
+## 35. [2026-10-13] 全量 batch 完成；682 个失败原因排查
+
+**结果**：141,538 转换成功，682 失败（0.48%），用时 134 分钟，16 clip/s。输出 `data/motion_lib_a3ultra/robot_filtered_v15/`。
+
+**失败原因排查**：全部 682 个失败报错均为 `SVD did not converge`，发生在 `load_soma_bvh_frames()` 里 `Rotation.from_matrix()`（FK 阶段，IK 之前）。抽查 3 个失败 clip（不同动作类型：双手持物、镐子 idle、原地等待）：
+- 根因是原始 BVH **动捕数据本身存在大段 NaN**：Y/Z 旋转通道在某一段连续帧内全部是 NaN，且**同一帧范围内所有关节同时失效**（Hips 到 Head 到四肢全部），X 通道正常——这是采集时的追踪丢失/遮挡，不是某个关节单独的问题。
+- 丢失段很长，不是偶发几帧：3 个样本分别丢失 76+456、343+433、394 帧（总帧数 1154/2150/1435），占比 30-60%。插值填补会伪造大半个动作，不安全。
+- 682 个失败分布在 54 个不同的采集 session（A513 99个、A521 79个、A527 74个...），分布分散，说明是源数据采集阶段偶发的追踪丢失，不是 pipeline 的 bug。
+
+**结论**：这 682 个 clip（0.48%）应当保持跳过，不做修复或插值——现有行为（遇到解析异常直接计入 failed、不写出 pkl）是正确的。
+
+---
+
+## 36. [2026-10-13] 用仓库自带过滤脚本清洗 v15 数据集
+
+**目的**：QA（worklog #33）中发现上箱子/下箱子/走窄边/手撑地/盘腿坐等环境交互或特殊接触类动作，机器人会悬空、穿地或自碰撞——这类问题不是 retarget 算法能单独解决的（需要场景几何信息，当前 pipeline 没有），用仓库已有的 `filter_and_copy_bones_data.py` 按关键词过滤掉。
+
+**命令**：
+```bash
+python3 gear_sonic/data_process/filter_and_copy_bones_data.py \
+  --source data/motion_lib_a3ultra/robot_filtered_v15/ \
+  --dest data/motion_lib_a3ultra/robot_filtered_v15_clean/ \
+  --workers 28
+```
+先用 `--dry-run` 跑一遍确认数量，再正式跑（无 `--dry-run`）。脚本按 `--source` 下每个一级子目录（这里是 BVH session 名，如 `230530_walk`、`A505`）分配一个 worker，recursive glob 该目录下所有 `.pkl`，对 `"{session}/{filename}.pkl"`（小写）做关键词子串匹配，命中任一关键词就不拷贝。
+
+**结果**：
+
+| | 数量 |
+|---|---|
+| 输入（v15 batch 全部成功） | 141,538 |
+| 过滤掉 | 12,422（8.8%） |
+| 保留到 clean | **129,116**（91.2%） |
+| clean 目录大小 | 33G（源 36G） |
+| 耗时 | 13s（28 进程并行） |
+
+**用的过滤词**（仓库默认，40 个，未新增）：
+`bed bike chair climb com_up_50cm sitting step_on seat table _sit_ sit_ ladder crutch _bed_ _ride_ scooter stepdown acrobatics_ box_HSPU cartwheel 50cm_box_ on_box fall_from handstand_ff_ on_1m form_box off_1m 230m jump_over_obstacle_ lift_crate_come_up_ jump_to_shoulder_roll kozak_dance stair handstand box_jump monkey_jump safety_roll box_dips walking_on_edge push_obstacle`
+
+**各关键词命中数**（对全部 141,538 个文件名独立统计，一个文件可能命中多个词，故总和 > 12,422）：
+
+| 关键词 | 命中数 | 示例 |
+|---|---:|---|
+| sitting | 3716 | sitting_legs_bend_arms_back_start_003\_\_A042.pkl |
+| 50cm_box_ | 3399 | come_down_50cm_box_R_001\_\_A475_M.pkl |
+| sit_ | 2428 | walk_sit_drinking_table_mug_R_001\_\_A472.pkl |
+| crutch | 976 | crutches_idle_turn_360_R_slow_002\_\_A519.pkl |
+| table | 703 | walk_sit_drinking_table_mug_R_001\_\_A472.pkl |
+| chair | 702 | sit_on_chair_start_R_003\_\_A063.pkl |
+| _sit_ | 190 | walk_sit_drinking_table_mug_R_001\_\_A472.pkl |
+| climb | 180 | ladder_climbing_down_stop_R_103\_\_A301_M.pkl |
+| handstand | 162 | idle_handstand_loop_003\_\_A305_M.pkl |
+| stair | 138 | dance_hiphop_upstairs_downstairs_R_fast_001\_\_A319.pkl |
+| ladder | 136 | ladder_climbing_down_stop_R_103\_\_A301_M.pkl |
+| jump_over_obstacle_ | 136 | jump_over_obstacle_2m_R_002\_\_A304.pkl |
+| lift_crate_come_up_ | 130 | lift_crate_come_up_50cm_box_R_004\_\_A141.pkl |
+| cartwheel | 120 | cartwheel_R_003\_\_A304.pkl |
+| handstand_ff_ | 106 | handstand_ff_loop_180_R_001\_\_A305.pkl |
+| kozak_dance | 90 | kozak_dance_003\_\_A353_M.pkl |
+| walking_on_edge | 80 | walking_on_edge_180_R_002\_\_A413.pkl |
+| safety_roll | 72 | safety_roll_315_L_001\_\_A305.pkl |
+| push_obstacle | 70 | push_obstacle_270_001\_\_A344_M.pkl |
+| box_jump | 48 | box_jump_002\_\_A362_M.pkl |
+| jump_to_shoulder_roll | 46 | tiger_jump_to_shoulder_roll_R_002\_\_A304_M.pkl |
+| _ride_ | 30 | victory_dance_ride_the_pony_R_002\_\_A307.pkl |
+| off_1m | 24 | jump_off_1m_R_003\_\_A300.pkl |
+| monkey_jump | 24 | monkey_jump_002\_\_A304.pkl |
+| box_HSPU | 24 | box_HSPU_002\_\_A359_M.pkl |
+| box_dips | 24 | box_dips_001\_\_A361.pkl |
+| form_box | 24 | jump_form_box_to_safety_roll_180_R_001\_\_A501_M.pkl |
+| stepdown | 12 | ladder_climbing_stepdown_R_003\_\_A300_M.pkl |
+| on_1m | 12 | jump_on_1m_R_004\_\_A300_M.pkl |
+| on_box | 12 | jump_on_box_230cm_003\_\_A304_M.pkl |
+| seat | 8 | stick_gum_to_seat_R_001\_\_A456.pkl |
+| fall_from | 4 | fall_from_2m_panic_180_R_002\_\_A304_M.pkl |
+| bed / bike / com_up_50cm / step_on / _bed_ / scooter / acrobatics_ / 230m | 0 | （本次数据集中未出现） |
+
+**正式跑前的校验**：
+- 关键词子串匹配可能有误伤风险（如 `sit_` 可能命中 `visit_` 这类无关词）。对本数据集全部文件名做了正则检查（`[a-z]sit_`，即 `sit_` 前紧跟字母），**0 个可疑匹配**——本数据集命名规范下所有 `sit_` 命中都是真实的"坐/辅助物"类动作（`walk_sit_`、`sit_on_chair`、`sit_cross_legged` 等），过滤干净。
+- `--dry-run` 先跑一遍核对数量（129,116 copied / 12,422 filtered），与正式跑结果一致后才去掉 `--dry-run` 执行。
+
+**说明**：这一步只按文件名关键词过滤 QA 已知有问题的"环境交互"类动作（箱子/楼梯/椅子/床/爬梯/手推障碍物等需要场景几何支持的动作），和 worklog #33 里"手撑地穿地、盘腿坐自碰撞"的已知限制是同一类问题的根源（没有地面以外的场景物体、retarget 不处理道具接触）。纯身体动作（走/跑/跳/舞蹈/格斗等）不受影响。
+
+**产出**：`data/motion_lib_a3ultra/robot_filtered_v15_clean/`，129,116 个 pkl，124 个 session 子目录，33G，可直接用于下一步训练数据准备。`robot_filtered_v15/`（未过滤，141,538 个）保留作为过滤前的完整数据。
+
+---
+
+## 37. [2026-10-13] 核查 Litchi_sonic_for_a3（SONIC 团队 A3 适配）与我们 A3 Ultra 的参数一致性
+
+**背景**：用户要求确认 `Litchi_sonic_for_a3`（相邻目录，SONIC 团队针对 AgiBot A3 的新开源适配，含 035/step200000 checkpoint）里的 A3 机器人参数是否与本项目用的 A3 Ultra (T3D0) 一致，避免把该 checkpoint 部署到 A3 Ultra 上时出现 sim2real/跨机型 gap。
+
+**对比对象**：
+- 我方：`gear_sonic/data/assets/robot_description/mjcf/a3_ultra_t3d0.xml` + `gear_sonic/envs/manager_env/robots/a3_ultra.py`
+- Litchi：`gear_sonic/data/assets/robot_description/mjcf/a3_t2d5.xml`（确认为 035 checkpoint 实际训练用的资产——`checkpoints/035_step200000/config.yaml:323` 的 `assetFileName: a3_t2d5.xml`）+ `gear_sonic/envs/manager_env/robots/a3.py` + `gear_sonic/utils/a3_motor_params.py`
+
+**结论：下肢（腿+腰）和手臂机构参数基本一致（同一套硬件平台），差异集中在头部感知组件和末端手**，具体：
+
+### 1. 运动学完全一致
+逐 body 对比 29 个共有 link 的局部偏移（`body_pos`）：骨盆高度 1.3m、大腿/小腿长、肩宽、前臂长等全部**逐毫米吻合**，仅 ankle_pitch_Link 1.5mm、elbow_Link 0.5mm 的建模取整误差。
+
+### 2. 质量分布完全一致
+29 个共有 link 的质量逐克吻合（髋/膝/踝/肩/肘/腰/骨盆全部 0.000kg 差），仅手腕末端（+0.22kg/侧，A3 Ultra 灵巧手结构更重）、头部（+0.235kg，A3 Ultra 多了独立俯仰传感器头）、躯干（+0.649kg，A3 Ultra 机身电子件更重）有差异。整机：A3U 60.01kg vs A3 57.98kg，差 2kg 全部来自这几处 + 手指质量。
+
+### 3. 电机/执行器参数几乎逐位精确吻合
+踝、腰并联关节的等效惯量倍数、等效最大力矩、等效限速——我方 `docs/robot_parameters/instructions.md` 与 Litchi `docs/a3_024_sim2real_materials/01_serial_parallel_torque_coupling/armature_reference.csv` **数值完全一致**（5.333/1.66562/7.3/1.21，10.8/19.37/9.24785/22.7 rad/s，118.2/54.75/115/46 Nm）。
+
+全部 11 组关节（hip/knee/ankle_pitch/ankle_roll/waist_yaw/waist_pitch/waist_roll/shoulder/shoulder_yaw_elbow/wrist_roll/wrist_pitch_yaw）的 `effort_limit_sim`、`velocity_limit_sim`、以及反射惯量 `armature`，两边逐一算出来的数值**全部一致到小数点后 6 位**（PFP-93-65/110-75/78-58/59-60/41-48 电机型号命名也一致），仅 waist_pitch 力矩我方标注 118.0 Nm 而 Litchi 用 115 Nm（差 2.5%，均在 `docs/robot_parameters/instructions.md` 注明的"理论计算值，建议 domain rand 3%"范围内，不算结构性差异）。
+
+**结论**：A3 与 A3 Ultra 共享同一套腿部/腰部/手臂的电机、减速器、连杆机构，不是两种机械结构不同的机器人。
+
+### 4. 发现的真实差异
+| 项目 | A3 Ultra | A3 (T2D5) |
+|---|---|---|
+| 末端手 | 完整灵巧手（每手 15 指关节，经 tendon-mimic 耦合驱动） | 无手指关节（`right_hand_Link` 为固定几何体，推测简单夹爪/固定手型） |
+| 头部 | `head_yaw` + 额外独立俯仰 `ultra_head_pitch`（挂载 Livox MID360 激光雷达，mesh 名 `ultra_head_mid360_Link`） | 仅 `head_yaw` + `head_pitch`；且 035 训练资产里 `head_yaw` range 被锁死为 `[0,0]`（训练未用到该自由度） |
+| hip_roll 上限 | 85°（右为 -85°） | 92°（右为 -92°），差 7° |
+| knee 上限 | 145° | 143°，差 2° |
+| waist_pitch 等效力矩 | 118.0 Nm（docx 理论值） | 115 Nm（差 2.5%，在建议 domain-rand 范围内） |
+
+**头/手差异对该 checkpoint 无影响**：035 checkpoint 的动作空间 `A3_ACTIVE_JOINT_NAMES`（`gear_sonic/envs/manager_env/robots/a3.py`）只有 29 个身体关节，不含头部和手指，所以 A3 Ultra 多出来的灵巧手/独立传感器头本来就不受这个策略驱动，需要另外的控制层（与 README "Current limitations" 里提到的"无手部精细操作"一致）。
+
+### 5. 需要注意的一点（不是硬件差异，是训练配方差异）
+两边各自训练用的 PD 增益（`stiffness`/`damping`）**选得不一样**，不能跨项目混用：
+
+| 关节组 | A3U 自己训练用 Kp/Kd | A3 (Litchi 035) 训练用 Kp/Kd |
+|---|---|---|
+| hip | 200 / 7 | 120(roll)/80(yaw,pitch) / 4(roll)/3(yaw,pitch) |
+| knee | 360 / 13 | 250 / 8 |
+| ankle | 80 / 3 | 50 / 2 |
+| waist_yaw | 200 / 7 | 85 / 3 |
+| waist_pitch/roll | 80 / 3 | 50 / 2 |
+| shoulder | 90 / 4 | 40 / 3 |
+| shoulder_yaw/elbow, wrist_roll | 40 / 3 | 30 / 2 |
+
+部署 Litchi 的 035 checkpoint 到 A3 Ultra 实机时，底层伺服 Kp/Kd 必须按 **Litchi 自己训练用的数值**（`gear_sonic/envs/manager_env/robots/a3.py` 或其 `gear_sonic_deploy` 导出的 deploy manifest）配置，不能套用我们 `a3_ultra.py` 里为"从零训练 A3 Ultra"选的那组增益——否则会制造出一个两个项目本不存在的 gap。
+
+### 6. 副产品：发现我方 `a3_ultra.py` 里 wrist_roll 的 armature 疑似笔误
+`gear_sonic/envs/manager_env/robots/a3_ultra.py:296-303` 的 `wrist_roll` 块：`effort_limit_sim=24.0, velocity_limit_sim=15.71`（对应 PFP-59-60 电机规格，与 Litchi `a3.py` 给 wrist_roll 用的电机型号一致）但 `armature=0.000810`（这是 PFP-41-48 电机的反射惯量，本应是 PFP-59-60 的 `0.004967`）。注释自相矛盾：写着"PFP-41-48"却配的是 PFP-59-60 的力矩/限速数值。Litchi 的 `a3_motor_params.py`／`a3.py` 对应位置是自洽的（`ARMATURE_PFP_59_60 = 0.004967`，与 24Nm/15.71rad/s 配套）。
+
+**这是我方从零训练 A3 Ultra 时的仿真参数 bug**（wrist_roll 关节仿真惯量偏小约 6 倍，与这次"能否部署 Litchi checkpoint"的问题无关），独立记录，后续训练前应修正为 `0.004967`。

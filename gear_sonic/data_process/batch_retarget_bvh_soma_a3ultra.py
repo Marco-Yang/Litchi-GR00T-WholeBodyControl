@@ -14,24 +14,27 @@ extract_soma_joints_from_bvh.py and replicate GMR's world-space dict format.
 
 Usage:
     # From tar.gz (streaming, no full extraction needed)
-    conda run -n gmr python batch_retarget_bvh_soma_a3ultra.py \
+    OMP_NUM_THREADS=1 conda run -n gmr python batch_retarget_bvh_soma_a3ultra.py \
         --tar data/bones_seed/soma_proportional.tar.gz \
-        --output data/motion_lib_a3ultra/robot_filtered/ \
-        --fps 30
+        --output data/motion_lib_a3ultra/robot_filtered_v15/ \
+        --fps 30 --workers 24
 
     # From a directory of BVH files
-    conda run -n gmr python batch_retarget_bvh_soma_a3ultra.py \
+    OMP_NUM_THREADS=1 conda run -n gmr python batch_retarget_bvh_soma_a3ultra.py \
         --bvh_dir /path/to/bvh/ \
-        --output data/motion_lib_a3ultra/robot_filtered/ \
+        --output data/motion_lib_a3ultra/robot_filtered_v15/ \
         --fps 30
 """
 
 import argparse
+import contextlib
+import io
 import os
 import re
 import sys
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 import joblib
@@ -198,23 +201,13 @@ def load_soma_bvh_frames(filepath):
         _hq_xyzw = world_quat_xyzw[0, _hips_j_idx]
         _hq_wxyz = np.array([_hq_xyzw[3], _hq_xyzw[0], _hq_xyzw[1], _hq_xyzw[2]])
         _hq_zup = _quat_mul(_Q_YUP_TO_ZUP, _hq_wxyz)
-        # body_Z (third column of R) = facing direction for SOMA Hips in Z-up.
-        # BVH forward (+Z in Y-up) maps to -Y in Z-up after R_x(+90°).
-        # Canonical forward = -Y_world (south), so yaw = angle FROM -Y TO body_Z_xy.
-        # Solve: R_Z(yaw) @ [0,-1] = [body_Z[0], body_Z[1]]
-        #   => yaw = atan2(body_Z[0], -body_Z[1])
-        # Rotate all frames so Hips faces canonical south (-Y) at frame 0;
-        # rot_offsets in bvh_nokov_to_a3_ultra.json were calibrated for this
-        # canonical direction, and A3 Ultra at qpos0 also faces south (-Y).
+        # SOMA Hips body_Z is the performer's LEFT (not forward): verified on 40
+        # Bones-SEED clips via toe direction and LeftLeg−RightLeg. Rotate so
+        # body_Z → +Y, i.e. the performer faces +X like A3 Ultra at qpos0.
+        # Must match calibrate_soma_to_a3ultra.py, or the robot ends up 180°
+        # from the performer (crossed legs/arms, hyperextended knees).
         _body_z = Rotation.from_quat(_hq_zup, scalar_first=True).as_matrix()[:, 2]
-        _yaw_f0 = float(np.arctan2(_body_z[0], -_body_z[1]))
-        # +π flips the canonical SOMA orientation by 180° around Z so the IK
-        # targets an East-facing robot (same as qpos0).  A post-processing step
-        # in retarget_bvh() then flips the root to West-facing.  This is
-        # cleaner than targeting West directly in the IK, because the mink
-        # differential IK converges reliably for East-facing from the East
-        # warm-start but stalls in a local minimum when the target is West.
-        _yaw_f0 += np.pi
+        _yaw_f0 = float(np.arctan2(-_body_z[0], _body_z[1]))
         _R_yaw_comp = Rotation.from_euler('Z', -_yaw_f0).as_matrix()
         _q_yaw_comp = Rotation.from_euler('Z', -_yaw_f0).as_quat(scalar_first=True)  # wxyz
         world_pos_zup = np.einsum('ij,tnj->tni', _R_yaw_comp, world_pos_zup)
@@ -261,35 +254,152 @@ def load_soma_bvh_frames(filepath):
 # GMR retarget for one BVH file                                               #
 # --------------------------------------------------------------------------- #
 
+POSTURE_COST = 1.0  # continuity prior (per rad) vs frame tasks (pos 100/m, rot 5-10/rad)
+
+
 def make_retargeter():
-    """Create a GMR instance for SOMA → A3 Ultra retargeting (reusable)."""
+    """Create a GMR instance for SOMA → A3 Ultra retargeting (reusable).
+
+    Body scale and position offsets are set per clip by _configure_clip() from
+    the performer's own bone lengths, so no global human height is assumed.
+    """
+    import mink
     from general_motion_retargeting import GeneralMotionRetargeting as GMR
-    ret = GMR(
-        src_human="bvh_nokov",
-        tgt_robot="agibot_a3_ultra",
-        # 1.90 rather than the SOMA performer's true height (~1.7-1.8 m).
-        # GMR multiplies all human_scale_table entries by ratio=actual/assumption.
-        # At 1.75 the ratio is 0.972 and the effective Hips scale = 0.875, which
-        # places the pelvis IK target at 0.88 × SOMA_hip_Z ≈ 0.90 m — far below
-        # A3 Ultra's natural standing pelvis height (1.30 m at qpos0), forcing
-        # 63° of knee flexion.  At 1.90 (ratio=1.056, Hips scale=0.950) the pelvis
-        # target rises to ≈0.97 m, giving ≈44° mean knee for normal walking
-        # (range 32-61°, no frames stuck at the −7° joint lower limit).
-        # NOTE: 1.95 would give ~23° mean but causes 78/120 frames to fall into
-        # the −7° hyperextension local minimum via sequential warm-start drift.
-        actual_human_height=1.90,
-    )
-    ret.max_iter = 50  # 30 was insufficient to rotate 180° to West-facing target
+    ret = GMR(src_human="bvh_nokov", tgt_robot="agibot_a3_ultra")
+    ret.max_iter = 50
+    # Pull each frame toward the previous solution so the IK does not hop
+    # between equivalent branches (e.g. shoulder gimbal at roll ≈ 90°).
+    ret.posture_task = mink.PostureTask(ret.configuration.model, cost=POSTURE_COST)
+    ret.tasks1.append(ret.posture_task)
+    ret.tasks2.append(ret.posture_task)
+    ret.robot_geom = _robot_geometry(ret.configuration.model)
     return ret
 
 
-def _warm_start_qpos(model) -> np.ndarray:
-    """Return qpos0 with knees pre-bent to 20° to escape IK hyperextension basin.
+def _robot_geometry(model) -> dict:
+    """Robot reference dimensions at qpos0, where every link frame is world-aligned."""
+    import mujoco as mj
+    d = mj.MjData(model)
+    d.qpos[:] = model.qpos0
+    mj.mj_forward(model, d)
+    P = lambda n: d.xpos[mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, n)].copy()
+    foot = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, "left_ankle_roll_Link")
+    sole = min(d.geom_xpos[g][2] - model.geom_size[g][0] for g in range(model.ngeom)
+               if model.geom_bodyid[g] == foot and model.geom_contype[g])
+    hip_l, hip_r = P("left_hip_pitch_Link"), P("right_hip_pitch_Link")
+    knee, ankle = P("left_knee_Link"), P("left_ankle_roll_Link")
+    return {
+        "leg": np.linalg.norm(hip_l - knee) + np.linalg.norm(knee - ankle),
+        "pelvis_to_hip": (hip_l + hip_r) / 2 - P("pelvis_link"),
+        "hip_half_w": (hip_l - hip_r)[1] / 2,
+        "hip_yaw_drop": hip_l[2] - P("left_hip_yaw_Link")[2],
+        "shoulder_half_w": (P("left_shoulder_roll_Link") - P("right_shoulder_roll_Link"))[1] / 2,
+        "shoulder_yaw_drop": P("left_shoulder_roll_Link")[2] - P("left_shoulder_yaw_Link")[2],
+        "ankle_h": ankle[2] - sole,
+    }
 
-    Starting from qpos0 (knees=0°) the mink IK falls into the lower joint-limit
-    basin (-7°, hyperextension).  Any init ≥ 15° is far enough from that basin
-    to converge to the correct solution (~23° mean for walking at actual_h=1.95).
+
+def _configure_clip(ret, frames) -> float:
+    """Fit the IK targets to this performer's proportions.
+
+    - one uniform scale s = robot leg length / performer leg length
+    - pelvis offset so the robot hip joints land on the scaled human hips
+      (the A3 pelvis frame sits 0.18 m above its hips, SOMA Hips only ~0.09 m)
+    - outward offsets for leg / arm targets to absorb hip and shoulder width
+    Offsets are in each target's robot-convention frame (GMR applies them there).
+    Returns the root z shift that puts the robot soles on the floor.
     """
+    g = ret.robot_geom
+    sample = frames[:: max(1, len(frames) // 50)]
+    P = lambda f, n: np.asarray(f[n][0])
+    R_tgt = lambda f, n: (Rotation.from_quat(f[n][1], scalar_first=True) * ret.rot_offsets1[n]).as_matrix()
+
+    leg_h = np.mean([np.linalg.norm(P(f, f"{s}Leg") - P(f, f"{s}Shin"))
+                     + np.linalg.norm(P(f, f"{s}Shin") - P(f, f"{s}Foot"))
+                     for f in sample for s in ("Left", "Right")])
+    s = g["leg"] / leg_h
+    for k in ret.human_scale_table:
+        ret.human_scale_table[k] = s
+
+    hip_c = np.mean([R_tgt(f, "Hips").T @ ((P(f, "LeftLeg") + P(f, "RightLeg")) / 2 - P(f, "Hips"))
+                     for f in sample], axis=0)
+    hip_hw = np.mean([(R_tgt(f, "Hips").T @ (P(f, "LeftLeg") - P(f, "RightLeg")))[1] / 2 for f in sample])
+    sh_hw = np.mean([(R_tgt(f, "Chest").T @ (P(f, "LeftArm") - P(f, "RightArm")))[1] / 2 for f in sample])
+    leg_lat = g["hip_half_w"] - s * hip_hw
+    arm_lat = g["shoulder_half_w"] - s * sh_hw
+
+    offsets = {"Hips": s * hip_c - g["pelvis_to_hip"]}
+    for side, sign in (("Left", 1.0), ("Right", -1.0)):
+        offsets[f"{side}Leg"] = [0.0, sign * leg_lat, -g["hip_yaw_drop"]]
+        offsets[f"{side}Shin"] = [0.0, sign * leg_lat, 0.0]
+        offsets[f"{side}FootMod"] = [0.0, sign * leg_lat, 0.0]
+        offsets[f"{side}Arm"] = [0.0, sign * arm_lat, -g["shoulder_yaw_drop"]]
+        offsets[f"{side}ForeArm"] = [0.0, sign * arm_lat, 0.0]
+        offsets[f"{side}Hand"] = [0.0, sign * arm_lat, 0.0]
+    for k, v in offsets.items():
+        ret.pos_offsets1[k] = np.asarray(v, dtype=float)
+
+    # BVH floor is z=0; planted-foot ankle height ≈ low percentile over the clip.
+    ankle_z = np.percentile([min(P(f, "LeftFoot")[2], P(f, "RightFoot")[2]) for f in frames], 5)
+    return g["ankle_h"] - s * ankle_z
+
+
+FLOOR_TOL = 0.02  # m of floor penetration tolerated before the root is lifted
+# Hands are left out: when the performer leans on the floor the robot's longer
+# arms push the palm under it, and lifting the whole body for that floats the feet.
+HAND_KW = ("wrist", "thumb", "index", "middle", "ring", "pinky")
+
+
+def _geom_lowest_z(model, data, g) -> float:
+    """Exact lowest world z of a sphere / capsule / cylinder / box / mesh geom."""
+    import mujoco as mj
+    z, Rm, s, t = data.geom_xpos[g][2], data.geom_xmat[g].reshape(3, 3), model.geom_size[g], model.geom_type[g]
+    az = abs(Rm[2, 2])
+    if t == mj.mjtGeom.mjGEOM_SPHERE:
+        return z - s[0]
+    if t == mj.mjtGeom.mjGEOM_CAPSULE:
+        return z - az * s[1] - s[0]
+    if t == mj.mjtGeom.mjGEOM_CYLINDER:
+        return z - az * s[1] - s[0] * np.sqrt(max(0.0, 1 - az * az))
+    if t == mj.mjtGeom.mjGEOM_BOX:
+        return z - np.abs(Rm[2, :]) @ s
+    if t == mj.mjtGeom.mjGEOM_MESH:
+        i = model.geom_dataid[g]
+        v = model.mesh_vert[model.mesh_vertadr[i]: model.mesh_vertadr[i] + model.mesh_vertnum[i]]
+        return z + (v @ Rm[2, :]).min()
+    return z
+
+
+def _lift_out_of_floor(qpos_list, model, fps: float):
+    """Raise the root on frames where a trunk / leg / head collision geom sinks into the floor.
+
+    Kneeling, crawling and deep crouches put robot knees or toes below
+    z=0 because the robot's link volumes differ from the performer's. The lift
+    is a moving max followed by a moving mean (±0.2 s), so it is never smaller
+    than what a frame needs and never steps abruptly.
+    """
+    import mujoco as mj
+    from scipy.ndimage import maximum_filter1d, uniform_filter1d
+    d = mj.MjData(model)
+    body = lambda g: (mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, model.geom_bodyid[g]) or "").lower()
+    geoms = [g for g in range(model.ngeom)
+             if model.geom_bodyid[g] != 0 and (model.geom_contype[g] or model.geom_conaffinity[g])
+             and not any(k in body(g) for k in HAND_KW)]
+    need = np.zeros(len(qpos_list))
+    for t, q in enumerate(qpos_list):
+        d.qpos[:] = q
+        mj.mj_kinematics(model, d)
+        need[t] = max(0.0, -min(_geom_lowest_z(model, d, g) for g in geoms) - FLOOR_TOL)
+    if not need.any():
+        return
+    w = 2 * max(1, round(0.2 * fps)) + 1
+    lift = uniform_filter1d(maximum_filter1d(need, w, mode="nearest"), w, mode="nearest")
+    for q, dz in zip(qpos_list, lift):
+        q[2] += dz
+
+
+def _warm_start_qpos(model) -> np.ndarray:
+    """qpos0 with knees pre-bent 20° so the first frame avoids the -7° hyperextension basin."""
     import mujoco as mj
     q = model.qpos0.copy()
     for i in range(model.njnt):
@@ -314,22 +424,23 @@ def retarget_bvh(bvh_path: str, fps_target: int = 30,
     if retargeter is None:
         retargeter = make_retargeter()
 
-    # load_soma_bvh_frames applies +π yaw_comp, which flips the IK target from
-    # East-facing to West-facing (R_Z(π) * East = West).  Use a West-facing
-    # warm-start so the IK starts in the correct basin and converges in ~50 iters.
-    _R180Z_wxyz = np.array([0.0, 0.0, 0.0, 1.0])  # wxyz: Rz(180°)
-    q_warm = _warm_start_qpos(retargeter.configuration.model)
-    q_warm[3:7] = _quat_mul(_R180Z_wxyz, q_warm[3:7])
-    retargeter.configuration.update(q_warm)
+    root_dz = _configure_clip(retargeter, frames)
+    retargeter.configuration.update(_warm_start_qpos(retargeter.configuration.model))
 
     stride = max(1, round(fps_src / fps_target))
     qpos_list = []
     for i, frame_data in enumerate(frames):
         if i % stride != 0:
             continue
-        qpos = retargeter.retarget(frame_data)
-        qpos_list.append(qpos.copy())
+        retargeter.posture_task.set_target(retargeter.configuration.q)
+        if not qpos_list:
+            retargeter.retarget(frame_data)  # settle the first frame before anchoring to it
+            retargeter.posture_task.set_target(retargeter.configuration.q)
+        qpos = retargeter.retarget(frame_data).copy()
+        qpos[2] += root_dz
+        qpos_list.append(qpos)
 
+    _lift_out_of_floor(qpos_list, retargeter.configuration.model, fps_src / stride)
     return qpos_list, retargeter
 
 
@@ -338,7 +449,7 @@ def retarget_bvh(bvh_path: str, fps_target: int = 30,
 # --------------------------------------------------------------------------- #
 
 def process_one_bvh(bvh_path: str, out_pkl: str, fps_target: int,
-                    retargeter=None):
+                    retargeter=None, motion_name: str = None):
     """Retarget one BVH file and save as SONIC motion_lib pkl.
 
     Returns (success, retargeter) — retargeter is returned so callers can
@@ -347,46 +458,118 @@ def process_one_bvh(bvh_path: str, out_pkl: str, fps_target: int,
     try:
         qpos_list, retargeter = retarget_bvh(bvh_path, fps_target, retargeter)
         if len(qpos_list) < 10:
-            print(f"  SKIP {bvh_path}: too short ({len(qpos_list)} frames)")
+            print(f"  SKIP {motion_name or bvh_path}: too short ({len(qpos_list)} frames)")
             return False, retargeter
 
         motion_data = convert_sequence(qpos_list, fps=float(fps_target))
-        motion_name = Path(bvh_path).stem
         os.makedirs(os.path.dirname(out_pkl), exist_ok=True)
-        joblib.dump({motion_name: motion_data}, out_pkl)
+        joblib.dump({motion_name or Path(bvh_path).stem: motion_data}, out_pkl)
         return True, retargeter
     except Exception as e:
-        print(f"  FAILED {bvh_path}: {e}")
+        print(f"  FAILED {motion_name or bvh_path}: {e}")
         return False, retargeter
 
 
 # --------------------------------------------------------------------------- #
-# Tar streaming                                                               #
+# Parallel batch                                                              #
 # --------------------------------------------------------------------------- #
 
-def iter_bvh_from_tar(tar_path: str):
-    """Yield (motion_name, tmp_bvh_path) from tar.gz using pipe streaming.
+_WORKER_RETARGETER = None
 
-    Uses r|gz (pipe) mode: reads sequentially without seeking. Each BVH is
-    written to a temp file, yielded, then deleted.
+
+def _worker_job(job):
+    """Pool worker: (motion_name, bvh path or bytes, out_pkl, fps) → success."""
+    global _WORKER_RETARGETER
+    if _WORKER_RETARGETER is None:
+        with contextlib.redirect_stdout(io.StringIO()):  # GMR prints the whole model on load
+            _WORKER_RETARGETER = make_retargeter()
+    motion_name, src, out_pkl, fps = job
+    tmp = None
+    if isinstance(src, bytes):
+        fd, tmp = tempfile.mkstemp(suffix=".bvh")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(src)
+        src = tmp
+    try:
+        ok, _WORKER_RETARGETER = process_one_bvh(src, out_pkl, fps, _WORKER_RETARGETER, motion_name)
+    finally:
+        if tmp:
+            os.unlink(tmp)
+    return ok
+
+
+def _run_jobs(jobs, workers: int, counts: dict, out_dir):
+    """Run jobs on a process pool, keeping at most 4×workers in flight so the
+    45 GB tar is never buffered into memory."""
+    from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+
+    t0 = time.time()
+
+    def tally(done):
+        for fut in done:
+            counts["ok" if fut.result() else "fail"] += 1
+            n = counts["ok"] + counts["fail"]
+            if n % 200 == 0:
+                rate = n / (time.time() - t0)
+                print(f"  [{n}] ok={counts['ok']} fail={counts['fail']} skip={counts['skip']} "
+                      f"({rate:.1f} clips/s)", flush=True)
+
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        pending = set()
+        for job in jobs:
+            if len(pending) >= 4 * workers:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                tally(done)
+            pending.add(ex.submit(_worker_job, job))
+        tally(wait(pending).done)
+    print(f"\nDone: {counts['ok']} converted, {counts['skip']} skipped, {counts['fail']} failed "
+          f"in {(time.time() - t0) / 60:.1f} min → {out_dir}")
+
+
+def _tar_jobs(tar_path, out_dir, fps, skip, max_files, counts):
+    """Yield jobs from tar.gz via pipe streaming (sequential read, no seeking).
+
+    Output keeps the session directory: soma_proportional/bvh/<session>/<name>.bvh
+    → <out_dir>/<session>/<name>.pkl
     """
+    n_jobs = 0
     with tarfile.open(tar_path, "r|gz") as tf:
         for member in tf:
             if not member.name.endswith(".bvh"):
                 continue
+            parts = Path(member.name).parts
+            session = parts[-2] if len(parts) >= 3 else "session"
+            motion_name = Path(member.name).stem
+            out_pkl = out_dir / session / f"{motion_name}.pkl"
+            if skip and out_pkl.exists():
+                counts["skip"] += 1
+                continue
             f = tf.extractfile(member)
             if f is None:
                 continue
-            content = f.read()
-            motion_name = Path(member.name).stem
-            # Write to temp file (GMR needs a file path, not bytes)
-            tmp = tempfile.NamedTemporaryFile(
-                suffix=".bvh", delete=False, mode="wb"
-            )
-            tmp.write(content)
-            tmp.flush()
-            tmp.close()
-            yield motion_name, tmp.name, member.name
+            yield motion_name, f.read(), str(out_pkl), fps
+            n_jobs += 1
+            if max_files > 0 and n_jobs >= max_files:
+                print(f"Reached max_files={max_files}, stopping.")
+                return
+
+
+def _dir_jobs(bvh_dir, out_dir, fps, skip, max_files, counts):
+    """Yield jobs for BVH files under a directory (one sub-directory level kept)."""
+    import glob
+    bvh_files = sorted(glob.glob(os.path.join(bvh_dir, "**", "*.bvh"), recursive=True))
+    print(f"Found {len(bvh_files)} BVH files in {bvh_dir}")
+    n_jobs = 0
+    for bvh_path in bvh_files:
+        motion_name = Path(bvh_path).stem
+        out_pkl = out_dir / Path(bvh_path).parent.name / f"{motion_name}.pkl"
+        if skip and out_pkl.exists():
+            counts["skip"] += 1
+            continue
+        yield motion_name, bvh_path, str(out_pkl), fps
+        n_jobs += 1
+        if max_files > 0 and n_jobs >= max_files:
+            return
 
 
 # --------------------------------------------------------------------------- #
@@ -400,108 +583,23 @@ def main():
     src.add_argument("--bvh_dir", help="Directory containing BVH files (flat or nested)")
     parser.add_argument("--output", required=True, help="Output directory for pkl files")
     parser.add_argument("--fps", type=int, default=30, help="Target FPS (default 30)")
-    parser.add_argument("--skip_existing", action="store_true", default=True,
-                        help="Skip already-converted files (default on)")
-    parser.add_argument("--no_skip", action="store_true", help="Disable skip_existing")
-    parser.add_argument("--max_files", type=int, default=0, help="Max files (0=all)")
-    parser.add_argument("--workers", type=int, default=1,
-                        help="Parallel workers (default 1; GMR uses its own IK solver)")
+    parser.add_argument("--no_skip", action="store_true",
+                        help="Re-convert clips whose output pkl already exists")
+    parser.add_argument("--max_files", type=int, default=0, help="Max clips to convert (0=all)")
+    parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 4),
+                        help="Parallel worker processes (default: CPU count - 4)")
     args = parser.parse_args()
 
-    skip = args.skip_existing and not args.no_skip
+    skip = not args.no_skip
     out_dir = Path(args.output)
-
+    counts = {"ok": 0, "fail": 0, "skip": 0}
+    print(f"Source: {args.tar or args.bvh_dir}\nOutput: {out_dir}  fps={args.fps}  "
+          f"skip_existing={skip}  workers={args.workers}", flush=True)
     if args.tar:
-        _run_from_tar(args.tar, out_dir, args.fps, skip, args.max_files, args.workers)
+        jobs = _tar_jobs(args.tar, out_dir, args.fps, skip, args.max_files, counts)
     else:
-        _run_from_dir(args.bvh_dir, out_dir, args.fps, skip, args.max_files, args.workers)
-
-
-def _run_from_tar(tar_path, out_dir, fps, skip, max_files, workers):
-    print(f"Streaming BVH files from {tar_path}")
-    print(f"Output: {out_dir}, FPS: {fps}, skip_existing: {skip}")
-
-    n_ok = n_skip = n_fail = 0
-    tmp_files = []
-    retargeter = None  # created on first file, reused thereafter
-
-    try:
-        for i, (motion_name, tmp_bvh, archive_path) in enumerate(
-            iter_bvh_from_tar(tar_path)
-        ):
-            tmp_files.append(tmp_bvh)
-
-            # Preserve session subdirectory structure: soma_proportional/bvh/DATE/NAME.bvh
-            parts = Path(archive_path).parts
-            session = parts[-2] if len(parts) >= 3 else "session"
-            out_pkl = out_dir / session / f"{motion_name}.pkl"
-
-            if skip and out_pkl.exists():
-                n_skip += 1
-                os.unlink(tmp_bvh)
-                tmp_files.pop()
-                if (n_ok + n_skip + n_fail) % 100 == 0:
-                    print(f"  [{n_ok + n_skip + n_fail}] ok={n_ok} skip={n_skip} fail={n_fail}")
-                continue
-
-            ok, retargeter = process_one_bvh(tmp_bvh, str(out_pkl), fps, retargeter)
-            os.unlink(tmp_bvh)
-            tmp_files.pop()
-
-            if ok:
-                n_ok += 1
-            else:
-                n_fail += 1
-
-            if (n_ok + n_skip + n_fail) % 100 == 0 or n_ok + n_skip + n_fail == 1:
-                print(f"  [{n_ok + n_skip + n_fail}] ok={n_ok} skip={n_skip} fail={n_fail}")
-
-            if max_files > 0 and (n_ok + n_skip + n_fail) >= max_files:
-                print(f"Reached max_files={max_files}, stopping.")
-                break
-
-    except KeyboardInterrupt:
-        print("\nInterrupted by user.")
-    finally:
-        # Clean up any remaining temp files
-        for f in tmp_files:
-            if os.path.exists(f):
-                os.unlink(f)
-
-    print(f"\nDone: {n_ok} converted, {n_skip} skipped, {n_fail} failed → {out_dir}")
-
-
-def _run_from_dir(bvh_dir, out_dir, fps, skip, max_files, workers):
-    import glob
-    bvh_files = sorted(glob.glob(os.path.join(bvh_dir, "**", "*.bvh"), recursive=True))
-    print(f"Found {len(bvh_files)} BVH files in {bvh_dir}")
-    print(f"Output: {out_dir}, FPS: {fps}")
-
-    n_ok = n_skip = n_fail = 0
-    retargeter = None
-    for bvh_path in bvh_files:
-        motion_name = Path(bvh_path).stem
-        # Preserve one level of sub-directory
-        parent = Path(bvh_path).parent.name
-        out_pkl = out_dir / parent / f"{motion_name}.pkl"
-
-        if skip and out_pkl.exists():
-            n_skip += 1
-            continue
-
-        ok, retargeter = process_one_bvh(bvh_path, str(out_pkl), fps, retargeter)
-        if ok:
-            n_ok += 1
-        else:
-            n_fail += 1
-
-        if (n_ok + n_skip + n_fail) % 100 == 0:
-            print(f"  [{n_ok + n_skip + n_fail}] ok={n_ok} skip={n_skip} fail={n_fail}")
-
-        if max_files > 0 and (n_ok + n_skip + n_fail) >= max_files:
-            break
-
-    print(f"\nDone: {n_ok} converted, {n_skip} skipped, {n_fail} failed → {out_dir}")
+        jobs = _dir_jobs(args.bvh_dir, out_dir, args.fps, skip, args.max_files, counts)
+    _run_jobs(jobs, args.workers, counts, out_dir)
 
 
 if __name__ == "__main__":
