@@ -296,3 +296,6 @@ gear_sonic/data/assets/robot_description/*
 !gear_sonic/data/assets/robot_description/mjcf/
 !gear_sonic/data/assets/robot_description/solver/
 !gear_sonic/data/assets/robot_description/urdf/
+# A3 (Litchi 035 contract) meshes referenced by the A3 MJCF/URDF (~20 MB, stored
+# via Git LFS per .gitattributes). A3 Ultra meshes and *.usd stay ignored.
+!gear_sonic/data/assets/robot_description/urdf/a3/**/*.STL
