@@ -256,9 +256,43 @@ gear_sonic_deploy/build_verify_*/
 gear_sonic_deploy/dist/
 gear_sonic_deploy/thirdparty/rockchip_sysroot/*.tar.gz
 
-# --- Motion data / CMake files are not uploaded to git (user request) ---
-# Downloaded motion datasets (e.g. Bones-SEED G1 CSVs) stay local.
+# --- Bulk motion data / generated CMake files are not uploaded to git ---
+# Downloaded motion datasets (e.g. Bones-SEED G1 CSVs) and generated
+# *.cmake (cmake_install.cmake, *Config.cmake in build trees) stay local.
 # NOTE: .gitignore only affects untracked files; files already tracked
-# (78 .csv, 4 .cmake at the time of writing) remain tracked.
+# remain tracked.
 *.csv
 *.cmake
+
+# Exceptions: small files required to reproduce / port the A3 pipeline.
+# (Files under already-ignored directories such as build/, dist/, .venv_sim/,
+# data/ are NOT re-included by these rules.)
+# A3 deploy CMake sources (AimRT fetch, ROS msg codegen, aarch64 toolchain, patches)
+!gear_sonic_deploy/cmake/*.cmake
+!gear_sonic_deploy/cmake/aimrt_patches/*.cmake
+!gear_sonic_deploy/cmake/toolchains/*.cmake
+!gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/cmake/*.cmake
+# A3 release sample motions (sim2sim / motion-lib conversion / deploy playback)
+!a3_data/agibot_a3/*.csv
+# A3 deploy runtime motions (remote_motions / teleop idle clip)
+!gear_sonic_deploy/assets/a3_runtime/**/*.csv
+# A3 motor model data package (T-N curve source next to the Jacobian .npz)
+!gear_sonic/data/a3_motor_model/*.csv
+# A3 sim2real reference tables (Jacobian grids, armature, T-N, passive foot)
+!docs/a3_024_sim2real_materials/**/*.csv
+
+# --- gear_sonic/data: keep ignoring bulk assets, but track the small A3 files ---
+# The generic `data/` rule above matches gear_sonic/data/ too, which would hide
+# files the code reads at runtime. Re-include the directory, ignore its children
+# again, then whitelist only small text/config files. Meshes (*.STL), USD and
+# other large assets stay out of git (see "remove large tracked assets" cleanup).
+!gear_sonic/data/
+gear_sonic/data/*
+!gear_sonic/data/a3_motor_model/
+!gear_sonic/data/assets/
+gear_sonic/data/assets/*
+!gear_sonic/data/assets/robot_description/
+gear_sonic/data/assets/robot_description/*
+!gear_sonic/data/assets/robot_description/mjcf/
+!gear_sonic/data/assets/robot_description/solver/
+!gear_sonic/data/assets/robot_description/urdf/
