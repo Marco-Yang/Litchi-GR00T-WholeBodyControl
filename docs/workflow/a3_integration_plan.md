@@ -274,7 +274,7 @@ std::unique_ptr<RobotIOBackend> CreateBackend(const std::string& name) {
 | `g1` | `sample_data/robot_filtered` + `sample_data/smpl_filtered`（官方样例） | 随机初始化 |
 | `h2` | 本地无动作库 | 未跑 |
 
-其它：Hydra compose 对四个机器人均通过（项目名分别为 TRL_G1_Track / TRL_H2_Track / TRL_A3_035 / TRL_A3Ultra_Track）；C++ 单测 192/200 通过，已知失败项是缺少 `reference/bones_072925_test/` 夹具的 FK 测试（原有问题），其余失败项本轮没有逐一复核；`pytest tests gear_sonic/tests` 尚未重跑。
+其它：Hydra compose 对四个机器人均通过（项目名分别为 TRL_G1_Track / TRL_H2_Track / TRL_A3_035 / TRL_A3Ultra_Track）；C++ 单测 192/200 通过，已知失败项是缺少 `reference/bones_072925_test/` 夹具的 FK 测试（原有问题），其余失败项本轮没有逐一复核。`pytest tests gear_sonic/tests`（isaaclab 环境）已重跑：169 通过、0 失败，1 个收集错误是缺 `msgpack_numpy`（遥操作可选依赖，与 A3 无关）；部署目录的 A3 Python 测试 4 通过 1 跳过，同目录 G1 的 ZMQ 测试因缺 `zmq` 无法收集（环境问题）。
 
 ### 8.9 环境与踩坑记录
 
@@ -294,9 +294,9 @@ std::unique_ptr<RobotIOBackend> CreateBackend(const std::string& name) {
 
 ### 8.11 遗留项
 
-1. `docs/workflow/sonic_a3_ultra_worklog.md` 需追加编号条目（只追加，不覆盖），本节内容可作为其素材。
-2. README 的 A3 章节和环境说明（empy 3.3.4、libacl、`GS_PYTHON3_EXECUTABLE`、RouDi 版本、空格路径）。
-3. 重跑 `pytest tests gear_sonic/tests`，重点看 `tests/test_a3_035_contract.py`、`test_download_from_hf.py`、`test_convert_a3_onnx_to_rknn.py`。
+1. ~~worklog 追加条目~~ 已完成：`sonic_a3_ultra_worklog.md` #43。
+2. ~~README 的 A3 章节和环境说明~~ 已完成：根 `README.md` 的 “AgiBot A3 / A3 Ultra (`--robot`)”。
+3. ~~重跑 pytest~~ 已完成，结果见 8.8。
 4. `sonic_a3_ultra.yaml` 的 `motion_file` 默认值 `data/motion_lib_a3ultra/robot_filtered` 在本地不存在（现有目录是 `robot_filtered_v15` 和 `robot_filtered_v15_clean`），默认配置直接训练会找不到数据；需重命名/软链，或训练时显式覆盖。
 5. `a3_ultra` 自研 63 DOF 合约尚无部署导出；h2 没有 C++ 后端。
 6. 可选：在 `ROBOT_MODEL_REGISTRY` / `ROBOT_WBC_YAML` 注册 a3 / a3_ultra / h2；Phase 4 VR 实时重定向；Phase 6 的 G1/H2 完整回归；清理被 gitignore 的构建目录（`gear_sonic_deploy/build/`、`build_verify_full/`、`dist/`）。

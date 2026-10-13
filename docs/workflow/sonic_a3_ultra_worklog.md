@@ -2436,3 +2436,70 @@ conda run -n isaaclab python gear_sonic/eval_agent_trl.py \
 5. `motion_lib_base.py` 支持"`motion_file` 可以是目录列表"这个新功能（Litchi 侧的 `_is_motion_file_sequence`/`_find_semantic_manifest`/`_load_validated_semantic_manifest` 等）未移植，这次验证绕开了（直接传单个目录路径，两边都支持），但如果以后要合并多个数据源目录会需要。
 6. 遗漏 2 的"G1 零回归"目前是推断而非实证（见 42.3）；`use_adaptive_sampling` 若开启时的"重置前快照"行为分歧未修复（见 42.3 未移植列表 + 42.5 不确定性列表）。
 7. `commands.py`/`modular_tracking_env_cfg.py` 这次为了打通 A3 验证陆续补的几处改动，没有重新对 G1/H2 现有训练配置跑一次回归冒烟测试（只用静态 import + 这次 A3 的真实运行作为信心来源）——建议在正式合入/训练前补一次 G1 的 `eval_agent_trl.py` 同类快速冒烟（`+max_render_steps=20`），以获得同等级别的"零回归"证据，而不是停留在"读代码推断不影响"。
+
+## 43. [2026-10-14] `--robot g1|a3|a3_ultra|h2` 统一入口 + Litchi 并入完成 + 官方 035 权重部署验证 + git 推送（面向冷启动 agent 的自包含记录）
+
+完整的改动清单、命令和环境坑记录在 `docs/workflow/a3_integration_plan.md` 第 8 节，本条只写结论、决策和证据，避免两处重复。
+
+### 43.1 要解决的问题与最终范围
+
+用户要求：把 Litchi_sonic_for_a3 的训练代码、035 step-200k 权重（PT/ONNX/RKNN）、C++ 部署代码、环境配置都并入本仓库，并让训练和部署都用 `--robot` 选机器人；G1/H2 不能回归。
+
+最终支持 `g1 / a3 / a3_ultra / h2`：
+- `a3` = Litchi 035 合约（A3 T2D5，29 DOF，ABI 名 `g1`/`a3_fast`）。
+- `a3_ultra` = 本项目自研 T3D0 63 DOF 合约。两套合约的 Kp/Kd 绝不混用。
+- 部署侧 `a3` 与 `a3_ultra` 都走同一个 A3 AimRT 包，用 035 产物（worklog #37/#40：同一硬件平台）。`a3_ultra` 自研合约还没有部署导出。`h2` 没有 C++ 后端。
+- **`g1_old` 曾被我加入又整体撤销**：用户明确说不需要。不要再加回来。
+
+### 43.2 关键决策
+
+1. 合并方法：三方合并（base=`daf3899`），Litchi 的 A3 发布版删除了 G1/H2 代码，所以每个删除块都人工复核，会损害 G1/H2 的全部回退。备份引用 `refs/backup/pre_litchi_merge`。
+2. C++：不再把 G1 和 A3 拆成两个仓库分支，而是用 CMake 开关 `ENABLE_TRT_INFERENCE` / `ENABLE_G1_BACKEND` 让两者共存；`deploy.sh --robot X` 按机器人分发（g1 走原流程，a3/a3_ultra 转给新脚本 `deploy_a3.sh`）。
+3. `modular_tracking_env_cfg.robot_type` 默认值保持 `g1`（Litchi 默认 A3，照搬会让现有 G1/H2 配置误加载 A3 资产）。
+4. git 策略（用户要求）：不上传 `*.csv` 和 `*.cmake`，但“不影响复现和代码移植”。因此：
+   - 以 `*.csv`/`*.cmake` 忽略为基线，再对必需的小文件加例外：4 个 A3 CMake 源文件、20 个 A3 样例 CSV、部署运行时 CSV、`a3_motor_model` 数据包、A3/A3 Ultra 的 MJCF/URDF 文本、求解器头文件和静态库、sim2real 参考 CSV。
+   - 发现根目录原有的 `data/` 规则会匹配 `gear_sonic/data/`，导致第一次推送漏掉 `a3_motor_model/` 和 A3 机器人资产（会让干净仓库无法加载 A3 模型）。已改为“重新包含该目录、忽略其子项、再白名单”。
+   - 大资产不进 git，沿用用户自己做的清理 `60065f3`：权重、动作库、数据集、A3 Ultra 网格和 USD。唯一例外是应用户要求加入的 A3（Litchi）104 个 STL 网格（约 20MB，走 Git LFS）。
+   - 已提交推送：`490c7aa`（主体）、`cd9285f`（小文件白名单）、`687bdc7`（A3 网格），分支 `origin/base`。
+
+### 43.3 验证证据
+
+**官方 035 权重的部署验证**
+- 部署包里两个 ONNX 的 SHA256 与 `a3_hf_manifest.json` 一致。
+- 官方 PT 在 MuJoCo sim2sim：`001_walk_front_slow.csv`，1652 步，未摔倒，`all_29_rmse=0.066`，根部倾角最大约 9.6°。
+- ONNX 对 PT 逐步对照：`a3_fast`、`g1` 两个 ONNX 最大差 ≤ 3.8e-6。ONNX 输入布局为“编码器按观测项排列（term-major）640 维 + 本体 930 维”，共 1570 维（试了 4 种拼接，只有这一种吻合）。
+- ONNX 直接驱动 MuJoCo 闭环：两个官方 ONNX 都走完 1652 步，未摔倒（rmse 0.0662 / 0.067）。
+- C++ 探针（部署包自带 ORT 1.16.3，`ramp` 输入）的动作 sum/abs_sum/min/max 与 Python ORT 在 4 位小数内一致，单次推理约 0.87 ms。
+- `deploy.sh --robot a3 --probe`：C++ 部署程序加载了 `g1` 与 `a3_fast` 两个官方 ONNX，不发布指令，随后等待机器人状态。
+- **没验证**：收到真机状态后输出指令这一环（没有真机或假机器人）。
+
+**训练冒烟**（`--robot` 入口，16 环境，2 次迭代，均正常完成）：`a3`（官方 PT 热启动，selected20 动作库）、`a3_ultra`（`robot_filtered_v15_clean/210531`）、`g1`（官方样例动作库，随机初始化）。`h2` 没有本地动作库，没跑。
+
+**pytest**（isaaclab 环境）：`tests` + `gear_sonic/tests` 共 169 个通过、0 个失败，1 个收集错误是环境缺 `msgpack_numpy`（遥操作可选依赖，与 A3 无关）。部署目录的 A3 测试 `test_a3_eval_cli.py`、`test_a3_body_drive_debug_convert.py`：4 通过 1 跳过；同目录的 G1 ZMQ 测试因缺 `zmq` 无法收集（环境问题）。C++ 单测此前 192/200 通过，已知失败项为缺少 `reference/bones_072925_test/` 夹具的 FK 测试，其余失败项没有逐一复核。
+- 对 #42.6 第 7 项：G1 现在有了训练入口层面的冒烟（不是 `eval_agent_trl.py` 的 20 步评估），“G1 零回归”仍不算完整实证。
+
+### 43.4 本次踩到的坑（再次遇到时直接看这里）
+
+- **iceoryx 版本必须一致**：部署包用 2.95.4 编译，conda 的 `iox-roudi` 是 2.0.2，不兼容，表现为一直 “RouDi not found - waiting”。用构建目录编译同版本：`cmake --build build_verify_full --target iox-roudi`（需要 `CPATH`/`LIBRARY_PATH` 指向 conda 的 libacl）。
+- 运行 C++ 时要把 `$CONDA_PREFIX/lib` 加进 `LD_LIBRARY_PATH`，否则 `librclcpp.so` 找不到。
+- 仓库路径含空格会让 `accelerate launch` 拆开 Hydra 参数（`LexerNoViableAltException`）。用无空格软链接路径；此时 Python 的 `sys.path[0]` 是真实路径，`train_agent_trl.py` 已改为同时删除逻辑路径和 realpath，避免 `gear_sonic/trl` 遮盖 HF 的 `trl`。
+- `pip install --target` 装 onnxruntime 时会把 numpy 2.x 一起装进目标目录并遮盖环境 numpy 1.26.4，装完要删掉目标目录里的 numpy。
+- `git check-ignore -v` 会把否定（`!`）规则也打印出来，判断“是否仍被忽略”要看退出码或最后一条是否是 `!`，不要只数输出行数。
+- `download_from_hf.py --help` 只显示 GR00T 那一半的参数；A3 参数（`--robot`、`--component`、`--list`）在统一入口里由 argv 分流，需用 `--robot a3 --list` 验证。默认只下 ONNX + RKNN，PT 要加 `--component pt`。
+- 在 `git push` 到受保护分支 `base` 时，若用户没有明确说要推，工具会拦截；需要用户确认。
+
+### 43.5 数据与官方开源范围
+
+- GR00T 开源：训练代码、检查点、C++ 部署、Bones-SEED（14.2 万条，含 G1 重定向 CSV 与 SOMA BVH，**受限访问，需在 HF 同意许可**）、转换脚本。SOMA 重定向器在外部仓库 NVIDIA/soma-retargeter。
+- Litchi 开源：A3 训练适配、035 检查点、20 条样例 CSV、C++ 部署；**不含**内部动作库、实时重定向和遥操作链路。
+- 本地已有：`soma_proportional.tar.gz`（43G，SOMA BVH）、`data/motion_lib_a3ultra/`、`sample_data/`（G1 仅 1 条）、`a3_data/agibot_a3/`。HF 缓存里的 `datasets--bones-studio--seed` 只有 README，**G1 CSV 没下载**。用户选择自己下载 `g1.tar.gz` 放到 `data/bones_seed/` 后解压，之后由我做 `convert_soma_csv_to_motion_lib.py` 转换和 `--robot g1` 训练冒烟。
+
+### 43.6 遗留项
+
+1. G1 CSV 待用户下载后做转换、过滤、训练冒烟（全量体量很大）。
+2. `sonic_a3_ultra.yaml` 的 `motion_file` 默认值是 `data/motion_lib_a3ultra/robot_filtered`（用户要求保持），本地该目录不存在，现有目录是 `robot_filtered_v15` 和 `robot_filtered_v15_clean`；直接用默认配置训练需先重命名/软链或显式覆盖。
+3. `a3_ultra` 自研 63 DOF 合约没有部署导出；`h2` 没有 C++ 后端；“收到真机状态后输出指令”未验证。
+4. A3 Ultra 的网格（约 36MB，另有重复的 `robot_model/model_data/a3_ultra` 和 35MB 的 `geometries.usd`）不在 git 里。`a3_t2d5_loop_hull_optimized.xml` 引用的两个 `*_hull_optimized.STL` 在 Litchi 公开版本里也没有（上游遗留，035 主流程不用）。
+5. `ROBOT_MODEL_REGISTRY` / `ROBOT_WBC_YAML` 尚未注册 a3 / a3_ultra / h2（目前只有友好报错）。Phase 4（VR 实时重定向）、完整 G1/H2 回归未做。
+6. 清理被 gitignore 的构建目录（`gear_sonic_deploy/build/`、`build_verify_full/`、`dist/`）。
+7. 本条目之后的 README 补充（A3 章节）见仓库根 `README.md`。

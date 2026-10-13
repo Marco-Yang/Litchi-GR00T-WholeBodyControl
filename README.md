@@ -52,6 +52,7 @@ This is the codebase for the **GR00T Whole-Body Control (WBC)** projects. It hos
 - [VR Whole-Body Teleoperation](#vr-whole-body-teleoperation)
 - [Kinematic Planner](#kinematic-planner)
 - [SONIC Training](#sonic-training)
+- [AgiBot A3 / A3 Ultra (`--robot`)](#agibot-a3--a3-ultra---robot)
 - [TODOs](#todos)
 - [What's Included](#whats-included)
   - [Setup](#setup)
@@ -339,6 +340,93 @@ For the full guide including multi-node training, evaluation, ONNX export, and S
 📖 [Installation (Training)](https://nvlabs.github.io/GR00T-WholeBodyControl/getting_started/installation_training.html) |
 [Training Guide](https://nvlabs.github.io/GR00T-WholeBodyControl/user_guide/training.html)
 
+## AgiBot A3 / A3 Ultra (`--robot`)
+
+This repository also carries the AgiBot A3 adaptation of SONIC from
+[Litchi_sonic_for_a3](https://agibottech.github.io/sonic_for_a3/) (035 / step-200k
+checkpoint, MuJoCo sim2sim, AimRT/ROS 2 C++ deploy with ONNX Runtime and RKNN backends).
+Training and deployment select the robot with one flag:
+
+| `--robot` | Training experiment | Deploy (`gear_sonic_deploy/deploy.sh`) | Notes |
+|---|---|---|---|
+| `g1` (default) | `sonic_v1_1` | Original G1 path (TensorRT + `unitree_sdk2`) | Unchanged |
+| `a3` | `sonic_a3_035` | `deploy_a3.sh --robot a3` (ONNX Runtime CPU / RKNN) | AgiBot A3 (T2D5), 29 DOF, 035 contract |
+| `a3_ultra` | `sonic_a3_ultra` | `deploy_a3.sh --robot a3_ultra` | Own T3D0 63-DOF training contract. Deploy currently runs the 035 policy: A3 and A3 Ultra share the hardware platform, but a deploy export of the T3D0 contract does not exist yet |
+| `h2` | `sonic_h2` | not available (no C++ backend yet) | |
+
+The 035 and T3D0 contracts are independent: never reuse one's Kp/Kd for the other.
+
+### Quick start
+
+```bash
+# 1. Weights of the official 035 step-200k checkpoint (size + SHA256 verified, `--list` previews)
+python download_from_hf.py --robot a3                       # default: ONNX + RKNN deploy models (~254 MB)
+python download_from_hf.py --robot a3 --component pt        # PyTorch checkpoint (~402 MB)
+python download_from_hf.py --robot a3 --component all       # also the RK3588 cross-compile sysroot
+
+# 2. MuJoCo sim2sim with the downloaded PT (regression gate, not a safety proof)
+python gear_sonic/scripts/sim2sim_a3_mujoco.py \
+    --checkpoint checkpoints/035_step200000/model_step_200000.pt \
+    --motion a3_data/agibot_a3/001_walk_front_slow.csv \
+    --encoder-mode a3_fast --batch-once
+
+# 3. Deploy: downloads ONNX if missing, builds dist/a3_deploy_<arch>/, then launches
+gear_sonic_deploy/deploy.sh --robot a3 -- --probe          # receive + inference, no commands sent
+gear_sonic_deploy/deploy.sh --robot a3_ultra --build-only  # build the package only
+
+# 4. Training: the robot flag expands to +exp=manager/universal_token/all_modes/<exp>
+accelerate launch --num_processes=1 gear_sonic/train_agent_trl.py --robot a3 \
+    checkpoint=checkpoints/035_step200000/model_step_200000.pt +resume=false \
+    headless=true num_envs=4096 \
+    "++manager_env.commands.motion.motion_lib_cfg.motion_file=[/abs/path/to/a3_motionlib]"
+python gear_sonic/train_agent_trl.py --robot a3_ultra ...   # same flag for the other robots
+```
+
+Verified with the official weights: ONNX matches the PT policy to better than 4e-6 per step,
+and the PT and both ONNX models complete a 1652-step MuJoCo walk without falling. Always
+validate in MuJoCo and use a safety gantry before touching a real robot.
+
+### Data
+
+| Source | What it is | Where |
+|---|---|---|
+| `a3_data/agibot_a3/*.csv` | 20 flat A3 sample motions shipped with the release | in git |
+| Bones-SEED G1 CSV (`g1.tar.gz`) | Gated dataset, accept the license on Hugging Face first | `data/bones_seed/` (not in git) |
+| `data_process/convert_a3_csv_to_motion_lib.py` | A3 flat CSV to motion-lib PKL | |
+| `data_process/batch_retarget_bvh_soma_a3ultra.py` | SOMA BVH to A3 Ultra motion-lib | |
+
+The internal motion dataset used for the 035 checkpoint is not released. The SOMA
+retargeter itself lives in [NVIDIA/soma-retargeter](https://github.com/NVIDIA/soma-retargeter).
+
+### Environment notes (C++ deploy and training)
+
+- **ROS 2 Humble through conda (robostack).** Use `empy==3.3.4` (empy 4.x breaks `rosidl`),
+  and install conda `libacl`. Export `CPATH=$CONDA_PREFIX/include` and
+  `LIBRARY_PATH=$CONDA_PREFIX/lib` for the build, and add `$CONDA_PREFIX/lib` to
+  `LD_LIBRARY_PATH` to run (otherwise `librclcpp.so` is not found).
+- **Python for the build**: `build_a3_deploy_pkg.sh` uses `$GS_PYTHON3_EXECUTABLE`, otherwise
+  `$CONDA_PREFIX/bin/python3`, so it does not pick up the system Python 3.12.
+- **iceoryx RouDi**: the deploy package is built against iceoryx 2.95.4 and needs a RouDi of the
+  same version. conda's `iox-roudi` (2.0.2) is incompatible and the deploy waits forever with
+  "RouDi not found". Build the matching one with
+  `cmake --build <build_dir> --target iox-roudi`.
+- **TensorRT-free build**: A3 packages use `-DENABLE_TRT_INFERENCE=OFF -DENABLE_A3_AIMRT_BACKEND=ON`;
+  the G1 binary needs `ENABLE_G1_BACKEND` (default on when TensorRT is enabled).
+- **Paths with spaces**: `accelerate launch` splits Hydra overrides at spaces. Check the repo out
+  to a path without spaces, or use a symlink for training.
+- **Isaac Sim**: run in a clean environment (do not activate other conda envs first);
+  `app.close()` can hang, so scripts exit with `os._exit(0)`.
+- **transformers 5.x** has no `TrainingArguments.logging_dir`; the trainer handles this.
+
+### Git policy for A3 files
+
+Large assets are not committed: weights (`*.pt`, `*.onnx`, `*.rknn`), motion libraries, downloaded
+datasets (`data/`), A3 Ultra meshes and USD. Small files needed to reproduce the pipeline are
+whitelisted in `.gitignore`: A3 CMake sources, sample CSVs, `gear_sonic/data/a3_motor_model/`,
+A3 MJCF/URDF and A3 STL meshes (Git LFS). Fetch weights with `download_from_hf.py`.
+
+Full integration notes: [`docs/workflow/a3_integration_plan.md`](docs/workflow/a3_integration_plan.md)
+and the [A3 training contract](docs/a3_035_training_contract.md).
 
 ## TODOs
 
