@@ -403,6 +403,8 @@ python gear_sonic/scripts/run_sim_loop.py --robot a3_ultra   # terminal 1: MuJoC
 gear_sonic_deploy/deploy.sh --robot a3_ultra sim             # terminal 2: unchanged C++ deploy binary (keys S, M, R / T, 3)
 ```
 
+For the real robot see `docs/notes/a3/pico_real_teleop.md` (IDLE start, two machines, preflight / probe, emergency stop; not yet run on hardware).
+To run SONIC on the operator PC instead of the MDU (no ROS 2 on the robot link): `./deploy.sh … real --teleop-input zmq --robot-link zmq --relay-host <MDU>` talks to `a3_zmq_relay` on the MDU (guard + hold-then-damp failsafe; guide section 4.6; verified in MuJoCo only).
 See `docs/notes/a3/mujoco_pico_sim_teleop.md` for the full A3 / A3 Ultra MuJoCo + Pico tutorial (three terminals; `docs/notes/g1/mujoco_pico_sim_teleop.md` section 8 is the short version) and
 `docs/workflow/a3_integration_plan.md` section 14 for what was and was not verified on A3 Ultra.
 

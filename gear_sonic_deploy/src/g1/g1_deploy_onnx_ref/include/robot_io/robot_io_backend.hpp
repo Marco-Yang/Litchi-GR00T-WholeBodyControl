@@ -95,6 +95,18 @@ class RobotIOBackend {
 
   virtual bool SendCommand(const RobotCommand& cmd) = 0;
 
+  // The operator (re-)enables the robot (IDLE / PASSIVE -> PD stand, ...): called before the first command of the new enable.  Backends
+  // with a session / arming handshake (A3ZmqBackend) start a fresh one here, so a relay that latched its failsafe can be taken over
+  // again without restarting the deploy.
+  virtual void NotifyEnable() {}
+
+  // True while the link to the robot has failed in a way the deploy must answer by disabling the robot (G1 does the same: a failed
+  // safety check stops control and sends damping).  `reason` receives a one-line explanation.
+  virtual bool LinkFault(std::string* reason) {
+    (void)reason;
+    return false;
+  }
+
   virtual std::string Name() const = 0;
   virtual double StateRateHz() const = 0;
 };

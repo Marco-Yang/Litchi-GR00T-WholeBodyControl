@@ -474,6 +474,12 @@ configure_and_build() {
     echo "note: CMake target a3_ta_bridge is not available (needs the TA protobuf bindings); the Pico" >&2
     echo "      --encoder a3-fast / g1 operator chain cannot start its bridge from this package" >&2
   fi
+  # Robot-side half of "deploy on the operator PC" (scripts/a3_relay_sim.sh, docs/notes/a3/pico_real_teleop.md 4.6).
+  if cmake_target_exists "${BUILD_DIR}" "a3_zmq_relay"; then
+    cmake --build "${BUILD_DIR}" --target a3_zmq_relay -j"${JOBS}"
+  else
+    echo "note: CMake target a3_zmq_relay is not available; the package has no ZMQ relay" >&2
+  fi
   if cmake_target_exists "${BUILD_DIR}" "a3_body_drive_debug_record"; then
     cmake --build "${BUILD_DIR}" --target a3_body_drive_debug_record -j"${JOBS}"
   else
@@ -511,7 +517,7 @@ stage_x86_64_onnxruntime_libs() {
   local resolved_libs=()
   local exe lib cache_lib real_lib lib_dir copied=0
 
-  for exe in "${PKG_DIR}/a3_deploy_onnx_ref" "${PKG_DIR}/a3_policy_runtime_probe"; do
+  for exe in "${PKG_DIR}/a3_deploy_onnx_ref" "${PKG_DIR}/a3_policy_runtime_probe" "${PKG_DIR}/a3_zmq_relay"; do
     [[ -x "${exe}" ]] || continue
     while IFS= read -r lib; do
       [[ "${lib}" == /* && -e "${lib}" ]] || continue
@@ -1088,6 +1094,10 @@ elif [[ -f /opt/ros/humble/setup.bash ]]; then
 fi
 
 echo "[a3] transport=${A3_TRANSPORT} aimrt_cfg=${A3_AIMRT_CFG}"
+if [[ "${A3_RUN_TARGET:-deploy}" == "relay" ]]; then
+  # robot-side ZMQ relay (run_a3_relay.sh): same environment, no policy / runtime config
+  exec "${SCRIPT_DIR}/a3_zmq_relay" --aimrt-cfg "${A3_AIMRT_CFG}" "$@"
+fi
 # A3_RUNTIME_CFG overrides the packaged runtime config (deploy.sh --encoder / --smpl-model generate one);
 # a second --runtime-cfg in "$@" would be ignored because the first occurrence wins.
 exec "${SCRIPT_DIR}/a3_deploy_onnx_ref" \
@@ -1111,7 +1121,19 @@ exec "${SCRIPT_DIR}/run_a3.sh" \
   "$@"
 RUN_A3_PROBE
 
-  chmod +x "${PKG_DIR}/run_a3.sh" "${PKG_DIR}/run_a3_probe.sh"
+  cat > "${PKG_DIR}/run_a3_relay.sh" <<'RUN_A3_RELAY'
+#!/usr/bin/env bash
+# Robot-side ZMQ relay: a3_zmq_relay with the package's environment (robot env, transport, libraries).  Run it on the MDU.
+#   ./run_a3_relay.sh --bind 10.42.10.12 --allow-peer <operator PC address> [--listen-only]   (see --help of a3_zmq_relay)
+set -euo pipefail
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+A3_RUN_TARGET=relay exec "${SCRIPT_DIR}/run_a3.sh" "$@"
+RUN_A3_RELAY
+
+  chmod +x "${PKG_DIR}/run_a3.sh" "${PKG_DIR}/run_a3_probe.sh" "${PKG_DIR}/run_a3_relay.sh"
+  install -m 0755 "${SCRIPT_DIR}/a3_relay_tool.py" "${PKG_DIR}/a3_relay_tool.py"
+  # read-only real-robot preflight (run it on the MDU before the probe; docs/notes/a3/pico_real_teleop.md)
+  install -m 0755 "${SCRIPT_DIR}/a3_real_preflight.sh" "${PKG_DIR}/a3_real_preflight.sh"
 }
 
 stage_extra_libs() {
@@ -1258,11 +1280,14 @@ verify_package() {
     echo "missing Rockchip RKNN runtime library: librknnrt.so" >&2
     exit 1
   fi
+  if [[ ! -x "${PKG_DIR}/a3_zmq_relay" ]]; then
+    echo "warning: ${PKG_DIR}/a3_zmq_relay missing: run_a3_relay.sh / --robot-link zmq cannot be used with this package" >&2
+  fi
   if [[ ! -x "${PKG_DIR}/a3_ta_bridge" ]]; then
     echo "warning: ${PKG_DIR}/a3_ta_bridge missing: scripts/a3_operator_chain.sh (--encoder a3-fast / g1) cannot start its bridge" >&2
   fi
   local exe needed
-  for exe in "${PKG_DIR}/a3_deploy_onnx_ref" "${PKG_DIR}/a3_policy_runtime_probe"; do
+  for exe in "${PKG_DIR}/a3_deploy_onnx_ref" "${PKG_DIR}/a3_policy_runtime_probe" "${PKG_DIR}/a3_zmq_relay"; do
     while IFS= read -r needed; do
       if [[ "${needed}" == libonnxruntime*.so* && ! -e "${PKG_DIR}/${needed}" ]]; then
         echo "missing packaged ONNX Runtime library required by $(basename "${exe}"): ${needed}" >&2

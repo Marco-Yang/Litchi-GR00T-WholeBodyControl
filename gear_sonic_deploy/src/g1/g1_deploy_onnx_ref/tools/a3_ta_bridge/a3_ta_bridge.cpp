@@ -10,7 +10,11 @@
 // AimRT runtime needs to run on the sender side.
 //
 //   a3_ta_bridge --zmq tcp://127.0.0.1:5560 [--topic /ta/whole_body_command]
-//                [--max-age-ms 200] [--print-every 100] [--dry-run]
+//                [--max-age-ms 200] [--print-every 100] [--qos reliable|best_effort] [--dry-run]
+//
+// QoS: the default is RELIABLE.  A best_effort publisher cannot reach a reliable subscription (ROS 2 QoS rule), and the real-robot
+// AimRT config (config/a3_aimrt_config.iceoryx.yaml) subscribes /ta/whole_body_command with reliable QoS, while the simulator config
+// (config/a3_aimrt_config.ros2.yaml) uses best_effort; a reliable publisher matches both.
 //
 // Safety: nothing is published when no valid a3_ref frame arrived within --max-age-ms; the
 // receiver then falls back to its stale-hold / stand logic. Frames are re-stamped with the
@@ -49,6 +53,7 @@ struct Args {
   std::string topic = "/ta/whole_body_command";
   double max_age_ms = 200.0;
   int print_every = 100;
+  std::string qos = "reliable";
   bool dry_run = false;
 };
 
@@ -65,10 +70,11 @@ bool ParseArgs(int argc, char** argv, Args& a) {
     else if (k == "--topic" && next(v)) a.topic = v;
     else if (k == "--max-age-ms" && next(v)) a.max_age_ms = std::atof(v.c_str());
     else if (k == "--print-every" && next(v)) a.print_every = std::atoi(v.c_str());
+    else if (k == "--qos" && next(v) && (v == "reliable" || v == "best_effort")) a.qos = v;
     else if (k == "--dry-run") a.dry_run = true;
     else {
       std::cerr << "usage: a3_ta_bridge [--zmq URL] [--topic T] [--max-age-ms N] "
-                   "[--print-every N] [--dry-run]\n";
+                   "[--print-every N] [--qos reliable|best_effort] [--dry-run]\n";
       return false;
     }
   }
@@ -87,12 +93,13 @@ int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<rclcpp::Node>("a3_ta_bridge");
   const std::string ros_topic = a3_deploy::TaRos2TopicName(args.topic);
-  // Same QoS as the AimRT config (keep_last 10, best_effort, volatile).
-  auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile();
+  // keep_last 10, volatile; reliable by default (see the QoS note at the top of the file).
+  auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).durability_volatile();
+  if (args.qos == "best_effort") qos.best_effort(); else qos.reliable();
   auto pub = node->create_publisher<ros2_plugin_proto::msg::RosMsgWrapper>(ros_topic, qos);
   const char* domain = std::getenv("ROS_DOMAIN_ID");
   const char* lo = std::getenv("ROS_LOCALHOST_ONLY");
-  std::cout << "[a3_ta_bridge] ROS2 topic: " << ros_topic << "  (ROS_DOMAIN_ID="
+  std::cout << "[a3_ta_bridge] ROS2 topic: " << ros_topic << "  qos=" << args.qos << "  (ROS_DOMAIN_ID="
             << (domain ? domain : "0 [default]") << ", ROS_LOCALHOST_ONLY=" << (lo ? lo : "unset")
             << ")\n";
   if (domain == nullptr || std::string(domain) == "0") {

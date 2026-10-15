@@ -3,7 +3,7 @@
 # Operator-side chain of the A3 / A3 Ultra Pico teleop: everything between
 # pico_manager_thread_server.py and the deploy binary, selected with --encoder.
 #
-#   scripts/a3_operator_chain.sh --encoder a3-fast|g1|smpl [--pico-host HOST] [--pico-port 5556]
+#   scripts/a3_operator_chain.sh --encoder a3-fast|g1|smpl [--pico-host HOST] [--pico-port 5556] [--real] [--no-bridge]
 #
 #   a3-fast / g1 : a3_teleop_retarget_node.py --mode a3-ref  (Pico SMPL -> A3 joint references, ZMQ :5560)
 #                  + a3_ta_bridge (ZMQ :5560 -> ROS2 /ta/whole_body_command).  Needs the ROS2 environment of the
@@ -13,6 +13,12 @@
 #
 # deploy.sh starts this next to the deploy binary for `--input-type zmq_manager` (sim / one machine).  On the real
 # robot run it on the operator PC and start deploy.sh on the robot with `--no-chain`.
+# --no-bridge : a3-fast / g1 only: start the retarget node but not a3_ta_bridge.  The deploy then reads the `a3_ref` ZMQ stream
+#          (tcp://<this PC>:5560) itself (`--teleop-input zmq`): no ROS 2 at all on this side, nothing published on the robot
+#          network.  deploy.sh passes it together with --teleop-input zmq.
+# --real : the robot is a real one on the network (a3-fast / g1): refuse to start unless ROS_DOMAIN_ID is set (not 0) and
+#          ROS_LOCALHOST_ONLY is not 1, because /ta/whole_body_command must reach the robot's AimRT.  Nothing else may publish that
+#          topic meanwhile (the vendor's own TA / teleop stack).  deploy.sh passes it for `real`.
 # Environment: A3_RETARGET_PYTHON (python with mujoco + mink + GMR + pyzmq, default: conda env gmr).
 #   a3-fast / g1 additionally need the ROS2 environment of the robot's network, because a3_ta_bridge publishes
 #   /ta/whole_body_command over ROS2: set ROS_DOMAIN_ID (and ROS_LOCALHOST_ONLY=0 across machines) like the robot, and
@@ -29,16 +35,37 @@ REPO_ROOT="$(cd -- "${GEAR_ROOT}/.." && pwd)"
 ENCODER="a3-fast"
 PICO_HOST="localhost"
 PICO_PORT=5556
+REAL=0
+NO_BRIDGE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --encoder)   ENCODER="$2"; shift 2 ;;
     --pico-host) PICO_HOST="$2"; shift 2 ;;
     --pico-port) PICO_PORT="$2"; shift 2 ;;
+    --real)      REAL=1; shift ;;
+    --no-bridge) NO_BRIDGE=1; shift ;;
     -h|--help)   sed -n 2,22p "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "a3_operator_chain.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
 case "${ENCODER}" in a3-fast|a3_fast|g1|smpl) ;; *) echo "--encoder must be a3-fast, g1 or smpl" >&2; exit 2 ;; esac
+
+if [[ "${REAL}" == "1" && "${ENCODER}" != "smpl" && "${NO_BRIDGE}" != "1" ]]; then
+  if [[ -z "${ROS_DOMAIN_ID:-}" || "${ROS_DOMAIN_ID}" == "0" ]]; then
+    echo "[a3-chain] --real: set ROS_DOMAIN_ID to the robot's domain (unset / 0 is shared with every ROS 2 participant)" >&2; exit 66
+  fi
+  if [[ "${ROS_LOCALHOST_ONLY:-0}" == "1" ]]; then
+    echo "[a3-chain] --real: ROS_LOCALHOST_ONLY=1 keeps /ta/whole_body_command on this PC; export ROS_LOCALHOST_ONLY=0" >&2; exit 66
+  fi
+  echo "[a3-chain] real robot: ROS_DOMAIN_ID=${ROS_DOMAIN_ID} ROS_LOCALHOST_ONLY=${ROS_LOCALHOST_ONLY:-0} RMW=${RMW_IMPLEMENTATION:-default}; nothing else may publish /ta/whole_body_command"
+  if [[ "${RMW_IMPLEMENTATION:-}" != "rmw_cyclonedds_cpp" ]]; then
+    echo "[a3-chain] WARNING: RMW is not rmw_cyclonedds_cpp.  The conda Humble Fast DDS 2.6.4 allocates tens of GB when another host in the domain" >&2
+    echo "[a3-chain]   announces malformed ros_discovery_info (plan 9.7 / 18.6) and can freeze this PC.  Recommended: RMW_IMPLEMENTATION=rmw_cyclonedds_cpp," >&2
+    echo "[a3-chain]   CYCLONEDDS_URI pinned to the robot NIC, and a memory cap (systemd-run --user --scope -p MemoryMax=2G -p MemorySwapMax=0)." >&2
+  elif [[ -z "${CYCLONEDDS_URI:-}" ]]; then
+    echo "[a3-chain] WARNING: CYCLONEDDS_URI is not set: Cyclone DDS will announce on every NIC (Wi-Fi, Tailscale, virtual); pin it to the robot NIC" >&2
+  fi
+fi
 
 case "$(uname -m)" in
   x86_64)        ARCH="x86_64" ;;
@@ -67,6 +94,12 @@ else
       --pico-host "${PICO_HOST}" --pico-port "${PICO_PORT}" --out-port 5560 </dev/null &
   CHILDREN+=("$!")
   sleep 1
+  if [[ "${NO_BRIDGE}" == "1" ]]; then
+    echo "[a3-chain] --no-bridge: the deploy reads tcp://<this PC>:5560 'a3_ref' itself (--teleop-input zmq); no ROS 2 on this side"
+    wait -n "${CHILDREN[@]}" || true
+    echo "[a3-chain] a chain process exited; stopping the rest"
+    exit 0
+  fi
   [[ -x "${PKG_DIR}/a3_ta_bridge" ]] || { echo "[a3-chain] ${PKG_DIR}/a3_ta_bridge missing (build the package: deploy.sh --robot a3_ultra --build-only)" >&2; exit 66; }
   BRIDGE_LD="${PKG_DIR}:${LD_LIBRARY_PATH:-}"
   if LD_LIBRARY_PATH="${BRIDGE_LD}" ldd "${PKG_DIR}/a3_ta_bridge" 2>/dev/null | grep -q "not found"; then

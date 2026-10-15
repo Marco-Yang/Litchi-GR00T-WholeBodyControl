@@ -341,10 +341,9 @@ PYTHONPATH=. /home/user/miniconda3/envs/gmr/bin/python gear_sonic/scripts/pico_p
 ```bash
 # 操作端 PC（连头显的那台）：Pico 服务 + 操作端链路（a3-fast 经 ROS2 把 /ta/whole_body_command 发给机器人，要与机器人同一 ROS_DOMAIN_ID）
 python gear_sonic/scripts/pico_manager_thread_server.py --robot a3_ultra --manager --num_frames_to_send 10
-gear_sonic_deploy/scripts/a3_operator_chain.sh --encoder a3-fast        # 或 --encoder smpl
-# 机器人上：--no-chain = 不在本机起操作端链路；smpl 时 --zmq-host 是操作端 PC 的 IP
-./deploy.sh --robot a3_ultra --input-type zmq_manager --no-chain real --encoder a3-fast   # 不要与终端 1 同时开
-./deploy.sh --robot a3_ultra --input-type zmq_manager --no-chain --zmq-host <操作端IP> real --encoder smpl --smpl-model /path/model_step_N_smpl.onnx
+gear_sonic_deploy/scripts/a3_operator_chain.sh --encoder a3-fast --real
+# 机器人上（--no-chain = 不在本机起操作端链路；--zmq-host 必须是操作端 PC 的 IP，否则收不到手柄的 A+B+X+Y）。真机以 IDLE 启动，按 S 才进 PD 站立
+./deploy.sh --robot a3_ultra --input-type zmq_manager --no-chain --zmq-host <操作端IP> real --encoder a3-fast   # 不要与终端 1 同时开
 ```
 
-真机侧用你站点自己的 `A3_TRANSPORT` / `ROS_DOMAIN_ID` / `A3_ROBOT_ENV`（见 `docs/a3_training2sim2deploy.md` 第 6 节）；上真机前务必阅读 `docs/workflow/a3_integration_plan.md` 12.7 的未验证项。
+**真机的完整流程（两台机器、aarch64 包、`sm_config`、preflight / probe、急停与失效行为、未验证项）见 [../a3/pico_real_teleop.md](../a3/pico_real_teleop.md)。**

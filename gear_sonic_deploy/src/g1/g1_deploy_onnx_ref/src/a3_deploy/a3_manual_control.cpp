@@ -363,6 +363,7 @@ void RequestDeployMode(ManualControlState& control,
   }
   if (next != DeployMode::kTeleop) {
     control.teleop_input_paused.store(false, std::memory_order_release);
+    control.teleop_policy_stand.store(false, std::memory_order_release);
   }
   log << "[mode] " << DeployModeName(prev) << " -> "
       << DeployModeName(next);
@@ -511,6 +512,7 @@ ManualKeyOutcome HandleManualKey(
       return ManualKeyOutcome::kHandled;
     case TransitionAction::kEnterTeleop:
       control.teleop_input_paused.store(false, std::memory_order_release);
+      control.teleop_policy_stand.store(false, std::memory_order_release);
       control.teleop_command_epoch.fetch_add(1, std::memory_order_acq_rel);
       RequestDeployMode(control, DeployMode::kTeleop, log);
       return ManualKeyOutcome::kHandled;

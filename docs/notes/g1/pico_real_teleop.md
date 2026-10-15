@@ -242,7 +242,9 @@ pkill -INT -x g1_deploy_onnx_ref || pkill -TERM -x g1_deploy_onnx_ref
 
 本机现有的真机是 **A3 Ultra**。权重用下载的 035（`a3` 与 `a3_ultra` 共用）。策略只驱动 29 个身体关节；多出来的头关节保持默认姿态，手指不驱动。不要和仿真同时开。
 
-PICO 的连接、IP 和 PC Service 与第 1 节相同。操作顺序与 G1 / 仿真第 8 节一致：等 **`Init Done`** → **A+B+X+Y** → 吊带卸力站稳 → **A+X**（POSE）。A3 没有 planner 策略，只有 POSE 流会持续推姿态。
+**A3 真机有单独的教程：[../a3/pico_real_teleop.md](../a3/pico_real_teleop.md)**（两台机器、aarch64 包、`sm_config`、preflight / probe、急停与失效行为），以及**部署进程放在本机、通过 ZMQ 中继连机器人**的路线（第 4.6 节）。下面是摘要。
+
+PICO 的连接、IP 和 PC Service 与第 1 节相同。操作顺序和 G1 一致：部署程序以 **IDLE** 启动、不发指令 → 机器人悬空时按 **A+B+X+Y**（或键盘 `S`）让机器人**硬起来**并保持默认站立姿态（PD 站立，打印 `Init Done`）→ 放下吊带站稳 → **A+X**（开始跟随，遥操）→ 再按 **A+X** 回到默认站立姿态 → **A+B+X+Y** 失能（passive）。A3 没有 planner 策略，站立姿态由 PD 站立承担。链路 / 状态流失联时部署程序自己失能，姿态流静默 1 秒回到站立姿态。
 
 ### 终端 1 — C++ 策略
 
@@ -253,18 +255,18 @@ cd /tmp/gwbc/gear_sonic_deploy
 ./deploy.sh --robot a3_ultra --input-type zmq_manager real --encoder a3-fast
 ```
 
-`--encoder a3-fast`（默认）：这条命令会在部署程序旁边启动 `a3_teleop_retarget_node.py`（PICO 的 SMPL → A3 关节）和 `a3_ta_bridge`（发到 `/ta/whole_body_command`），并自动进入 PD 站立、监听 Pico 的 ZMQ `command`（A+B+X+Y）。`--encoder smpl --smpl-model <onnx>` 需要 SMPL-encoder 模型，**A3 / A3 Ultra 目前没有**。`real` 使用现场的 `A3_TRANSPORT`、`ROS_DOMAIN_ID`、`A3_ROBOT_ENV`，**不要**沿用仿真的 `ROS_DOMAIN_ID=87` 和 `ROS_LOCALHOST_ONLY=1`。
+`--encoder a3-fast`（默认）：这条命令会在部署程序旁边启动 `a3_teleop_retarget_node.py`（PICO 的 SMPL → A3 关节）和 `a3_ta_bridge`（发到 `/ta/whole_body_command`），并监听 Pico 的 ZMQ `command`（A+B+X+Y / A+X）；**不会**自动进入 PD 站立（A+B+X+Y 或按 `S`）。启动前会打印 REAL ROBOT 横幅并要求确认。`--encoder smpl --smpl-model <onnx>` 需要 SMPL-encoder 模型，**A3 / A3 Ultra 目前没有**。`real` 使用现场的 `A3_TRANSPORT`、`ROS_DOMAIN_ID`、`A3_ROBOT_ENV`，**不要**沿用仿真的 `ROS_DOMAIN_ID=87` 和 `ROS_LOCALHOST_ONLY=1`。
 
 机器人上通常没有 GMR / mujoco 环境，这时把操作端链路放到连头显的 PC 上、机器人只跑部署：
 
 ```bash
 # 操作端 PC（与机器人同一 ROS_DOMAIN_ID 的网络里）
-gear_sonic_deploy/scripts/a3_operator_chain.sh --encoder a3-fast
+gear_sonic_deploy/scripts/a3_operator_chain.sh --encoder a3-fast --real
 # 机器人上
 ./deploy.sh --robot a3_ultra --input-type zmq_manager --no-chain --zmq-host <操作端IP> real --encoder a3-fast
 ```
 
-首次在吊带下进行。等到 **`Init Done`** 后：A+B+X+Y 启动遥操，吊带卸力站稳后再 A+X。键盘备份：
+首次在吊带下进行。按 `S` 等到 **`Init Done`**，放下吊带站稳后：A+B+X+Y 启动遥操，再 A+X。键盘备份：
 
 | 键 | 作用 |
 |---|---|

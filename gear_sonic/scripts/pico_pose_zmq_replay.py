@@ -11,12 +11,21 @@ without a Pico.
 
     python gear_sonic/scripts/pico_pose_zmq_replay.py \
         --clip sample_data/smpl_filtered/walk_forward_amateur_001__A001.pkl --loop
+
+``--commands`` also stands in for the controller buttons (the "command" topic of the real Pico manager, same state machine): press
+``y`` for A+B+X+Y (disabled -> stand, enabled -> disable) and ``x`` for A+X (stand <-> follow) in THIS terminal (``--command-fifo`` takes the
+same letters from a named pipe, for scripted runs).
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import defaultdict, deque
+import os
+import queue
+import select
+import sys
+import threading
 import time
 
 import joblib
@@ -67,6 +76,8 @@ def main() -> None:
     ap.add_argument("--stand-seconds", type=float, default=2.0, help="hold the first frame this long before playing")
     ap.add_argument("--loop", action="store_true")
     ap.add_argument("--topic", default="pose")
+    ap.add_argument("--commands", action="store_true", help="read y (A+B+X+Y) / x (A+X) from this terminal and publish the Pico 'command' messages")
+    ap.add_argument("--command-fifo", default="", help="read the same letters from this named pipe (created if missing)")
     args = ap.parse_args()
 
     if args.clip.startswith("synthetic:"):
@@ -87,6 +98,63 @@ def main() -> None:
     print(f"[replay] publishing '{args.topic}' on tcp://*:{args.port}  clip={args.clip} frames={i0}..{i1} @{clip_fps} fps")
     time.sleep(0.5)  # let subscribers connect
 
+    cmd_q: queue.SimpleQueue = queue.SimpleQueue()
+    if args.commands or args.command_fifo:
+        from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_command_message
+
+        # the manager's very first message, then one message per mode switch (gear_sonic/scripts/pico_manager_thread_server.py)
+        sock.send(build_command_message(start=False, stop=False, planner=False))
+        state = {"mode": "OFF"}
+
+        def handle(key: str) -> None:
+            mode = state["mode"]
+            if key == "y":
+                if mode == "OFF":
+                    state["mode"] = "PLANNER"
+                    cmd_q.put((build_command_message(start=True, stop=False, planner=True), "A+B+X+Y: start (stand)"))
+                else:
+                    state["mode"] = "OFF"
+                    cmd_q.put((build_command_message(start=False, stop=True, planner=True), "A+B+X+Y: stop (disable)"))
+            elif key == "x" and mode != "OFF":
+                if mode == "PLANNER":
+                    state["mode"] = "POSE"
+                    cmd_q.put((build_command_message(start=True, stop=False, planner=False), "A+X: POSE (follow)"))
+                else:
+                    state["mode"] = "PLANNER"
+                    cmd_q.put((build_command_message(start=True, stop=False, planner=True), "A+X: back to PLANNER (stand)"))
+
+        def key_thread() -> None:
+            fifo_fd = None
+            if args.command_fifo:
+                if not os.path.exists(args.command_fifo):
+                    os.mkfifo(args.command_fifo)
+                fifo_fd = os.open(args.command_fifo, os.O_RDWR | os.O_NONBLOCK)  # read-write: never sees EOF when a writer closes
+            tty_ok = args.commands and sys.stdin.isatty()
+            old = None
+            if tty_ok:
+                import termios
+                import tty
+
+                old = termios.tcgetattr(sys.stdin)
+                tty.setcbreak(sys.stdin.fileno())
+            try:
+                fds = [fd for fd in (sys.stdin if tty_ok else None, fifo_fd) if fd is not None]
+                while True:
+                    ready, _, _ = select.select(fds, [], [], 0.2)
+                    for fd in ready:
+                        try:
+                            data = os.read(fd if isinstance(fd, int) else fd.fileno(), 64)
+                        except BlockingIOError:
+                            continue
+                        for ch in data.decode(errors="ignore"):
+                            handle(ch.lower())
+            finally:
+                if old is not None:
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+
+        threading.Thread(target=key_thread, daemon=True).start()
+        print("[replay] command keys: y = A+B+X+Y (disabled -> stand, enabled -> disable), x = A+X (stand <-> follow)")
+
     buf: dict[str, deque] = defaultdict(lambda: deque(maxlen=args.num_frames_to_send))
     dt = 1.0 / args.target_fps
     step = 0
@@ -96,6 +164,10 @@ def main() -> None:
         while True:
             n_play = int((i1 - i0) / clip_fps * args.target_fps)
             for k in range(stand_steps + n_play):
+                while not cmd_q.empty():
+                    msg_bytes, label = cmd_q.get()
+                    sock.send(msg_bytes)
+                    print(f"[replay] {label}")
                 t_clip = 0.0 if k < stand_steps else (k - stand_steps) / args.target_fps
                 idx = min(i1 - 1, i0 + int(round(t_clip * clip_fps)))
                 smpl_pose, smpl_joints, body_quat_w = frame_from_pose_aa(pose_aa[idx], fk)

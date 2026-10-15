@@ -2640,3 +2640,203 @@ conda run -n isaaclab python gear_sonic/eval_agent_trl.py \
 - 所有验证进程都按各自的 PID 结束，没有碰你的会话（开始前 5556 / 5557 / 5560 / 5561 都空，结束后也空）。
 
 **教程内容**：架构图与和 G1 的区别表；一次性准备；连头显（指向 G1 文档第 1 节）；三个终端的命令与每个终端该看到的日志；第一次遥操（A+B+X+Y → `9` → A+X）；急停；键盘备份；没有头显时的联调；常见问题；这份文档验证过 / 没验证什么；真机（指向 plan 12.7，未验证）。G1 文档第 8 节加了指向它的链接，README 的链接改指它。
+
+## 51. [2026-10-15，接 #50] 真机部署审查与修补（详见 plan 第 18 节）
+
+**要求**：MuJoCo 没问题了，开始部署真机；先检查真机部署的逻辑完整性和代码准确性；仿照 `docs/notes/g1/pico_real_teleop.md` 和 Litchi 的真机部署逻辑实现 A3 真机部署，MuJoCo 里要按 `9` 松绳。
+
+- **审查**：把改过的 C++ / 脚本与 Litchi 原版逐个 diff，通读真机路径，对照 Litchi `docs/a3_training2sim2deploy.md` 6.1 / 6.2。发现 11 条（plan 18.1）。
+- **修了**：① 真机启动后自动进 PD 站立（违反 Litchi “以 IDLE 启动、不发指令”）→ 新增 `--auto-pd-stand`，只对仿真开；② `a3_ta_bridge` best_effort 连不上真机配置里 reliable 的订阅 → 默认 reliable（rclpy 实测 0 / 201 vs 全收）；③ 真机示例漏了 `--zmq-host`；④ 缺 Litchi 的前置（`motion_control` 互斥、aarch64 包、probe）。新增 `a3_real_preflight.sh`（随包）、`a3_operator_chain.sh --real` 检查、`deploy_a3.sh real` 横幅 + 确认、`docs/notes/a3/pico_real_teleop.md`；仿真教程里松绳按 `9`，环境变量只留给无窗口的自动化测试。
+- **没改、列给你决定**：失联保护（参考流中断 `hold_last`、Pico 停止是单条消息无心跳）、停止是否映射到 passive（kp = kd = 0，真机瘫软）、颈部指令名（Ultra）、关节限位裁剪。目标平台是 RK3588 还是 Thor 也要你确认。
+- **回归**：MuJoCo 无窗口全链路通过（骨盆 1.073–1.075 m，倾角 ≤1.3°，转发 2700+ 帧 0 拒收）；IDLE 启动 `cmd_rx` 恒 0、`S` 后才发；Pico `start` / `stop` 消息 → teleop / passive。测试 `tests/test_a3_real_deploy_scripts.py`（8）。
+- **没有**真机、aarch64 包、RKNN 的任何验证；**没有提交 git**（上一次提交 `c335a6c` 之后的改动都在工作区）。
+- 验证用的小工具（PTY 驱动按键）在会话临时目录；中途用户中断过一次工具调用，之后只在无窗口模式下跑回归，没有再在用户桌面上开 MuJoCo 窗口。
+
+
+## 52. [2026-10-15 21:12–21:17，接 #51] 网线直连 A3 Ultra，确认算力平台（只做连通，没有发指令）
+
+**用户要求**：网线已经接到智元 A3 Ultra，开始确认平台。随后贴了 `enp11s0` 上 8 秒的 tcpdump。要求把结论写入工作日志。
+
+**结论**：这台机器两种平台都有，不是二选一。SONIC 的 aarch64 / RKNN 包部署目标是 **MDU `10.42.10.12`（RK3588）**。**ADU `10.42.10.11` 是 NVIDIA Thor**（网卡 MAC `48:b0:2d:63:4d:4d` 属于 NVIDIA，与智元地址表一致）。Litchi 的 Thor 部署教程仍是 TODO，这次没有往 Thor 上部署。#45 / #51 里“RK3588 还是 Thor”这一条由此关闭。
+
+网线接的是机器人内部网 `eth_hdu`（`10.42.10.0/24`），不是 G1 的 `192.168.123.0/24`。本机网卡 `enp11s0`（NetworkManager 配置 `Wired connection 2`）在原有 `192.168.123.99/24` 之外增加了 **`10.42.10.99/24`**，`ipv4.never-default=yes`、无网关，Wi-Fi 仍是默认出口。四台设备 ping 均为 2/2。
+
+| 地址 | 角色 | 平台 | 依据 |
+|---|---|---|---|
+| 10.42.10.10 | HDU，头部域 | RK3588S2 | 智元 A3 Ultra 接口文档地址表；抓包里它是 PTP 主时钟（MAC `6e:59:13:b5:5c:77`，本地管理地址） |
+| 10.42.10.11 | ADU，具身智能 | NVIDIA Thor | 地址表 + MAC `48:b0:2d:63:4d:4d`（NVIDIA Corporation，OUI 2019-10-25） |
+| 10.42.10.12 | MDU，运动控制 | RK3588 | 地址表；最靠近执行器。MAC `b6:f8:f9:86:27:bb`（本地管理地址）。ping TTL 64，约 0.3–0.6 ms |
+| 10.42.10.150 | 同网上的另一台设备 | 网卡厂商 DJI Baiwang（MAC `ec:72:f7:0f:1f:22`） | 不是三块工控机。TTL 255 |
+
+地址表出处：[智元 A3 Ultra 详细接口文档](https://open.agibot.com/docs/aimdk/a3-ultra/v3_2/dev_guide/07-00-detailed_interface)（`.10` / `.11` / `.12` 依次为 HDU / ADU / MDU）、[A3 Ultra 概述](https://open.agibot.com/docs/en/aimdk/a3-ultra/v3_2/dev_guide/01-a3_overview)（MDU = RK3588，HDU = RK3588S2，ADU = NVIDIA Thor，三者经 `eth_hdu` `10.42.10.x` 组内部网）。
+
+**过程**
+- 先在 `192.168.123.0/24` 上扫了一遍（含以前 G1 的 `192.168.123.161`）：链路是通的（`enp11s0` UP、1000 Mb/s 全双工），但没有任何邻居应答。
+- 用户的 tcpdump：三块工控机都在发 `239.255.0.1:65400` 组播；`.10` 与 `.150` 还在向 `255.255.255.255:56000` 发 UDP 广播；另有一台 MAC `02:aa:bb:cc:dd:00` 在 ARP 询问 `192.168.7.1`（源 `192.168.7.150`），像 USB gadget，本机不在那个网段，没有跟。
+- 加上 `10.42.10.99/24` 之后：`.10` / `.11` / `.12` / `.150` 都是 2/2 通，TTL 前三台为 64、`.150` 为 255。
+
+**没有做**：没有 SSH、没有调用机上 HTTP / JSON-RPC、没有启动 `deploy.sh real` 或任何会发布关节指令的程序。颈部话题名、IMU、`motion_control` 是否在跑，这次都还没看。
+
+**文件改动**：仅本日志。网卡地址是本机 NetworkManager 配置，不在仓库里。
+
+## 52. [2026-10-15，接 #51] 真机平台确认：MDU = RK3588（10.42.10.12），Thor 是 ADU
+
+用户接了网线，回报（只 ping、没登录、没发指令）：这台 A3 Ultra 三块板都在线，算力平台不是二选一——`10.42.10.10` HDU（RK3588S2，PTP 主时钟，跳板机）、`10.42.10.11` ADU（NVIDIA Thor）、`10.42.10.12` **MDU（RK3588，运动控制，SONIC 的 aarch64 包部署在这里）**；`10.42.10.150` 是同网另一台设备（DJI Baiwang 网卡，不是工控机）。网线接的是机器人内部网 `eth_hdu`（`10.42.10.0/24`），不是 G1 的 `192.168.123.0/24`；本机 `enp11s0` 已加 `10.42.10.99/24`（原 `192.168.123.99/24` 还在，没设网关），我在本机核对了地址和路由。**结论：035 走 MDU（Rockchip / RKNN），Thor 这次不部署（Litchi 的 Thor 教程仍是 TODO）。**
+
+- 已写入 `docs/notes/a3/pico_real_teleop.md`（0.1 平台与网络、0.2 构建前置、机器人上的 `--zmq-host` 用 `10.42.10.99`）和 plan 18.5。
+- **构建 aarch64 包的前置缺三样**：Docker 没装（要 root，等你决定）、sysroot（677 MB）没下载、aarch64 ONNX Runtime 1.19.2 没下载（官方 release 可达）。sysroot 里是 ROS 2 **Jazzy**，操作端是 Humble，互通没验证。我没有下载 / 构建任何东西。
+- 没有登录机器人；机器人的 `ROS_DOMAIN_ID`、`sm_config`、`motion_control` 状态、MDU 上现有包等都还不知道，要你授权登录后才能读。
+- 仍待你决定：停止是否映射 passive、失联保护（plan 18.3 第 2、3 条）。
+
+## 53. [2026-10-15，接 #52] 路线 B 调查：不上 MDU，在本机跑 SONIC；被动探测 DDS 域
+
+用户问能不能不部署到 MDU、像 G1 一样直接在本机跑，并同意做被动探测，还问 Litchi 怎么解决这些问题。
+- **被动探测（只收不发）**：`enp11s0` 加入多播组 `239.255.0.1`，听域 0–232 共 25 秒：`hdu`（10.42.10.10，14 个参与者）、`adu`（10.42.10.11，19 个）、`mdu`（10.42.10.12，20 个）都在**域 232** 用 Fast DDS 广播。没有登录、没有发任何话题。机器人 `ROS_DOMAIN_ID` 很可能是 232（待厂商 `env.sh` 确认）。
+- **Litchi 的设计**：`a3_aimrt_config.iceoryx.yaml` = MDU 本机共享内存；`a3_aimrt_config.ros2.yaml` = “ADU-style cross-board transport”，部署进程跑在别的板子上、body-drive 话题走 ROS 2（best_effort）。我们的仿真一直用后者。结论写进 plan 18.6。
+- **还没做**：以参与者身份加入域 232 列 `/body_drive/*` 与 QoS（要先得到用户同意，并且必须加内存上限和网卡白名单，见 plan 9.7 的内存事故）；`--probe`（不发布指令）量网络抖动；没有改任何代码，没有发布任何话题。
+
+## 54. [2026-10-15，接 #53] “Fast DDS 2.6.4 内存暴涨”追查（含一次更正）
+
+用户问这个问题能不能解决、能不能不加入机器人的域；后来追问“畸形数据是 192.168.110.14 的吗”。全部在 `systemd-run --user --scope -p MemoryMax=2G -p MemorySwapMax=0` 下做，**没有加入机器人的域 232，没有登录、没有发布任何话题**（只在 Wi-Fi 域 0 / 空域 99 / 回环上实验）。
+- **成立的**：Fast DDS 域 0 被 2 GB 上限杀掉（137），整机无事；空域 99 正常（39 MB）；域 0 加 `FILTER_DIFFERENT_HOST`（忽略其它主机）也正常（38 MB）——触发者是其它主机上的参与者。域 0 里唯一可见的另一台 DDS 主机是 `192.168.110.14`（主机名 `ubuntu`，用户 `descfly`，RTPS 2.2 与 2.3 两种；本机和机器人三块板都是 RTPS 2.2）。整条链路（仿真 + 部署 + 桥 + Pico 模拟器）用 `rmw_cyclonedds_cpp` 在回环上跑通，无需重编译。
+- **更正**：我先前说“Cyclone 明确拒绝了那台主机的畸形数据”。对照实验（只有一个不存在的对端、多播关闭）里同样的报错照样出现，所以那是我探测脚本自己的问题，**不是**对端数据的证据，已在 plan 9.7 / 18.7、`pico_real_teleop.md` 0.4 里撤回。没有确定：数据是畸形还是更新的格式、是不是就是 `.14`（没有单独隔离）、机器人域会不会触发、Cyclone ↔ 机器人 Fast DDS 互通。
+- 改动：`a3_operator_chain.sh --real` 在 RMW 不是 Cyclone / 没钉网卡时打印警告；`tests/test_a3_real_deploy_scripts.py` 同步；教程新增 0.4；plan 9.7 补充、新增 18.7。
+- 待定：加入域 232 的只读探测（要用户明确同意）；“PC 完全不碰 DDS”的 ZMQ `a3_ref` 输入（要改 C++ 并交叉编译）。
+- **`.14` 的归属**：用户不知道是不是自己的设备（`ubuntu.lan`、MAC `50:2e:91:0e:04:2c`，本机 2022 年的 OUI 库查不到厂商）。它在共享 Wi-Fi 上，不是我们的设备：**不再探测它，不让用户去停它**，不再追究它是不是触发者；机器人域在另一张有线网，钉 `enp11s0` + 非 0 域就看不到它。
+
+## 55. [2026-10-15，接 #54] 加入机器人的域 232 做只读探测（用户同意，内存上限 16 GB）
+
+- **做法**：`gear_sonic_deploy/scripts/a3_ros_graph_probe.py`（新）——Cyclone RMW、钉 `10.42.10.99`、`ROS_DOMAIN_ID=232`、`systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0`、`timeout 90`，等 15 秒后列话题和 QoS。不发布、不订阅、不起服务（rosout、参数服务关闭，只剩节点自带的发现基础设施）；没有登录机器人；进程已退出，本机内存正常。
+- **结果**：峰值内存 **41 MB**，没有暴涨；339 个话题；Cyclone 与机器人的 Fast DDS 互相发现正常。**SONIC 的 `/body_drive/*` 状态 / 指令话题不在 ROS 2 上**（只有 `/body_drive/leg_joint_command_ros2` 一个发布者）；机器人暴露的是厂商 motion_control 层 `/motion/control/*`。`/ta/whole_body_command`：没有发布者、**2 个 best_effort 订阅者（身份未知）**。
+- **结论**：①“在 PC 上跑 SONIC”按现状走不通 → 走 **MDU 部署**（要 Docker、sysroot、aarch64 ONNX Runtime）；②桥的 reliable QoS 与已有订阅者兼容；③上真机前必须查清那 2 个订阅者（会收到我们的帧）；④PC 加入机器人域已验证安全，ZMQ 输入暂不需要。写入 plan 18.8 / 18.9、`pico_real_teleop.md` 0.4 / 0.5。
+- 没有登录、没有发布、没有改机器人任何东西。待授权：登录 MDU / ADU 只读检查（见 plan 18.9）。
+
+
+## 56. [2026-10-15，接 #55] 当前现状总览（用户要求：先把现状详细记录下来；此条是快照，后续改动另记）
+
+### 56.1 目标与进度
+
+| 方向 | 状态 |
+|---|---|
+| 统一 `--robot g1/a3/a3_ultra/h2` 入口（训练、MuJoCo、部署、Pico） | 完成并推送（提交 `c335a6c`，`origin/base`） |
+| A3 重定向数据集（129,116 条，Litchi a3 参数，已转回采集朝向）+ SMPL 配对检查 | 完成；`data/motion_lib_a3_29d/robot_filtered_v15_clean`（22 GB；旧的面朝 +X 版本为 `…_yawnorm`） |
+| SMPL 全量数据 | 已下载并解压 `data/smpl_filtered`（131,455 个 pkl，31 GB）；分卷 `bones_seed_smpl/`（31 GB）可删 |
+| A3 SMPL 编码器 | 配方、导出、部署接口验证过；**没有训练**（用户决定先不训练） |
+| MuJoCo + Pico 遥操（a3 / a3_ultra） | 完成；教程 `docs/notes/a3/mujoco_pico_sim_teleop.md`；整链路（仿真 + 部署 + 桥 + Pico 模拟器）多次回归通过 |
+| 真机遥操 | **未验证**：代码审查与修补、教程 `docs/notes/a3/pico_real_teleop.md`、preflight、探测工具都已就绪；没有登录过机器人，没有构建 aarch64 包，没有发布过任何指令 |
+
+### 56.2 仓库状态
+
+- 已推送：`c335a6c`（121 个文件）。之后的改动**全部在工作区、没有提交**：12 个已修改文件（`README.md`、`docs/notes/a3/mujoco_pico_sim_teleop.md`、`docs/notes/g1/{mujoco_pico_sim_teleop,pico_real_teleop}.md`、plan、worklog、`gear_sonic_deploy/scripts/{a3_operator_chain.sh,build_a3_deploy_pkg.sh,deploy_a3.sh}`、`a3_pico_zmq_command.hpp`、`main.cpp`、`a3_ta_bridge.cpp`）和 4 个新文件（`docs/notes/a3/pico_real_teleop.md`、`gear_sonic_deploy/scripts/a3_real_preflight.sh`、`gear_sonic_deploy/scripts/a3_ros_graph_probe.py`、`tests/test_a3_real_deploy_scripts.py`）。
+- `dist/a3_deploy_x86_64/` 里的 `a3_deploy_onnx_ref` 和 `a3_ta_bridge` 已增量重编（含 `--auto-pd-stand`、reliable QoS）；旧二进制备份在会话临时目录（会话结束后会丢）。
+- 测试：`tests` + `gear_sonic/tests`（isaaclab 环境）257 通过 / 5 跳过（4 个需要 GMR / mink，1 个需要 onnxruntime）；gmr 环境相关测试 60 通过。
+
+### 56.3 机器人平台与网络（用户接网线后确认；只 ping / 只收 DDS 多播 / 一次获准的只读 ROS 2 探测）
+
+| 地址 | 角色 | 平台 |
+|---|---|---|
+| `10.42.10.10` | HDU 头部域，PTP 主时钟，SSH / rsync 跳板机 | RK3588S2 |
+| `10.42.10.11` | ADU 具身智能 | NVIDIA Thor（Litchi 的 Thor 教程仍是 TODO，不部署） |
+| `10.42.10.12` | **MDU 运动控制，SONIC 的 aarch64 / RKNN 包按 Litchi 流程部署在这里** | RK3588 |
+| `10.42.10.150` | 同网另一台设备（DJI Baiwang 网卡） | 不碰 |
+
+本机网卡 `enp11s0` 同时带 `10.42.10.99/24`（新加）和 `192.168.123.99/24`（G1 的），默认路由仍走 Wi-Fi（头显用）。三块板都在 **ROS 域 232**，Fast DDS（RTPS 2.2，共 53 个参与者）。机器人侧 ROS 2 是 Jazzy（交叉编译 sysroot），本机 conda 是 Humble。
+
+只读探测结果（plan 18.8）：Cyclone RMW 钉 `10.42.10.99`、16 GB 上限加入域 232，峰值内存 41 MB，339 个话题，互相发现正常。**SONIC 用的 `/body_drive/*` 状态 / 指令话题不在 ROS 2 上**（只有 `/body_drive/leg_joint_command_ros2`）；暴露的是厂商 `/motion/control/*` 层。`/ta/whole_body_command`：没有发布者，**2 个 best_effort 订阅者（身份未知）**。
+
+### 56.4 Litchi 两份 AimRT 配置的含义（对“部署在哪”的约束）
+
+- `a3_aimrt_config.iceoryx.yaml` = “MDU-style local transport”：部署进程在 MDU 上，body-drive 走 iceoryx 共享内存（跨不了机器）；`/ta/whole_body_command` 额外允许 ROS 2（reliable 订阅）。
+- `a3_aimrt_config.ros2.yaml` = “ADU-style cross-board transport … lets the deploy process run on ADU while body-drive publishers/subscribers live on another board”：body-drive 话题走 ROS 2（best_effort）。我们的仿真一直用它。
+- **要在别的机器（包括这台 PC）上跑部署进程，前提是机器人一侧把 `/body_drive/*` 暴露到 ROS 2**；这台机器现在没有暴露（上一节）。怎么打开（厂商配置里开 ros2 后端？某个运行模式？）只能登录 MDU 看，还没有。
+
+### 56.5 真机部署审查与修补（plan 第 18 节，详见 #51）
+
+已修：真机启动自动进 PD 站立 → `--auto-pd-stand` 仅对仿真开，真机 IDLE 启动；`a3_ta_bridge` 默认 reliable（与真机配置兼容，rclpy 实测 best_effort→reliable 收到 0/201）；`--zmq-host`、`motion_control` 互斥、aarch64 包、probe 等文档缺口；新增 `a3_real_preflight.sh`（随包）、`a3_operator_chain.sh --real` 检查、`deploy_a3.sh real` 横幅 + 确认。
+没改、待决定：停止 = passive（kp = kd = 0，真机完全放松）；Pico 停止是单条消息、无心跳，参考流中断 `hold_last`；颈部指令关节名（A3 Ultra）；策略输出没有关节限位裁剪。
+
+### 56.6 DDS 内存问题（plan 9.7 / 18.7，含更正）
+
+Fast DDS 2.6.4 在 Wi-Fi 域 0 会被 2 GB 上限杀掉；空域 99、`FILTER_DIFFERENT_HOST` 都正常，所以触发者是其它主机上的参与者；域 0 里唯一可见的是 `192.168.110.14`（`ubuntu`，用户 `descfly`，用户不知道是不是自己的设备，不再探测它）。**撤回**了“Cyclone 拒绝了它的畸形数据”的说法（对照实验证明那些 Cyclone 报错来自我的探测脚本）。机器人域 232 用 Cyclone 加入实测安全。约定：所有 ROS 2 进程都放进 `systemd-run --user --scope -p MemoryMax=…G -p MemorySwapMax=0`、钉网卡、用非 0 域。
+
+### 56.7 阻塞项与待决
+
+1. 部署位置：MDU（Litchi 默认流程，要 Docker + 677 MB sysroot / aarch64 ONNX Runtime + 登录 MDU）还是本机（Litchi 的 ADU 式跨板 ROS 2，前提是 body-drive 在 ROS 2 上暴露——现在没有）。
+2. 没有登录权限就不知道：官方 `ROS_DOMAIN_ID`、那 2 个 `/ta/whole_body_command` 订阅者是谁、`sm_config`、`motion_control` 状态、MDU 上现有包、RKNN 运行时版本、SSH 用户 / 是否经 HDU。
+3. 停止语义与失联保护（56.5）。
+4. 本机没装 Docker（要 root）。
+
+### 56.8 约定（这几轮里用户明确要求或我自己定下的）
+
+- 没有用户的明确同意，不登录机器人、不发布任何话题、不下发指令；获准的探测只做获准的那一次。
+- ROS 2 进程一律限内存、钉网卡、不用默认域 0；按 PID 结束自己起的进程，不用 `pkill -f`；起仿真窗口前告诉用户，自己的回归尽量无窗口（有窗口时松绳由用户按 `9`）。
+- Pico 头显测试由用户自己做；真机从 IDLE 启动，悬空按 `S`，放吊带站稳后再 A+B+X+Y → A+X；软件急停不能代替物理急停。
+- 不擅自提交；提交 / 推送只在用户要求时做（上一次 `c335a6c` 是用户要求的）。
+
+### 56.9 工具与命令
+
+`gear_sonic_deploy/scripts/{a3_real_preflight.sh, a3_ros_graph_probe.py, a3_operator_chain.sh --real, deploy_a3.sh}`；`gear_sonic/data_process/{restore_a3_heading.py, compare_smpl_vs_a3.py, check_smpl_pairing.py, make_compare_videos.py}`；教程 `docs/notes/a3/{mujoco_pico_sim_teleop.md, pico_real_teleop.md}`；plan 第 15–18 节。
+
+## 57. [2026-10-15，接 #56] 遥操参考改走 ZMQ；按 Litchi 的 ADU 式跨板 ROS 2 做 `--remote`（带门）
+
+用户要求：把通信改成 ZMQ、在本机部署 SONIC 不用 MDU，并按 Litchi “部署进程不在 MDU 上、跨板走 ROS 2”的逻辑来。详见 plan 18.10。
+- **ZMQ 遥操参考（做了并验证）**：部署程序新增 `--teleop-input zmq`（`A3RefZmqSource`，直接订阅重定向节点的 `a3_ref` 流，不要 `a3_ta_bridge`、不要 ROS 2、机器人网络上不发布任何话题；同时消除了“2 个身份不明的 `/ta` 订阅者会收到我们的帧”的风险）。无窗口 MuJoCo 回归：没有 `a3_ta_bridge` 进程，`mode=teleop`，机器人跟着挥，0 次摔倒。过程中修了我引入的一个启动崩溃（读不存在的可选配置段抛 `YAML::InvalidNode`，在发任何指令之前就退出）。
+- **机器人链路改 ZMQ（不做）**：机器人上没有 ZMQ 端点，要在 MDU 上放我们写的中继（交叉编译、失联保护、要登录 MDU），比让厂商配置打开 ROS 2 后端更重。
+- **`--remote`（做了，按现状被门挡住）**：`deploy_a3.sh --remote` = Litchi 的 ADU 式 ros2 配置 + Cyclone + 钉网卡 + 内存上限 + 只读的门（`a3_ros_graph_probe.py --sonic-gate`：6 个状态 + 4 个指令话题、类型、QoS）。门在本机 MuJoCo 上 PASS、在 2026-10-15 的真机快照上 FAIL，不满足就什么都不发布、不启动。要走通需要在 MDU 上打开 body-drive 的 ROS 2 后端（要登录 MDU）。
+- 测试：`tests/test_a3_real_deploy_scripts.py` 14 个。没有登录机器人、没有发布任何话题；起过的仿真 / 部署进程都按 PID 结束。aarch64 包没有构建（Docker 仍未装）。
+
+
+## 58. [2026-10-15，接 #57] 用户授权登录 MDU 做只读检查，并坚持“部署进程不在 MDU 上”这条路（路线 B）
+
+- **授权范围**：登录 MDU（`10.42.10.12`）做**只读**检查。不用 sudo、不改配置、不重启服务、不发布话题。路线选定：部署进程在本机（Litchi 的 ADU 式跨板 ROS 2），所以要查的是“MDU 上有没有、怎么打开 body-drive 的 ROS 2 后端”。
+- **SSH 现状（只做了 TCP 连接和不带凭据的认证方式询问）**：三块板 `10.42.10.10 / .11 / .12` 的 22 端口都开；MDU 的 sshd 接受 `publickey` 和 `password`；本机 `~/.ssh/config` 里只有用户自己的其它服务器，**没有机器人条目、不知道 MDU 的用户名**；ssh-agent 里有 1 把 ED25519 密钥（注释是用户的邮箱）。没有尝试任何登录（没有猜用户名、没有试密码）。**MDU 和 HDU 的 ED25519 主机密钥完全相同**（`SHA256:ID3aqqmNUgkaadYpnatbJyiwQlXcaO9weUndQLNYul4`）——两块板像是同一个镜像克隆出来的，`known_hosts` 分不出它们。
+- **新增** `gear_sonic_deploy/scripts/a3_mdu_readonly_check.sh`：只读调查脚本（`ssh <user>@10.42.10.12 'bash -s' < …`，从标准输入喂给对方，不拷文件）。内容：平台 / 系统 / CPU / 内存、网络与对时服务、`agibot_pm` 与 `motion_control` 等进程是否在跑、`sm_config.yaml` 的 Motion 功能组、厂商环境脚本里 ROS / RMW / DDS / iceoryx 变量、哪些厂商 AimRT 配置提到 `/body_drive/*` 以及有没有 `ros2_plugin` / ros2 后端、哪个模块订阅 `/ta/whole_body_command`（那 2 个身份不明的订阅者）、MDU 上有没有现成的 SONIC 包、RKNN 运行时版本、监听端口。疑似密码 / 令牌的行会被打码；每条命令限时限行。已在本机空跑：语法通过、不写任何文件。
+- **等用户给**：MDU 的 SSH 用户名，以及用哪种认证（ssh-agent 里那把密钥是否已授权；否则由用户自己在终端里登录跑脚本、把输出贴回来；不要把密码发给我）。
+
+## 59. [2026-10-15，接 #58] MDU 的 SSH 用户名：同事建议 `agi`；公钥试了一次，没有授权
+
+用户在团队群里问 MDU 的 SSH 用户名，同事李祥治回复“agi 有试过吗”（用户贴了截图）。这是团队内部给出的线索，所以只用它试了**一次**：`agi@10.42.10.12`，只用公钥（`BatchMode`、`PreferredAuthentications=publickey`），主机密钥存到临时文件、不改用户的 `known_hosts`。结果 `Permission denied (publickey,password)`：ssh-agent 里那把密钥没有被 `agi` 授权（sshd 对“用户不存在”和“密钥不对”回同样的信息，所以不能由此判断 `agi` 这个用户是否存在）。主机密钥指纹与 #58 记录的一致（`SHA256:ID3aqq…`）。没有试密码、没有试别的用户名、没有登录成功。下一步：用户在自己的终端里用密码登录并运行只读脚本，把输出贴回（`ssh agi@10.42.10.12 'bash -s' < gear_sonic_deploy/scripts/a3_mdu_readonly_check.sh`）；密码不要发给我。
+
+## 60. [2026-10-15，接 #59] 用户本人登录 MDU 跑了只读检查并贴回输出；我的探测工具有截断 bug，需更正 #55 的一部分结论
+
+- **登录**：用户在自己的终端里用 `agi` + 密码登录 `10.42.10.12`，运行 `a3_mdu_readonly_check.sh`，把完整输出贴回。我没有登录、没有碰密码。
+- **得到的事实**（全文见 plan 18.11）：MDU = `Rockchip RK3588 AGIBOT A3 MDU V4 Board`、Debian 12、内核 6.1.118 PREEMPT_RT、16 GB、负载 10.4 / 8 核、无对时服务、`/opt/ros/jazzy`、RKNN 运行时 2.3.2（与 Litchi 一致）、机型 `a3_ultra_t3d0`；`env.sh`：`ROS_DOMAIN_ID=232`、`ROS_LOCALHOST_ONLY=0`（官方值确认）；`sm_config` 的 `Motion: [agent, mc]`；厂商 `motion_control`（`mc`）正在运行；MDU 上没有 SONIC 包。
+- **`/ta/whole_body_command` 的订阅者**：`motion_control` 订阅它（`sub_ta_whole_body_command`），录包工具的话题清单里也有。**`mc` 在跑时，往这个话题发的帧会被厂商控制器当遥操指令消费**——遥操参考必须走 `--teleop-input zmq`，不能往机器人网发布 `/ta`。
+- **body-drive 的 ROS 2**：`hal_ethercat` / `hal_elink` / `motion_control` 的 AimRT 配置都已加载 `ros2_plugin` 并定义了 ros2 后端（best_effort），`hal_ethercat` 里 `/body_drive/{arm,leg,hand}_joint_command` 的 `enable_backends` 是 `[iceoryx]`；暴露到 ROS 2 在厂商配置结构里就是改 `enable_backends`（要重启 EtherCAT 主站，不是小操作）。
+- **更正**：#55 / plan 18.8 说“`/body_drive/*` 不在 ROS 2 上”，依据是只读探测——但**那次探测的“其它话题”列表被我的工具截断在 1500 字符**（`/aima/hds/alert` 处），`/ros2/*` 开头的话题被遮住；而 MDU 上 UWB 融合配置用 `/ros2/body_drive/torso_imu/data`，说明厂商有一个带 `/ros2/` 前缀的 body-drive ROS 2 镜像。所以结论改为：**只对 `/body_drive/` 前缀成立，不能推出没有镜像**。已修探测工具（不截断，默认模式含 `/ros2/`），plan 18.8、教程 0.5 / 4.5 已加更正；要重新探测才能下结论（需要用户再次同意加入域 232）。
+- **新增** `gear_sonic_deploy/scripts/a3_mdu_readonly_check2.sh`（第二轮只读检查：t3d0 的 `hal_ethercat` 完整 `channel:` 段、`/ros2/body_drive/*` 是谁创建的、IMU 话题由谁发、`ros_dds_configuration.xml`、`start_motion_control.sh`、`mc` 的 ROS 环境、可写性）。
+- 没有改 MDU 上的任何东西；本机改动仍在工作区，没有提交。
+
+## 61. [2026-10-15，接 #60] 第二轮 MDU 只读检查：t3d0 的 body-drive 只有一小部分在 ROS 2 上，路线 B 要厂商改 `hal_ethercat`
+
+用户本人再次登录 `agi@10.42.10.12` 运行 `a3_mdu_readonly_check2.sh` 并贴回输出（我没有登录）。全文见 plan 18.12。
+- **t3d0 `hal_ethercat` 的路由**：5 个 `/body_drive/*_joint_command` 订阅和所有 `/body_drive/*` 状态发布都只有 `[iceoryx]`；`/ros2/body_drive/` 镜像只有 `arm_joint_state`、`waist_joint_state`、`pelvis_imu/data`、`torso_imu/data` 四个；**腿、脖子、手的状态没有 ROS 2 出口**。统配 QoS 是 best_effort / volatile / keep_last 10，与我们的 ros2 配置一致。
+- **更正 #60 / 18.11**：“暴露 body-drive 就是改 `enable_backends`”只对指令话题成立；兄弟配置里手臂 / 腰的 `enable_ros2_state_topic: false`，t3d0 的 module 段没打出来（grep 在 30 行处截断），不知道镜像有没有真的在发。
+- **`mc` 的 ROS 2 入口**是参考级（`/motion/control/*_joint_command` 原为 91 元素扁平数组，被 `/ta/whole_body_command` 取代），没有证据能透传 SONIC 的 kp/kd，不能当机器人链路；`/hal_state/emergency` 在 ROS 2 上，将来可订阅做急停感知（没做）。
+- **其它**：厂商 Fast DDS 配置只用 SHM + `10.42.10.12` 的 UDPv4；配置目录属主 `agi`（登录用户可改，我没改）；官方关 `mc` 的做法仍没看到；Litchi 文档里没有 ADU 式 ros2 传输在真机上运行过的记录。
+- **结论**：路线 B 需要厂商改 `hal_ethercat`（和手的 `hal_elink`）并重启 EtherCAT 主站；plan 18.12 列了给厂商的 5 个问题。代码没改（话题前缀可配置等厂商回答再决定）。
+- **等用户**：转达厂商问题；再授权一次域 232 只读探测（修好的工具）。没有改 MDU 上的任何东西，没有提交。
+
+## 62. [2026-10-16，接 #61] 用户选定“不走 ROS 2、ZMQ、部署在本机；失联时短时保持姿态再阻尼”：实现 ZMQ 中继 `a3_zmq_relay`
+
+用户决定：路线用 ZMQ 中继（机器人上一个小进程，iceoryx ↔ ZMQ），失联策略是“短时保持姿态再阻尼”。详见 plan 18.13。
+- **新增**：`include/a3_relay/a3_relay_wire.hpp`（线格式）、`a3_relay_guard.hpp`（守卫状态机 `DISARMED → ACTIVE → HOLD → DAMP`，锁存，新会话才能重新接管）、`src/a3_relay/main.cpp`（可执行文件 `a3_zmq_relay`：`--bind`、`--allow-peer`、`--listen-only`、各阈值）、`include/robot_io/a3_zmq_backend.hpp` + `src/robot_io/a3_zmq_backend.cpp`（本机的 `RobotIOBackend`）、`scripts/a3_relay_tool.py`（Python 线格式 + `listen` / `fake-pc`）、`scripts/a3_relay_sim.sh`（中继接 MuJoCo）。`main.cpp`：`--robot-link zmq --relay-host … [--relay-state-port --relay-command-port]`。`deploy_a3.sh`：同名选项、REAL 横幅、与 `--remote` 互斥、要求 `--teleop-input zmq`。`build_a3_deploy_pkg.sh`：构建并打包中继、`run_a3_relay.sh`、`A3_RUN_TARGET=relay`。CMake：`a3_zmq_relay`、`a3_relay_tests`。
+- **测试**：C++ 25 个（线格式 6 + 守卫 19，含与 Python 黄金帧逐字节一致）；`tests/test_a3_zmq_relay_launch.py` 6 个；原有 14 个仍通过。
+- **抓到的问题**：`-ffast-math` 使 `std::isfinite` 失效（改位模式判断）；仿真头在 0.49 rad 使第一帧被拒（颈部放宽）；位置偏差 / 步长上限第一版太紧，进入遥操就阻尼（改成荒谬值上限 7 / 6 rad）；并且在中继里第一次看到：机器人吊在绳上开遥操时部署会给 1–2.7 rad 的单帧指令跳变（直连一样，之前没人看过，真机上要评估）；中继与带 AimRT 的完整部署因 `127.0.0.1:50901` 冲突不能同机并存。
+- **MuJoCo 验证**：站立、遥操（wave、walk 片段）、断线（SIGSTOP 120 ms 自愈、SIGKILL → DAMP、绳上重启重新接管、站立时卡 1.5 s → DAMP 倒下）、`--allow-peer` / 乱码帧 / `--listen-only`、`fake-pc` 工具。5 次中继跑里有 1 次松绳后摔倒，直连基线 1 次没摔，**样本太少没有结论**。
+- **没做**：aarch64 包（Docker 没装、用户没同意）、MDU 上运行、手、preflight 检查中继、关节位置限幅、阻尼 / 时限数值标定。
+- **厂商**：用户在 `docs/notes/a3/real_mdu_body_drive.md` 里记下 2026-10-16 的回复（部分指令可带 Kp/Kd，写进 3.3）；在话题和升级方式明确之前不在机器人上启动会发布关节指令的程序。该文件我只加了“路线 C”一节。
+- 没有碰机器人，没有提交。
+
+## 63. [2026-10-16，接 #62] Pico 流程和失联逻辑对齐 G1、Kp/Kd 对齐 Litchi 真机、aarch64 材料下载
+
+用户三条要求（详见 plan 18.14）：aarch64 包/Docker 的用途（需要就下载）；失联与 Pico 遥操全部和 G1 一致（A+B+X+Y 硬起来保持默认站立姿态、A+X 跟随、再 A+X 回站立、A+B+X+Y 失能）；Kp/Kd 与 Litchi 真机一致。
+- **下载**：Rockchip sysroot（677 MB，sha256 通过）、aarch64 ONNX Runtime 1.19.2。Docker / 交叉编译器没装，`sudo` 要密码，写了命令请用户装（`pico_real_teleop.md` 0.2）。结论：中继路线只有 `a3_zmq_relay` 跑在 MDU 上、SONIC 不下到 MDU，但交叉编译环境两条路线共用。
+- **Pico 映射**：新增 `a3_pico_command_logic.hpp`（纯函数，6 个测试），`a3_pico_zmq_command.hpp` 改用它：A+B+X+Y 失能时 → PD 站立、使能时 → passive；A+X：PD 站立 ↔ 遥操。`deploy_a3.sh`：`--input-type zmq_manager` 不再传 `--auto-pd-stand`，横幅打印新流程。`pico_pose_zmq_replay.py` 新增 `--commands` / `--command-fifo`（替手柄发 `command` 消息，同一个状态机）。
+- **失联**：`RobotIOBackend::NotifyEnable()` / `LinkFault()`；`A3ZmqBackend` 每次重新使能换新会话，中继锁存 / listen-only 报链路故障；`main.cpp` 新增链路监督线程（看门狗 safe-halt 或链路故障 → passive，不自动恢复）和 `teleop.stale_fallback_ms`（姿态流静默 1 s → 回 PD 站立）。
+- **Kp/Kd**：核对我们的 A3 参数文件与 Litchi 逐字节相同；Litchi 真机策略增益档是 `a3_024`；我之前给中继阻尼用了 `a3` 档，已改成默认 `a3_024`（`--gain-profile`）。失能用 Litchi 的零增益。
+- **测试**：C++ 31 个、Python 21 个；MuJoCo 整条 Pico 流程（含挂起部署、杀姿态流、键盘 P）跑通，见 plan 18.14。
+- 文档：A3 MuJoCo 教程（新流程 + 新增 5b 中继变体的四个终端命令）、A3 真机教程（第 5、6、4.6、0.2 节）、G1 文档里的 A3 摘要、README 不变。
+- 过程中修了两个自己的问题：Pico 模拟器读命名管道的竞态（`BlockingIOError`，改 `O_RDWR` 并捕获）；我的测试脚本里按键次数和 Pico 脚本状态机对不上（Pico 脚本把第二次 A+B+X+Y 当“停止”）。
+- 没有碰机器人，没有提交。
+

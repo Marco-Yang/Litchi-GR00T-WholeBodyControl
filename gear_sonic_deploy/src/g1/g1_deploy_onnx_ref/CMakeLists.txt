@@ -103,6 +103,7 @@ list(REMOVE_ITEM PROJECT_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/g1_deploy_onnx_ref
 # (PR 9.5); exclude from g1_deploy_shared so only the executable target pulls
 # it in.
 list(REMOVE_ITEM PROJECT_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/main.cpp)
+list(REMOVE_ITEM PROJECT_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_relay/main.cpp)
 list(REMOVE_ITEM PROJECT_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/a3_policy_runtime_probe.cpp)
 list(REMOVE_ITEM PROJECT_SRCS
@@ -135,6 +136,7 @@ set(ROBOT_IO_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/robot_io/layouts.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/robot_io/a3_layout_extra.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/robot_io/a3_aimrt_backend.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/robot_io/a3_zmq_backend.cpp
 )
 
 # -----------------------------------------------------------------------------
@@ -784,6 +786,39 @@ if(ENABLE_RKNN_INFERENCE)
     COMMENT "Copying bundled RKNN runtime library to runtime output dir")
 endif()
 
+# -----------------------------------------------------------------------------
+# a3_zmq_relay: robot-side half of "run SONIC on the operator PC" (iceoryx / AimRT on one side, ZMQ on the other; guard + damping
+# failsafe in include/a3_relay/).  Same backend sources and AimRT wiring as a3_deploy_onnx_ref, no policy, no teleop.
+# -----------------------------------------------------------------------------
+if(A3_AIMRT_BACKEND_AVAILABLE)
+  add_executable(a3_zmq_relay ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_relay/main.cpp)
+  target_sources(a3_zmq_relay PRIVATE ${ROBOT_IO_SOURCES})
+  target_include_directories(a3_zmq_relay
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/ ${PROJECT_SOURCE_DIR}/src)
+  target_link_directories(a3_zmq_relay PRIVATE ${CUDA_LINK_DIRS})
+  target_link_libraries(a3_zmq_relay PRIVATE ${PROJECT_NAME} ${EXE_LIBS} ${A3_AIMRT_BACKEND_LIBS} pthread)
+  target_compile_definitions(a3_zmq_relay PRIVATE ENABLE_A3_AIMRT_BACKEND=1)
+  if(A3_MOTION_RPC_AVAILABLE)
+    target_compile_definitions(a3_zmq_relay PRIVATE HAS_A3_MOTION_RPC=1)
+    target_link_libraries(a3_zmq_relay PRIVATE a3_motion_rpc_aimrt)
+  endif()
+  if(rclcpp_FOUND AND std_msgs_FOUND)
+    target_include_directories(a3_zmq_relay PRIVATE ${MSGPACK_INCLUDE_DIRS})
+    target_link_libraries(a3_zmq_relay PRIVATE ${ROS2_LIBS})
+    target_compile_definitions(a3_zmq_relay PRIVATE HAS_ROS2=1)
+  else()
+    target_compile_definitions(a3_zmq_relay PRIVATE HAS_ROS2=0)
+  endif()
+  set_target_properties(a3_zmq_relay
+    PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${GS_RUNTIME_OUTPUT_DIR}"
+               CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               CXX_EXTENSIONS OFF
+               BUILD_WITH_INSTALL_RPATH TRUE
+               BUILD_RPATH "$ORIGIN;/opt/ros/jazzy/lib;/opt/ros/humble/lib"
+               INSTALL_RPATH "$ORIGIN;/opt/ros/jazzy/lib;/opt/ros/humble/lib")
+endif()
+
 set(A3_POLICY_RUNTIME_PROBE_NAME a3_policy_runtime_probe)
 add_executable(${A3_POLICY_RUNTIME_PROBE_NAME}
   ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/a3_policy_runtime_probe.cpp)
@@ -1097,6 +1132,7 @@ list(APPEND TEST_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/test_a3_encoder_obs_builder.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/test_packed_motion_decoder.cpp)
 list(REMOVE_DUPLICATES TEST_SRCS)
+list(FILTER TEST_SRCS EXCLUDE REGEX "/test_a3_relay_[a-z_]*\\.cpp$")  # built by the light a3_relay_tests target below
 
 add_executable(run_tests ${TEST_SRCS})
 target_sources(run_tests PRIVATE ${ROBOT_IO_SOURCES})
@@ -1113,6 +1149,18 @@ if(A3_AIMRT_BACKEND_AVAILABLE)
     target_link_libraries(run_tests PRIVATE a3_motion_rpc_aimrt)
   endif()
 endif()
+
+# a3_relay_tests: wire format + guard state machine (header-only, no robot / AimRT / ORT needed): fast to build and run.
+add_executable(a3_relay_tests
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/test_a3_relay_wire.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/test_a3_relay_guard.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/test_a3_relay_pico_mapping.cpp)
+target_include_directories(a3_relay_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_definitions(a3_relay_tests PRIVATE
+  A3_RELAY_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/golden")
+target_link_libraries(a3_relay_tests PRIVATE GTest::GTest GTest::Main)
+set_target_properties(a3_relay_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${GS_RUNTIME_OUTPUT_DIR}"
+  CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
 
 # Setting our output directory and C++ standard
 set_target_properties(

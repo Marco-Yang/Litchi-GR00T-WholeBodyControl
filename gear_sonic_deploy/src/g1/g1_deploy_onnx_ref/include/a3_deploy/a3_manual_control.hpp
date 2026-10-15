@@ -96,6 +96,10 @@ struct ManualControlState {
   std::atomic<int> selected_remote_motion_index{-1};
   std::atomic<bool> remote_motion_active{false};
   std::atomic<bool> teleop_input_paused{false};
+  // G1 PLANNER equivalent while DeployMode stays kTeleop: ignore the live Pico /
+  // TA reference and feed the default-stand tokenizer through a3_fast so the
+  // policy keeps balancing.  Cleared on resume follow, PD stand, or passive.
+  std::atomic<bool> teleop_policy_stand{false};
   std::atomic<std::uint64_t> teleop_command_epoch{0};
   std::atomic<int> teleop_source{0};  // 0=g1, 1=smpl, 2=a3_fast
   std::atomic<bool> policy_yaw_offset_valid{false};

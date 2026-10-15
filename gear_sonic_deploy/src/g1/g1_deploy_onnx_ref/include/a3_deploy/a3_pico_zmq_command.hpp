@@ -1,13 +1,15 @@
 // Copyright (c) 2026, AgiBot Inc. All rights reserved.
 //
-// Subscribe to pico_manager's ZMQ "command" topic (same wire format as G1
-// zmq_manager) and map A+B+X+Y start/stop onto the A3 manual state machine:
-//   start -> PD stand (if needed) then teleop
-//   stop  -> passive
-// A3 has no planner policy; the planner bit is ignored for mode selection.
+// Subscribe to pico_manager's ZMQ "command" topic (same wire format as G1 zmq_manager) and map the G1 operator flow onto the A3
+// manual state machine (a3_pico_command_logic.hpp):
+//   A+B+X+Y  disabled -> PD stand (hardens, default standing pose)   enabled -> passive (disabled)
+//   A+X      PD stand -> teleop follow
+//   A+X      teleop follow -> policy stand (keep a3_fast, default-stand reference; G1 POSE -> PLANNER)
+//   A+X      policy stand -> teleop follow again
 #pragma once
 
 #include "a3_deploy/a3_manual_control.hpp"
+#include "a3_deploy/a3_pico_command_logic.hpp"
 #include "input_interface/zmq_packed_message_subscriber.hpp"
 
 #include <atomic>
@@ -63,7 +65,7 @@ class A3PicoZmqCommandWatcher {
     helper_ = std::thread([this] { HelperLoop(); });
     std::cout << "[pico-cmd] listening tcp://" << host_ << ":" << port_
               << " topic '" << topic_
-              << "' (A+B+X+Y start->teleop, stop->passive; same as G1)\n";
+              << "' (A+B+X+Y: harden to PD stand / disable, A+X: follow <-> policy stand; same flow as G1)\n";
     return true;
   }
 
@@ -109,43 +111,71 @@ class A3PicoZmqCommandWatcher {
   void OnCommand(
       const ZMQPackedMessageSubscriber::DecodedHeader& hdr,
       const std::vector<ZMQPackedMessageSubscriber::BufferView>& bufs) {
-    bool start = false;
-    bool stop = false;
-    if (!DecodeBoolField(hdr, bufs, "start", &start) ||
-        !DecodeBoolField(hdr, bufs, "stop", &stop)) {
+    PicoCommand cmd;
+    if (!DecodeBoolField(hdr, bufs, "start", &cmd.start) || !DecodeBoolField(hdr, bufs, "stop", &cmd.stop)) {
       return;
     }
+    if (!DecodeBoolField(hdr, bufs, "planner", &cmd.planner)) cmd.planner = true;  // an older sender without the bit: "stand"
 
     std::lock_guard<std::mutex> lock(mu_);
-    if (stop) {
-      pending_teleop_.store(false, std::memory_order_release);
-      const DeployMode mode = LoadDeployMode(control_);
-      if (mode != DeployMode::kPassive && mode != DeployMode::kIdle) {
-        RequestDeployMode(control_, DeployMode::kPassive, std::cout);
-        std::cout << "[pico-cmd] A+B+X+Y stop -> passive\n";
-      }
-      return;
-    }
-    if (!start) return;
-
     const DeployMode mode = LoadDeployMode(control_);
-    if (mode == DeployMode::kTeleop) {
-      // Already tracking; POSE/PLANNER toggles only change the Pico stream.
-      return;
+    const bool policy_stand =
+        control_.teleop_policy_stand.load(std::memory_order_acquire);
+    switch (DecidePicoAction(mode,
+                             control_.pd_stand_ready.load(std::memory_order_acquire),
+                             policy_stand, cmd)) {
+      case PicoAction::kNone:
+        return;
+      case PicoAction::kEnterPassive:
+        pending_teleop_.store(false, std::memory_order_release);
+        control_.teleop_policy_stand.store(false, std::memory_order_release);
+        RequestDeployMode(control_, DeployMode::kPassive, std::cout);
+        std::cout << "[pico-cmd] A+B+X+Y -> passive: robot disabled (kp = kd = 0)\n";
+        return;
+      case PicoAction::kEnterPdStand:
+        pending_teleop_.store(false, std::memory_order_release);
+        control_.teleop_policy_stand.store(false, std::memory_order_release);
+        RequestDeployMode(control_, DeployMode::kPdStand, std::cout);
+        std::cout << "[pico-cmd] A+B+X+Y -> PD stand: robot hardens and holds the default standing pose (Init Done when the ramp is "
+                     "finished); then A+X to follow, A+B+X+Y to disable\n";
+        return;
+      case PicoAction::kEnterPolicyStand:
+        pending_teleop_.store(false, std::memory_order_release);
+        EnterPolicyStand();
+        std::cout << "[pico-cmd] A+X -> policy stand: a3_fast keeps running on the default standing pose "
+                     "(G1 PLANNER); A+X again to follow, A+B+X+Y to disable\n";
+        return;
+      case PicoAction::kEnterTeleop:
+        StartTeleop();
+        std::cout << "[pico-cmd] A+X -> teleop: following the operator (A+X again: policy stand)\n";
+        return;
+      case PicoAction::kEnterTeleopWhenReady:
+        pending_teleop_.store(true, std::memory_order_release);
+        std::cout << "[pico-cmd] A+X while the PD stand ramp is still running: teleop starts as soon as the standing pose is reached\n";
+        return;
+      case PicoAction::kIgnoredNotEnabled:
+        std::cout << "[pico-cmd] A+X ignored: the robot is disabled; press A+B+X+Y first\n";
+        return;
     }
-    if (mode == DeployMode::kPdStand &&
-        control_.pd_stand_ready.load(std::memory_order_acquire)) {
-      control_.teleop_input_paused.store(false, std::memory_order_release);
-      control_.teleop_command_epoch.fetch_add(1, std::memory_order_acq_rel);
+  }
+
+  void EnterPolicyStand() {
+    control_.teleop_input_paused.store(false, std::memory_order_release);
+    control_.teleop_policy_stand.store(true, std::memory_order_release);
+    control_.teleop_command_epoch.fetch_add(1, std::memory_order_acq_rel);
+    // Stay in TELEOP so a3_fast keeps evaluating; only the reference changes.
+    // Do not RequestDeployMode if already teleop: that would Reset() the buffers
+    // and reprint "teleop -> teleop (restart)" for a reference-only switch.
+    if (LoadDeployMode(control_) != DeployMode::kTeleop) {
       RequestDeployMode(control_, DeployMode::kTeleop, std::cout);
-      std::cout << "[pico-cmd] A+B+X+Y start -> teleop\n";
-      return;
     }
-    if (mode == DeployMode::kIdle || mode == DeployMode::kPassive) {
-      RequestDeployMode(control_, DeployMode::kPdStand, std::cout);
-      std::cout << "[pico-cmd] A+B+X+Y start -> pd_stand (waiting Init Done)\n";
-    }
-    pending_teleop_.store(true, std::memory_order_release);
+  }
+
+  void StartTeleop() {
+    control_.teleop_input_paused.store(false, std::memory_order_release);
+    control_.teleop_policy_stand.store(false, std::memory_order_release);
+    control_.teleop_command_epoch.fetch_add(1, std::memory_order_acq_rel);
+    RequestDeployMode(control_, DeployMode::kTeleop, std::cout);
   }
 
   void HelperLoop() {
@@ -153,28 +183,25 @@ class A3PicoZmqCommandWatcher {
     while (running_.load(std::memory_order_acquire) &&
            !stop_requested_.load(std::memory_order_acquire)) {
       const DeployMode mode = LoadDeployMode(control_);
-      const bool ready =
-          control_.pd_stand_ready.load(std::memory_order_acquire);
+      const bool ready = control_.pd_stand_ready.load(std::memory_order_acquire);
       if (mode == DeployMode::kPdStand && ready && !printed_init_done) {
         std::cout << "Init Done\n";
-        std::cout << "[pico-cmd] PD stand ready — press A+B+X+Y to start "
-                     "teleop, then A+X for POSE; MuJoCo window key 9 releases "
-                     "the elastic band\n";
+        std::cout << "[pico-cmd] standing at the default pose: A+X to follow the operator, A+X again for policy stand, "
+                     "A+B+X+Y to disable (simulator: MuJoCo window key 9 releases the elastic band)\n";
         printed_init_done = true;
       }
       if (mode != DeployMode::kPdStand) printed_init_done = false;
 
-      if (pending_teleop_.load(std::memory_order_acquire) &&
-          mode == DeployMode::kPdStand && ready) {
+      if (pending_teleop_.load(std::memory_order_acquire) && mode == DeployMode::kPdStand && ready) {
         std::lock_guard<std::mutex> lock(mu_);
         if (pending_teleop_.exchange(false, std::memory_order_acq_rel) &&
             LoadDeployMode(control_) == DeployMode::kPdStand &&
             control_.pd_stand_ready.load(std::memory_order_acquire)) {
-          control_.teleop_input_paused.store(false, std::memory_order_release);
-          control_.teleop_command_epoch.fetch_add(1, std::memory_order_acq_rel);
-          RequestDeployMode(control_, DeployMode::kTeleop, std::cout);
-          std::cout << "[pico-cmd] Init Done + pending start -> teleop\n";
+          StartTeleop();
+          std::cout << "[pico-cmd] standing pose reached + pending A+X -> teleop\n";
         }
+      } else if (mode != DeployMode::kPdStand) {
+        pending_teleop_.store(false, std::memory_order_release);
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }

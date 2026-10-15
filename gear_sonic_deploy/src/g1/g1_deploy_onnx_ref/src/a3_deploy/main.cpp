@@ -20,6 +20,7 @@
 #include "a3_deploy/expand_to_backend.hpp"
 #include "a3_deploy/a3_manual_control.hpp"
 #include "a3_deploy/a3_pico_zmq_command.hpp"
+#include "a3_deploy/a3_ref_zmq_source.hpp"
 #include "a3_deploy/a3_motion_rpc_controller.hpp"
 #include "a3_deploy/a3_motion_library.hpp"
 #include "a3_deploy/a3_obs_builder.hpp"
@@ -32,6 +33,7 @@
 #include "math_utils.hpp"
 #include "robot_io/a3_layout_extra.hpp"
 #include "robot_io/a3_aimrt_backend.hpp"
+#include "robot_io/a3_zmq_backend.hpp"
 #include "robot_io/robot_io_backend.hpp"
 
 #include <yaml-cpp/yaml.h>
@@ -138,11 +140,15 @@ bool HasFlag(int argc, char** argv, const char* flag) {
 }
 
 bool ValidateKnownFlags(int argc, char** argv, std::string* error) {
-  const std::array<std::string, 4> bool_flags = {
-      "--dry-run", "--probe", "--probe-manual", "--auto-start"};
-  const std::array<std::string, 7> value_flags = {
+  const std::array<std::string, 5> bool_flags = {
+      "--dry-run", "--probe", "--probe-manual", "--auto-start",
+      "--auto-pd-stand"};
+  const std::array<std::string, 14> value_flags = {
       "--runtime-cfg", "--probe-source", "--aimrt-cfg",
-      "--frame-log-interval", "--teleop-source", "--zmq-host", "--zmq-port"};
+      "--frame-log-interval", "--teleop-source", "--zmq-host", "--zmq-port",
+      "--teleop-input", "--a3-ref-host", "--a3-ref-port",
+      "--robot-link", "--relay-host", "--relay-state-port",
+      "--relay-command-port"};
   auto contains = [](const auto& values, const std::string& needle) {
     return std::find(values.begin(), values.end(), needle) != values.end();
   };
@@ -255,14 +261,27 @@ void PrintUsage(const char* progname) {
                "--auto-start Use the simulation/debug flow: PD warmup then policy inference.\n"
                "             Without this flag, startup is PASSIVE and keyboard-controlled.\n"
                "--aimrt-cfg PATH  Override backend.aimrt_cfg_path from runtime config.\n"
+               "--robot-link aimrt|zmq  How the robot is reached (default aimrt = this process is next to body-drive).\n"
+               "             zmq: through a3_zmq_relay on the robot (no ROS 2 / DDS here); needs --relay-host HOST\n"
+               "             [--relay-state-port 5570] [--relay-command-port 5571], backend.sync_mode latest_cache,\n"
+               "             policy_driver.phase_align_to_sync false and --teleop-input zmq.\n"
                "--frame-log-interval N  Override logging.frame_log_interval (0 disables).\n"
                "--teleop-source g1|smpl|a3_fast  Preselect and LOCK the TELEOP encoder source\n"
                "             (same as teleop.default_source). Keys 1/2/3 then cannot switch to another\n"
                "             source, and a source that is not available is a startup error.\n"
-               "             Also enables G1-like Pico bring-up: auto PD stand + ZMQ command\n"
-               "             listener (A+B+X+Y start/stop) on --zmq-host/--zmq-port.\n"
+               "             Also starts the Pico ZMQ command listener (A+B+X+Y start/stop) on\n"
+               "             --zmq-host/--zmq-port.  Startup stays IDLE (no commands) unless\n"
+               "             --auto-pd-stand is given.\n"
+               "--auto-pd-stand  With --teleop-source: enter PD stand right after startup (the G1-like\n"
+               "             \"Init Done\" ramp).  For the simulator only: on the real robot the vendor\n"
+               "             procedure starts IDLE and the operator presses S (PD stand) by hand.\n"
                "--zmq-host HOST  Pico ZMQ PUB host for the command topic (default localhost).\n"
-               "--zmq-port PORT  Pico ZMQ PUB port (default 5556).\n";
+               "--zmq-port PORT  Pico ZMQ PUB port (default 5556).\n"
+               "--teleop-input ta|zmq  Where the a3-fast / g1 teleop reference comes from: ta = the AimRT\n"
+               "             /ta/whole_body_command subscription (default, needs the ROS 2 a3_ta_bridge);\n"
+               "             zmq = the operator's `a3_ref` ZMQ stream read directly (no ROS 2 hop; nothing is\n"
+               "             published on the robot network).  Same as teleop.input.\n"
+               "--a3-ref-host HOST / --a3-ref-port PORT  Where `a3_ref` is published (default localhost:5560).\n";
 }
 
 // --- Config accessors ------------------------------------------------------
@@ -1167,6 +1186,10 @@ void WaitForShutdownWithFrameLog(const a3_deploy::A3PolicyDriver& driver,
           std::cout << " paused="
                     << (manual_control->teleop_input_paused.load(
                             std::memory_order_acquire) ? 1 : 0);
+          if (manual_control->teleop_policy_stand.load(
+                  std::memory_order_acquire)) {
+            std::cout << " policy_stand=1";
+          }
         }
         if (manual_control->motion_held.load(std::memory_order_acquire)) {
           std::cout << " hold=1";
@@ -1439,28 +1462,84 @@ int main(int argc, char** argv) {
   // --- Backend -------------------------------------------------------------
   std::unique_ptr<robot_io::RobotIOBackend> backend_ptr;
 
-  auto real = std::make_unique<robot_io::A3AimrtBackend>();
-  try {
-    if (aimrt_cfg_override.empty() && cfg["backend"]["aimrt_cfg_path"]) {
-      cfg["backend"]["aimrt_cfg_path"] = ResolveRuntimePathString(
-          cfg["backend"]["aimrt_cfg_path"].as<std::string>(),
-          runtime_cfg_lookup_path);
+  const std::string robot_link = NormalizeConfigToken(ParseStringFlag(
+      argc, argv, "--robot-link",
+      OptionalKey<std::string>(cfg["backend"]["link"], std::string{"aimrt"})));
+  if (robot_link != "aimrt" && robot_link != "zmq") {
+    std::cerr << "--robot-link / backend.link must be aimrt or zmq (got '" << robot_link << "')\n";
+    return 64;
+  }
+  if (robot_link == "zmq") {
+    // Pull-mode state only: the relay delivers the newest state, the fixed-rate driver pulls it.
+    const std::string link_sync_mode = NormalizeConfigToken(
+        OptionalKey<std::string>(cfg["backend"]["sync_mode"], std::string{"latest_cache"}));
+    if (link_sync_mode != "latest_cache" ||
+        OptionalKey<bool>(cfg["policy_driver"]["phase_align_to_sync"], true)) {
+      std::cerr << "--robot-link zmq needs backend.sync_mode: latest_cache and policy_driver.phase_align_to_sync: false "
+                   "(the relay delivers the newest state; there is no per-topic sync here)\n";
+      return 65;
     }
-    const std::string backend_cfg =
-        BuildBackendConfigString(cfg["backend"], aimrt_cfg_override,
-                                 force_publish_disabled, configured_policy_hz);
-    if (!real->Init(backend_cfg)) {
-      std::cerr << "A3AimrtBackend::Init failed\n";
+    const YAML::Node relay_cfg = cfg["backend"]["relay"];
+    const bool relay_cfg_is_map = relay_cfg.IsDefined() && relay_cfg.IsMap();
+    const std::string relay_host = ParseStringFlag(
+        argc, argv, "--relay-host",
+        relay_cfg_is_map ? OptionalKey<std::string>(relay_cfg["host"], std::string{}) : std::string{});
+    if (relay_host.empty()) {
+      std::cerr << "--robot-link zmq needs --relay-host HOST (the robot-network address the relay is bound to, e.g. 10.42.10.12)\n";
+      return 64;
+    }
+    std::uint64_t state_port = relay_cfg_is_map ? OptionalKey<std::uint64_t>(relay_cfg["state_port"], 5570ULL) : 5570ULL;
+    std::uint64_t command_port = relay_cfg_is_map ? OptionalKey<std::uint64_t>(relay_cfg["command_port"], 5571ULL) : 5571ULL;
+    std::string port_err;
+    if (!ParseUint64Flag(argc, argv, "--relay-state-port", &state_port, &port_err) ||
+        !ParseUint64Flag(argc, argv, "--relay-command-port", &command_port, &port_err)) {
+      std::cerr << port_err << "\n";
+      return 64;
+    }
+    if (state_port == 0 || state_port > 65535 || command_port == 0 || command_port > 65535) {
+      std::cerr << "--relay-state-port / --relay-command-port must be in 1..65535\n";
+      return 64;
+    }
+    const bool zmq_publish_enabled =
+        !force_publish_disabled && OptionalKey<bool>(cfg["backend"]["publish_enabled"], true);
+    std::ostringstream zcfg;
+    zcfg << "relay_host=" << relay_host << ",state_port=" << state_port << ",command_port=" << command_port
+         << ",max_frame_age_ms="
+         << OptionalKey<double>(cfg["policy_driver"]["watchdog"]["max_frame_age_ms"], 50.0)
+         << ",state_hz=" << OptionalKey<double>(cfg["backend"]["sync_hz"], configured_policy_hz * 2.0)
+         << ",publish_enabled=" << (zmq_publish_enabled ? "true" : "false");
+    auto zmq_backend = std::make_unique<robot_io::A3ZmqBackend>();
+    if (!zmq_backend->Init(zcfg.str())) {
+      std::cerr << "A3ZmqBackend::Init failed\n";
       return 1;
     }
-  } catch (const std::exception& e) {
-    std::cerr << "backend config error: " << e.what() << "\n";
-    return 1;
-  }
-  backend_ptr = std::move(real);
-  std::cout << "✓ A3AimrtBackend initialised\n";
-  if (!aimrt_cfg_override.empty()) {
-    std::cout << "✓ AimRT cfg override: " << aimrt_cfg_override << "\n";
+    backend_ptr = std::move(zmq_backend);
+    std::cout << "✓ A3ZmqBackend initialised: relay " << relay_host << " state=" << state_port
+              << " commands=" << command_port << (zmq_publish_enabled ? "" : " (publishing disabled)") << "\n";
+  } else {
+    auto real = std::make_unique<robot_io::A3AimrtBackend>();
+    try {
+      if (aimrt_cfg_override.empty() && cfg["backend"]["aimrt_cfg_path"]) {
+        cfg["backend"]["aimrt_cfg_path"] = ResolveRuntimePathString(
+            cfg["backend"]["aimrt_cfg_path"].as<std::string>(),
+            runtime_cfg_lookup_path);
+      }
+      const std::string backend_cfg =
+          BuildBackendConfigString(cfg["backend"], aimrt_cfg_override,
+                                   force_publish_disabled, configured_policy_hz);
+      if (!real->Init(backend_cfg)) {
+        std::cerr << "A3AimrtBackend::Init failed\n";
+        return 1;
+      }
+    } catch (const std::exception& e) {
+      std::cerr << "backend config error: " << e.what() << "\n";
+      return 1;
+    }
+    backend_ptr = std::move(real);
+    std::cout << "✓ A3AimrtBackend initialised\n";
+    if (!aimrt_cfg_override.empty()) {
+      std::cout << "✓ AimRT cfg override: " << aimrt_cfg_override << "\n";
+    }
   }
 
   auto& backend = *backend_ptr;
@@ -1499,6 +1578,10 @@ int main(int argc, char** argv) {
       teleop_cfg["topic"], std::string{"/ta/whole_body_command"});
   const double teleop_stale_warn_ms =
       OptionalKey<double>(teleop_cfg["stale_warn_ms"], 250.0);
+  // G1: a stale planner stream (older than ~1 s) falls back to IDLE (standing).  A3: a teleop reference that has been silent this
+  // long drops the robot back to the default standing pose (PD stand), exactly as if the operator pressed A+X again.  0 disables.
+  const double teleop_stale_fallback_ms =
+      OptionalKey<double>(teleop_cfg["stale_fallback_ms"], 1000.0);
   const bool teleop_yaw_offset_compensation =
       OptionalKey<bool>(teleop_cfg["yaw_offset_compensation"], false);
   const double teleop_fallback_policy_blend =
@@ -1509,22 +1592,72 @@ int main(int argc, char** argv) {
       OptionalKey<bool>(teleop_cfg["fallback_use_pd_stand_gains"], true);
   std::atomic<bool> teleop_first_frame_logged{false};
 
+  // Where the teleop reference frames come from: the AimRT /ta/whole_body_command subscription (default) or the operator's
+  // `a3_ref` ZMQ stream read directly (no ROS 2 hop; --teleop-input zmq).
+  std::string teleop_input = NormalizeConfigToken(ParseStringFlag(
+      argc, argv, "--teleop-input",
+      OptionalKey<std::string>(teleop_cfg["input"], std::string{"ta"})));
+  if (teleop_input != "ta" && teleop_input != "zmq") {
+    std::cerr << "--teleop-input / teleop.input must be ta or zmq (got '" << teleop_input << "')\n";
+    return 64;
+  }
+  if (robot_link == "zmq" && teleop_enabled && teleop_input != "zmq") {
+    std::cerr << "--robot-link zmq has no AimRT in this process, so the /ta/whole_body_command subscription does not exist: "
+                 "use --teleop-input zmq (or teleop.enabled: false)\n";
+    return 64;
+  }
+  // optional `teleop.a3_ref_zmq: {host, port}`; indexing into an absent section would throw YAML::InvalidNode
+  const YAML::Node a3_ref_cfg = teleop_cfg["a3_ref_zmq"];
+  const bool a3_ref_cfg_is_map = a3_ref_cfg.IsDefined() && a3_ref_cfg.IsMap();
+  a3_deploy::A3RefZmqSourceOptions a3_ref_options;
+  a3_ref_options.host = ParseStringFlag(
+      argc, argv, "--a3-ref-host",
+      a3_ref_cfg_is_map
+          ? OptionalKey<std::string>(a3_ref_cfg["host"], std::string{"localhost"})
+          : std::string{"localhost"});
+  {
+    std::string port_err;
+    std::uint64_t port_u =
+        a3_ref_cfg_is_map ? OptionalKey<std::uint64_t>(a3_ref_cfg["port"], 5560ULL) : 5560ULL;
+    if (!ParseUint64Flag(argc, argv, "--a3-ref-port", &port_u, &port_err)) {
+      std::cerr << port_err << "\n";
+      return 64;
+    }
+    if (port_u == 0 || port_u > 65535) {
+      std::cerr << "--a3-ref-port must be in 1..65535\n";
+      return 64;
+    }
+    a3_ref_options.port = static_cast<int>(port_u);
+  }
+  std::unique_ptr<a3_deploy::A3RefZmqSource> a3_ref_source;  // declared after the buffers it feeds: destroyed first
+
   if (teleop_enabled) {
-    if (auto* aimrt_backend =
+    auto teleop_sink = [&teleop_reference, &teleop_fast_reference,
+                        &teleop_first_frame_logged](
+                           const a3_deploy::A3TeleopFrame& frame) {
+      if (!teleop_first_frame_logged.exchange(true,
+                                              std::memory_order_acq_rel)) {
+        std::cerr << "[teleop] first whole_body_command received: "
+                  << "stamp_ns=" << frame.stamp_ns << "\n";
+      }
+      teleop_reference.PushFrame(frame);
+      teleop_fast_reference.PushFrame(frame);
+    };
+    if (teleop_input == "zmq") {
+      a3_ref_source = std::make_unique<a3_deploy::A3RefZmqSource>(a3_ref_options, teleop_sink);
+      if (!a3_ref_source->Start()) return 66;
+      std::cout << "✓ teleop reference enabled: input=zmq " << a3_ref_source->Endpoint()
+                << " (no /ta subscription) delay_ms="
+                << (static_cast<double>(teleop_options.delay_ns) / 1e6)
+                << " future_frame_skip=" << teleop_options.future_frame_skip
+                << " fast_delay_ms="
+                << (static_cast<double>(teleop_fast_options.delay_ns) / 1e6)
+                << " fast_future_frame_skip=" << teleop_fast_options.future_frame_skip
+                << "\n";
+    } else if (auto* aimrt_backend =
             dynamic_cast<robot_io::A3AimrtBackend*>(backend_ptr.get())) {
       aimrt_backend->SetTeleopTopic(teleop_topic);
-      aimrt_backend->SetTeleopFrameCallback(
-          [&teleop_reference, &teleop_fast_reference,
-           &teleop_first_frame_logged](
-              const a3_deploy::A3TeleopFrame& frame) {
-            if (!teleop_first_frame_logged.exchange(
-                    true, std::memory_order_acq_rel)) {
-              std::cerr << "[teleop] first whole_body_command received: "
-                        << "stamp_ns=" << frame.stamp_ns << "\n";
-            }
-            teleop_reference.PushFrame(frame);
-            teleop_fast_reference.PushFrame(frame);
-          });
+      aimrt_backend->SetTeleopFrameCallback(teleop_sink);
       std::cout << "✓ teleop reference enabled: topic=" << teleop_topic
                 << " delay_ms="
                 << (static_cast<double>(teleop_options.delay_ns) / 1e6)
@@ -2211,7 +2344,7 @@ int main(int argc, char** argv) {
     eval_options.backend_name = backend.Name();
     // A3 sync 使用 system_clock；G1 SDK backend 使用 steady/monotonic clock。
     eval_options.state_clock_domain =
-        backend.Name() == "a3" ? "system" : "monotonic";
+        (backend.Name() == "a3" || backend.Name() == "a3_zmq") ? "system" : "monotonic";
     eval_options.runtime_config_path = runtime_cfg_lookup_path.string();
     eval_options.policy_model_path = encoder_decoder_mode
                                          ? encoder_model_path + " + " +
@@ -2278,11 +2411,17 @@ int main(int argc, char** argv) {
   if (eval_recorder->Enabled()) {
     std::string eval_error;
     if (!eval_recorder->Start(&eval_error)) {
-      std::cerr << "evaluation recorder 启动失败: " << eval_error << "\n";
-      return 1;
+      // Builds without HAS_A3_EVAL_MCAP still parse eval.* from the runtime
+      // config; refusing to start the whole deploy blocked sim/real bring-up.
+      // Keep running without the recorder (same as eval.enabled: false).
+      std::cerr << "evaluation recorder 启动失败（继续部署，不写 episode）: "
+                << eval_error << "\n";
+      eval_recorder = std::make_unique<a3_deploy::A3EvalRecorder>(
+          a3_deploy::A3EvalRecorderOptions{});
+    } else {
+      std::cout << "✓ evaluation recorder: "
+                << eval_recorder->SessionDirectory() << "\n";
     }
-    std::cout << "✓ evaluation recorder: "
-              << eval_recorder->SessionDirectory() << "\n";
   }
   a3_deploy::EvalFrameV1 eval_pending_frame;
   bool eval_pending_valid = false;
@@ -2745,6 +2884,8 @@ int main(int argc, char** argv) {
       manual_control.motion_playing.load(std::memory_order_acquire);
   bool observed_teleop_input_paused =
       manual_control.teleop_input_paused.load(std::memory_order_acquire);
+  bool observed_teleop_policy_stand =
+      manual_control.teleop_policy_stand.load(std::memory_order_acquire);
   bool pd_stand_initialized = false;
   bool teleop_running_started = false;
   bool teleop_hold_valid = false;
@@ -3111,6 +3252,11 @@ int main(int argc, char** argv) {
     const DeployMode mode = LoadDeployMode(manual_control);
     prepare_eval_frame(tick_idx, mode);
     if (epoch != observed_epoch || mode != observed_mode) {
+      const DeployMode previous_mode = observed_mode;
+      if ((previous_mode == DeployMode::kIdle || previous_mode == DeployMode::kPassive) &&
+          (mode == DeployMode::kPdStand || mode == DeployMode::kMotion || mode == DeployMode::kTeleop)) {
+        backend.NotifyEnable();  // a new enable is a new session for backends that have one (the ZMQ relay)
+      }
       observed_epoch = epoch;
       observed_mode = mode;
       observed_motion_command_epoch =
@@ -3119,6 +3265,8 @@ int main(int argc, char** argv) {
           manual_control.teleop_command_epoch.load(std::memory_order_acquire);
       observed_teleop_input_paused =
           manual_control.teleop_input_paused.load(std::memory_order_acquire);
+      observed_teleop_policy_stand =
+          manual_control.teleop_policy_stand.load(std::memory_order_acquire);
       mode_entry_tick = tick_idx;
       pd_stand_initialized = false;
       reset_all_teleop_runtime();
@@ -3260,6 +3408,21 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "\n");
           }
         }
+        const bool policy_stand_now =
+            manual_control.teleop_policy_stand.load(std::memory_order_acquire);
+        if (policy_stand_now != observed_teleop_policy_stand) {
+          observed_teleop_policy_stand = policy_stand_now;
+          clear_teleop_wait_log();
+          token_transition_remaining = token_transition_ticks;
+          if (policy_stand_now) {
+            std::fprintf(stderr,
+                         "[teleop] policy stand: default-stand tokenizer through "
+                         "a3_fast (G1 PLANNER); A+X to follow again\n");
+          } else {
+            std::fprintf(stderr,
+                         "[teleop] leaving policy stand: resume live reference\n");
+          }
+        }
         const bool paused =
             manual_control.teleop_input_paused.load(std::memory_order_acquire);
         if (paused != observed_teleop_input_paused) {
@@ -3382,9 +3545,12 @@ int main(int argc, char** argv) {
           (tick_idx >= mode_entry_tick) ? (tick_idx - mode_entry_tick) : 0;
       const bool teleop_input_paused =
           manual_control.teleop_input_paused.load(std::memory_order_acquire);
+      const bool teleop_policy_stand =
+          manual_control.teleop_policy_stand.load(std::memory_order_acquire);
       manual_control.motion_tick.store(teleop_tick, std::memory_order_release);
-      manual_control.motion_held.store(teleop_input_paused,
-                                       std::memory_order_release);
+      manual_control.motion_held.store(
+          teleop_input_paused || teleop_policy_stand,
+          std::memory_order_release);
 
       const std::array<double, 4> quat_wxyz = {state.imu_quat_wxyz[0],
                                                state.imu_quat_wxyz[1],
@@ -3406,13 +3572,36 @@ int main(int argc, char** argv) {
       const bool teleop_currently_stale =
           teleop_has_latest && teleop_age_ns > teleop_stale_warn_ns;
 
+      // G1: stale planner -> IDLE standing with the policy still running.
+      // A3: enter policy stand (keep a3_fast on the default-stand tokenizer) instead of open-loop PD stand.
+      if (teleop_stale_fallback_ms > 0.0 && !active_source_is_smpl &&
+          !teleop_input_paused && !teleop_policy_stand && teleop_has_latest &&
+          teleop_age_ns >
+              static_cast<std::int64_t>(teleop_stale_fallback_ms * 1'000'000.0)) {
+        std::fprintf(stderr,
+                     "[teleop] reference lost for %.0f ms (> %.0f): policy stand "
+                     "(a3_fast + default stand; G1 falls back to IDLE the same way); "
+                     "A+X to follow again\n",
+                     static_cast<double>(teleop_age_ns) / 1e6,
+                     teleop_stale_fallback_ms);
+        manual_control.teleop_policy_stand.store(true, std::memory_order_release);
+        manual_control.teleop_command_epoch.fetch_add(1, std::memory_order_acq_rel);
+      }
+
       bool teleop_using_fallback_reference = false;
       bool teleop_tokenizer_ok = false;
       a3_deploy::A3TeleopTokenizerStatus teleop_status =
           a3_deploy::A3TeleopTokenizerStatus::kNoData;
       bool smpl_tokenizer_ok = false;
 
-      if (!active_source_is_smpl &&
+      // Policy stand: ignore the live Pico / TA stream and feed the default-stand
+      // tokenizer through ONNX (same path as the no-data fallback, but intentional).
+      if (teleop_policy_stand) {
+        teleop_using_fallback_reference = build_teleop_stand_fallback(
+            teleop_tick, quat_wxyz,
+            a3_deploy::A3TeleopTokenizerStatus::kRunning, "policy_stand",
+            /*source_enabled=*/true, active_teleop_source, tokenizer_slice);
+      } else if (!active_source_is_smpl &&
           !teleop_input_paused && teleop_stream_stale && teleop_has_latest &&
           latest_teleop_stamp_ns != teleop_stale_latest_stamp_ns &&
           !teleop_currently_stale) {
@@ -3442,7 +3631,9 @@ int main(int argc, char** argv) {
         }
       }
 
-      if (!active_source_is_smpl) {
+      if (teleop_policy_stand) {
+        // tokenizer_slice already filled above; keep a3_fast on that stand reference.
+      } else if (!active_source_is_smpl) {
         bool teleop_holding_last_command = false;
         if (teleop_input_paused && teleop_hold_valid) {
           tokenizer_slice = teleop_hold_slice;
@@ -3549,6 +3740,16 @@ int main(int argc, char** argv) {
         const bool smpl_currently_stale =
             smpl_has_latest && now_monotonic_ns > 0 &&
             smpl_age_ns > teleop_stale_warn_ns;
+        if (teleop_stale_fallback_ms > 0.0 && smpl_has_latest && !teleop_input_paused &&
+            !teleop_policy_stand &&
+            smpl_age_ns > static_cast<std::int64_t>(teleop_stale_fallback_ms * 1'000'000.0)) {
+          std::fprintf(stderr,
+                       "[teleop] SMPL stream lost for %.0f ms (> %.0f): policy stand "
+                       "(a3_fast + default stand); A+X to follow again\n",
+                       static_cast<double>(smpl_age_ns) / 1e6, teleop_stale_fallback_ms);
+          manual_control.teleop_policy_stand.store(true, std::memory_order_release);
+          manual_control.teleop_command_epoch.fetch_add(1, std::memory_order_acq_rel);
+        }
         const bool smpl_ready =
             smpl_zmq_enabled && smpl_zmq_source.HasReadyWindow();
         bool smpl_holding_last_command = false;
@@ -4153,12 +4354,19 @@ int main(int argc, char** argv) {
     keyboard_thread = StartKeyboardControlThread(
         manual_control, motion_names, remote_motion_names, motion_shortcuts);
 
-    // G1-like Pico bring-up when deploy.sh passed --teleop-source (zmq_manager):
-    // auto PD stand (= Init ramp), then A+B+X+Y maps to teleop via ZMQ command.
+    // Pico bring-up when deploy.sh passed --teleop-source (zmq_manager): A+B+X+Y maps to start/stop via the ZMQ
+    // command topic.  The G1-like auto PD stand (= Init ramp) is opt-in (--auto-pd-stand, used for the simulator):
+    // on the real robot the program must begin IDLE and send nothing until the operator asks for PD stand
+    // (docs/a3_training2sim2deploy.md section 6.1: "The program begins in IDLE and sends no commands").
     if (teleop_source_preselected && !backend_only) {
-      a3_deploy::RequestDeployMode(manual_control, DeployMode::kPdStand,
-                                   std::cout);
-      std::cout << "✓ G1-like bring-up: auto PD stand (wait for Init Done)\n";
+      if (HasFlag(argc, argv, "--auto-pd-stand")) {
+        a3_deploy::RequestDeployMode(manual_control, DeployMode::kPdStand,
+                                     std::cout);
+        std::cout << "✓ G1-like bring-up: auto PD stand (wait for Init Done)\n";
+      } else {
+        std::cout << "✓ startup IDLE, no commands sent: press S (PD stand) with the robot supported, or Pico "
+                     "A+B+X+Y\n";
+      }
       pico_cmd_watcher = std::make_unique<a3_deploy::A3PicoZmqCommandWatcher>(
           manual_control, g_stop_requested, pico_zmq_host, pico_zmq_port);
       if (!pico_cmd_watcher->Start()) {
@@ -4167,6 +4375,49 @@ int main(int argc, char** argv) {
                      "keyboard S/T instead\n";
       }
     }
+  }
+  // Link supervisor (G1: a failed safety check stops control and sends damping): while the robot is enabled, a robot-state watchdog trip
+  // or a link fault reported by the backend (the ZMQ relay latched its failsafe, ...) disables the robot, and it stays disabled until
+  // the operator enables it again (A+B+X+Y, or S).  Watchdog trips are the driver's existing safe-halt frames (state older than
+  // policy_driver.watchdog.max_frame_age_ms).
+  std::atomic<bool> supervisor_run{!auto_start && !backend_only};
+  std::thread link_supervisor;
+  if (supervisor_run.load()) {
+    link_supervisor = std::thread([&] {
+      using Clock = std::chrono::steady_clock;
+      auto is_enabled = [](DeployMode m) {
+        return m == DeployMode::kPdStand || m == DeployMode::kMotion || m == DeployMode::kTeleop;
+      };
+      bool was_enabled = false;
+      Clock::time_point enabled_since = Clock::now();
+      std::uint64_t last_halts = driver->SafeHaltCount();
+      while (supervisor_run.load(std::memory_order_acquire) && !g_stop_requested.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const DeployMode mode = LoadDeployMode(manual_control);
+        const bool enabled = is_enabled(mode);
+        const auto now = Clock::now();
+        if (enabled && !was_enabled) {
+          enabled_since = now;
+          last_halts = driver->SafeHaltCount();
+        }
+        was_enabled = enabled;
+        if (!enabled) continue;
+        std::string reason;
+        const std::uint64_t halts = driver->SafeHaltCount();
+        bool fault = false;
+        if (halts > last_halts && now - enabled_since > std::chrono::milliseconds(300)) {
+          fault = true;
+          reason = "robot state lost or stale (watchdog safe-halt)";
+        }
+        last_halts = halts;
+        if (!fault && now - enabled_since > std::chrono::milliseconds(100)) fault = backend.LinkFault(&reason);
+        if (fault) {
+          std::cerr << "[link] " << reason << " -> passive (robot disabled). Re-enable with A+B+X+Y (or S) once the link is healthy.\n";
+          a3_deploy::RequestDeployMode(manual_control, DeployMode::kPassive, std::cout);
+          was_enabled = false;
+        }
+      }
+    });
   }
   std::cout << "✓ entering policy loop; Ctrl-C to exit\n";
   if (frame_log_interval > 0) {
@@ -4185,7 +4436,10 @@ int main(int argc, char** argv) {
                               latest_direct_mode);
 
   std::cout << "shutdown requested — stopping driver\n";
+  supervisor_run.store(false, std::memory_order_release);
+  if (link_supervisor.joinable()) link_supervisor.join();
   if (pico_cmd_watcher) pico_cmd_watcher->Stop();
+  if (a3_ref_source) a3_ref_source->Stop();
   if (keyboard_thread.joinable()) keyboard_thread.join();
   driver->StopDriver();
   if (eval_recorder->Enabled()) {
