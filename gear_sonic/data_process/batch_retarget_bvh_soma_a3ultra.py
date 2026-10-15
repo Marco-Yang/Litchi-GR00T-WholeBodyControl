@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Batch BVH → SONIC motion_lib retarget for AgiBot A3 Ultra.
+"""Batch BVH → SONIC motion_lib retarget for AgiBot A3 Ultra (default) or A3 (``--robot a3``).
 
 Processes SOMA BVH files from soma_proportional.tar.gz (or a BVH directory)
 and produces SONIC motion_lib pkl files.
 
 Pipeline per file:
-  BVH (NOVA/SOMA skeleton) → GMR nokov retarget → A3 Ultra qpos → SONIC pkl
+  BVH (NOVA/SOMA skeleton) → GMR nokov retarget → robot qpos → SONIC pkl
+
+``--robot a3_ultra`` (default, what produced robot_filtered_v15): the 63-DOF T3D0 model, 31-column ``dof``, 64-body
+``pose_aa``.  ``--robot a3``: the same method on the A3 of the 035 contract (``a3_t2d5.xml``, Litchi a3 parameters:
+its URDF kinematics, joint limits, foot/ground geometry), written directly in the Litchi ``a3_29`` motion-lib format
+(29-column ``dof``, 32-body ``pose_aa``) -- the dataset the A3 training path (``--robot a3`` / ``--robot a3_ultra``) reads.
+GMR does not know the A3 yet; it is registered at run time below, no change to the GMR checkout is needed.
 
 SOMA BVH specifics: ROOT is a synthetic "Root" joint (6 channels), "Hips" is
 a child with 6 channels, all other joints have 3 channels. The vendor
@@ -48,6 +54,39 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from gear_sonic.data_process.convert_gmr_a3ultra_to_motion_lib import convert_sequence
 
+# --------------------------------------------------------------------------- #
+# Target robots                                                               #
+# --------------------------------------------------------------------------- #
+IK_CONFIG_DIR = Path(__file__).resolve().parent / "gmr_ik_configs"
+MJCF_DIR = PROJECT_ROOT / "gear_sonic" / "data" / "assets" / "robot_description" / "mjcf"
+ROBOTS = {
+    # GMR already ships agibot_a3_ultra (xml + bvh_nokov IK table live in the GMR checkout)
+    "a3_ultra": {"gmr": "agibot_a3_ultra"},
+    # the A3 (T2D5) of the 035 contract; the IK table is the Ultra's: both robots share the 29 body joints and every
+    # IK link frame at qpos0 (tests/test_a3_retarget_batch.py compares them), so the calibrated offsets carry over.
+    "a3": {"gmr": "agibot_a3", "mjcf": MJCF_DIR / "a3_t2d5.xml", "ik_config": IK_CONFIG_DIR / "bvh_nokov_to_a3.json"},
+}
+
+
+def _register_robot(robot: str) -> str:
+    """Make GMR aware of ``robot`` (a no-op for robots it ships) and return its GMR name."""
+    spec = ROBOTS[robot]
+    if "mjcf" in spec:
+        from general_motion_retargeting import params
+        params.ROBOT_XML_DICT[spec["gmr"]] = spec["mjcf"]
+        params.IK_CONFIG_DICT["bvh_nokov"][spec["gmr"]] = spec["ik_config"]
+        params.ROBOT_BASE_DICT[spec["gmr"]] = "pelvis_link"
+        params.VIEWER_CAM_DISTANCE_DICT[spec["gmr"]] = 2.5
+    return spec["gmr"]
+
+
+def convert_for(robot: str, qpos_list: list, fps: float) -> dict:
+    """GMR qpos list -> motion-lib entry in the format of ``robot``."""
+    if robot == "a3":
+        from gear_sonic.data_process.convert_gmr_a3_to_motion_lib import convert_sequence as convert_a3
+        return convert_a3(qpos_list, fps)
+    return convert_sequence(qpos_list, fps)
+
 
 # --------------------------------------------------------------------------- #
 # SOMA BVH parser → GMR world-space frame dicts                               #
@@ -57,14 +96,18 @@ _R_YUP_TO_ZUP = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=np.float64)
 _Q_YUP_TO_ZUP = Rotation.from_matrix(_R_YUP_TO_ZUP).as_quat(scalar_first=True)  # wxyz
 
 
-def _parse_soma_bvh(filepath):
-    """Parse SOMA BVH; return (joints, channel_order, motion_data, n_frames, frame_time).
+def _parse_soma_bvh(filepath, max_frames=None, text=None):
+    """Parse SOMA BVH; return (joints, motion_data, n_frames, frame_time).
 
     Handles multiple 6-channel joints (Root + Hips both have XYZ pos + XYZ rot).
-    Returns motion_data as (n_frames, n_channels) with raw degrees/cm values.
+    Returns motion_data as (n_frames, n_channels) with raw degrees/cm values; ``max_frames`` reads only the first rows
+    (``n_frames`` is still the declared count), ``text`` parses an in-memory BVH instead of a file.
     """
-    with open(filepath) as f:
-        lines = f.readlines()
+    if text is not None:
+        lines = text.splitlines()
+    else:
+        with open(filepath) as f:
+            lines = f.readlines()
 
     joints = []   # list of {name, offset, pos_channels, rot_channels, rot_order, parent_idx}
     joint_stack = []
@@ -116,8 +159,9 @@ def _parse_soma_bvh(filepath):
     i += 1
 
     n_channels = channel_index
-    motion_data = np.empty((n_frames, n_channels), dtype=np.float64)
-    for fi in range(n_frames):
+    n_read = n_frames if max_frames is None else min(n_frames, max_frames)
+    motion_data = np.empty((n_read, n_channels), dtype=np.float64)
+    for fi in range(n_read):
         motion_data[fi] = list(map(float, lines[i].strip().split()))
         i += 1
 
@@ -136,8 +180,50 @@ def _quat_mul(q1, q2):
     ])
 
 
-def load_soma_bvh_frames(filepath):
-    """Load SOMA BVH and return (frames_list, human_height) matching GMR format.
+def _yaw_f0_from_hips_quat(hq_xyzw) -> float:
+    """Heading of the performer at frame 0 (rad, Z-up world, +X = 0): the angle by which ``load_soma_bvh_frames`` turns
+    the clip so the performer faces +X.  SOMA Hips body_Z is the performer's LEFT (not forward): verified on 40
+    Bones-SEED clips via toe direction and LeftLeg-RightLeg."""
+    hq_wxyz = np.array([hq_xyzw[3], hq_xyzw[0], hq_xyzw[1], hq_xyzw[2]])
+    hq_zup = _quat_mul(_Q_YUP_TO_ZUP, hq_wxyz)
+    body_z = Rotation.from_quat(hq_zup, scalar_first=True).as_matrix()[:, 2]
+    return float(np.arctan2(-body_z[0], body_z[1]))
+
+
+def bvh_heading_f0(filepath=None, text=None) -> float:
+    """``_yaw_f0`` of a SOMA BVH without loading the clip: the original capture heading (rad) that the retarget removes.
+
+    Reads the header and the first frame only (same forward kinematics as ``load_soma_bvh_frames``).
+    """
+    joints, motion_data, _, _ = _parse_soma_bvh(filepath, max_frames=1, text=text)
+    hips = next((k for k, j in enumerate(joints) if j["name"] == "Hips"), -1)
+    if hips < 0:
+        return 0.0
+    rot = [None] * len(joints)
+    for k, joint in enumerate(joints):
+        if joint["rot_order"]:
+            local = Rotation.from_euler(joint["rot_order"].upper(), motion_data[0, joint["rot_ch_idx"]], degrees=True).as_matrix()
+        else:
+            local = np.eye(3)
+        rot[k] = local if joint["parent_idx"] < 0 else rot[joint["parent_idx"]] @ local
+    return _yaw_f0_from_hips_quat(Rotation.from_matrix(rot[hips]).as_quat())
+
+
+def rotate_qpos_about_z(qpos, psi: float):
+    """GMR qpos (root xyz, root quat wxyz, joints) -> the same pose with the whole scene turned by ``psi`` about +Z.
+
+    Joint angles are unchanged: root position and orientation are rotated in the world.
+    """
+    out = np.array(qpos, dtype=np.float64, copy=True)
+    c, s = np.cos(psi), np.sin(psi)
+    out[0], out[1] = c * qpos[0] - s * qpos[1], s * qpos[0] + c * qpos[1]
+    out[3:7] = _quat_mul(np.array([np.cos(psi / 2), 0.0, 0.0, np.sin(psi / 2)]), qpos[3:7])
+    return out
+
+
+def load_soma_bvh_frames(filepath, return_yaw=False):
+    """Load SOMA BVH and return (frames_list, human_height, fps_src) matching GMR format
+    (plus the removed capture heading ``_yaw_f0`` as a 4th value with ``return_yaw=True``).
 
     Each frame is a dict: joint_name → [position_zup_m, orientation_wxyz_zup].
     Adds synthetic LeftFootMod/RightFootMod (foot position + toe orientation).
@@ -197,17 +283,12 @@ def load_soma_bvh_frames(filepath):
     # the frame-0 Hips yaw makes the offset universal across all motions.
     _hips_j_idx = next((k for k, j in enumerate(joints) if j["name"] == "Hips"), -1)
     _q_yaw_comp = None  # wxyz compensation quaternion (identity if Hips not found)
+    _yaw_f0 = 0.0
     if _hips_j_idx >= 0:
-        _hq_xyzw = world_quat_xyzw[0, _hips_j_idx]
-        _hq_wxyz = np.array([_hq_xyzw[3], _hq_xyzw[0], _hq_xyzw[1], _hq_xyzw[2]])
-        _hq_zup = _quat_mul(_Q_YUP_TO_ZUP, _hq_wxyz)
-        # SOMA Hips body_Z is the performer's LEFT (not forward): verified on 40
-        # Bones-SEED clips via toe direction and LeftLeg−RightLeg. Rotate so
-        # body_Z → +Y, i.e. the performer faces +X like A3 Ultra at qpos0.
+        # Rotate so Hips body_Z (the performer's LEFT) -> +Y, i.e. the performer faces +X like A3 Ultra at qpos0.
         # Must match calibrate_soma_to_a3ultra.py, or the robot ends up 180°
         # from the performer (crossed legs/arms, hyperextended knees).
-        _body_z = Rotation.from_quat(_hq_zup, scalar_first=True).as_matrix()[:, 2]
-        _yaw_f0 = float(np.arctan2(-_body_z[0], _body_z[1]))
+        _yaw_f0 = _yaw_f0_from_hips_quat(world_quat_xyzw[0, _hips_j_idx])
         _R_yaw_comp = Rotation.from_euler('Z', -_yaw_f0).as_matrix()
         _q_yaw_comp = Rotation.from_euler('Z', -_yaw_f0).as_quat(scalar_first=True)  # wxyz
         world_pos_zup = np.einsum('ij,tnj->tni', _R_yaw_comp, world_pos_zup)
@@ -247,6 +328,8 @@ def load_soma_bvh_frames(filepath):
         human_height = 1.75
 
     fps_src = round(1.0 / frame_time)
+    if return_yaw:
+        return frames, human_height, fps_src, _yaw_f0
     return frames, human_height, fps_src
 
 
@@ -257,15 +340,15 @@ def load_soma_bvh_frames(filepath):
 POSTURE_COST = 1.0  # continuity prior (per rad) vs frame tasks (pos 100/m, rot 5-10/rad)
 
 
-def make_retargeter():
-    """Create a GMR instance for SOMA → A3 Ultra retargeting (reusable).
+def make_retargeter(robot: str = "a3_ultra"):
+    """Create a GMR instance for SOMA → A3 Ultra (or A3) retargeting (reusable).
 
     Body scale and position offsets are set per clip by _configure_clip() from
     the performer's own bone lengths, so no global human height is assumed.
     """
     import mink
     from general_motion_retargeting import GeneralMotionRetargeting as GMR
-    ret = GMR(src_human="bvh_nokov", tgt_robot="agibot_a3_ultra")
+    ret = GMR(src_human="bvh_nokov", tgt_robot=_register_robot(robot))
     ret.max_iter = 50
     # Pull each frame toward the previous solution so the IK does not hop
     # between equivalent branches (e.g. shoulder gimbal at roll ≈ 90°).
@@ -284,8 +367,8 @@ def _robot_geometry(model) -> dict:
     mj.mj_forward(model, d)
     P = lambda n: d.xpos[mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, n)].copy()
     foot = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, "left_ankle_roll_Link")
-    sole = min(d.geom_xpos[g][2] - model.geom_size[g][0] for g in range(model.ngeom)
-               if model.geom_bodyid[g] == foot and model.geom_contype[g])
+    sole = min(_geom_lowest_z(model, d, g) for g in range(model.ngeom)
+               if model.geom_bodyid[g] == foot and model.geom_contype[g])  # spheres: z - r; meshes: lowest vertex
     hip_l, hip_r = P("left_hip_pitch_Link"), P("right_hip_pitch_Link")
     knee, ankle = P("left_knee_Link"), P("left_ankle_roll_Link")
     return {
@@ -410,19 +493,24 @@ def _warm_start_qpos(model) -> np.ndarray:
 
 
 def retarget_bvh(bvh_path: str, fps_target: int = 30,
-                 retargeter=None):
+                 retargeter=None, robot: str = "a3_ultra", keep_heading: bool = False):
     """Run GMR nokov retarget on a SOMA BVH file.
 
     Returns (qpos_list, retargeter). Pass the returned retargeter back on the
     next call to avoid reloading the robot model each time.
+
+    The IK runs on the clip turned to face +X at frame 0 (``load_soma_bvh_frames``).  ``keep_heading=True`` turns the
+    result back by the removed capture heading, so the output sits in the BVH's own world frame -- the frame of the
+    Bones-SEED SMPL data and of the G1 library (the SMPL encoder's ``smpl_root_ori_b`` needs robot and SMPL to share it).
+    Joint angles are identical either way.
     """
-    frames, _human_height, fps_src = load_soma_bvh_frames(bvh_path)
+    frames, _human_height, fps_src, yaw_f0 = load_soma_bvh_frames(bvh_path, return_yaw=True)
 
     if len(frames) == 0:
         raise ValueError("BVH produced 0 frames")
 
     if retargeter is None:
-        retargeter = make_retargeter()
+        retargeter = make_retargeter(robot)
 
     root_dz = _configure_clip(retargeter, frames)
     retargeter.configuration.update(_warm_start_qpos(retargeter.configuration.model))
@@ -441,6 +529,8 @@ def retarget_bvh(bvh_path: str, fps_target: int = 30,
         qpos_list.append(qpos)
 
     _lift_out_of_floor(qpos_list, retargeter.configuration.model, fps_src / stride)
+    if keep_heading:
+        qpos_list = [rotate_qpos_about_z(q, yaw_f0) for q in qpos_list]
     return qpos_list, retargeter
 
 
@@ -449,21 +539,23 @@ def retarget_bvh(bvh_path: str, fps_target: int = 30,
 # --------------------------------------------------------------------------- #
 
 def process_one_bvh(bvh_path: str, out_pkl: str, fps_target: int,
-                    retargeter=None, motion_name: str = None):
+                    retargeter=None, motion_name: str = None, robot: str = "a3_ultra", keep_heading: bool = False):
     """Retarget one BVH file and save as SONIC motion_lib pkl.
 
     Returns (success, retargeter) — retargeter is returned so callers can
     reuse the loaded model across files.
     """
     try:
-        qpos_list, retargeter = retarget_bvh(bvh_path, fps_target, retargeter)
+        qpos_list, retargeter = retarget_bvh(bvh_path, fps_target, retargeter, robot, keep_heading)
         if len(qpos_list) < 10:
             print(f"  SKIP {motion_name or bvh_path}: too short ({len(qpos_list)} frames)")
             return False, retargeter
 
-        motion_data = convert_sequence(qpos_list, fps=float(fps_target))
+        motion_data = convert_for(robot, qpos_list, float(fps_target))
         os.makedirs(os.path.dirname(out_pkl), exist_ok=True)
-        joblib.dump({motion_name or Path(bvh_path).stem: motion_data}, out_pkl)
+        tmp_pkl = out_pkl + ".tmp"  # atomic: an interrupted run must not leave a half-written pkl that "skip existing" trusts
+        joblib.dump({motion_name or Path(bvh_path).stem: motion_data}, tmp_pkl)
+        os.replace(tmp_pkl, out_pkl)
         return True, retargeter
     except Exception as e:
         print(f"  FAILED {motion_name or bvh_path}: {e}")
@@ -478,12 +570,12 @@ _WORKER_RETARGETER = None
 
 
 def _worker_job(job):
-    """Pool worker: (motion_name, bvh path or bytes, out_pkl, fps) → success."""
+    """Pool worker: (motion_name, bvh path or bytes, out_pkl, fps, robot, keep_heading) → success."""
     global _WORKER_RETARGETER
+    motion_name, src, out_pkl, fps, robot, keep_heading = job
     if _WORKER_RETARGETER is None:
         with contextlib.redirect_stdout(io.StringIO()):  # GMR prints the whole model on load
-            _WORKER_RETARGETER = make_retargeter()
-    motion_name, src, out_pkl, fps = job
+            _WORKER_RETARGETER = make_retargeter(robot)
     tmp = None
     if isinstance(src, bytes):
         fd, tmp = tempfile.mkstemp(suffix=".bvh")
@@ -491,7 +583,7 @@ def _worker_job(job):
             fh.write(src)
         src = tmp
     try:
-        ok, _WORKER_RETARGETER = process_one_bvh(src, out_pkl, fps, _WORKER_RETARGETER, motion_name)
+        ok, _WORKER_RETARGETER = process_one_bvh(src, out_pkl, fps, _WORKER_RETARGETER, motion_name, robot, keep_heading)
     finally:
         if tmp:
             os.unlink(tmp)
@@ -526,7 +618,7 @@ def _run_jobs(jobs, workers: int, counts: dict, out_dir):
           f"in {(time.time() - t0) / 60:.1f} min → {out_dir}")
 
 
-def _tar_jobs(tar_path, out_dir, fps, skip, max_files, counts):
+def _tar_jobs(tar_path, out_dir, fps, skip, max_files, counts, robot="a3_ultra", only=None, keep_heading=False):
     """Yield jobs from tar.gz via pipe streaming (sequential read, no seeking).
 
     Output keeps the session directory: soma_proportional/bvh/<session>/<name>.bvh
@@ -540,6 +632,8 @@ def _tar_jobs(tar_path, out_dir, fps, skip, max_files, counts):
             parts = Path(member.name).parts
             session = parts[-2] if len(parts) >= 3 else "session"
             motion_name = Path(member.name).stem
+            if only is not None and motion_name not in only:
+                continue
             out_pkl = out_dir / session / f"{motion_name}.pkl"
             if skip and out_pkl.exists():
                 counts["skip"] += 1
@@ -547,14 +641,14 @@ def _tar_jobs(tar_path, out_dir, fps, skip, max_files, counts):
             f = tf.extractfile(member)
             if f is None:
                 continue
-            yield motion_name, f.read(), str(out_pkl), fps
+            yield motion_name, f.read(), str(out_pkl), fps, robot, keep_heading
             n_jobs += 1
             if max_files > 0 and n_jobs >= max_files:
                 print(f"Reached max_files={max_files}, stopping.")
                 return
 
 
-def _dir_jobs(bvh_dir, out_dir, fps, skip, max_files, counts):
+def _dir_jobs(bvh_dir, out_dir, fps, skip, max_files, counts, robot="a3_ultra", only=None, keep_heading=False):
     """Yield jobs for BVH files under a directory (one sub-directory level kept)."""
     import glob
     bvh_files = sorted(glob.glob(os.path.join(bvh_dir, "**", "*.bvh"), recursive=True))
@@ -562,11 +656,13 @@ def _dir_jobs(bvh_dir, out_dir, fps, skip, max_files, counts):
     n_jobs = 0
     for bvh_path in bvh_files:
         motion_name = Path(bvh_path).stem
+        if only is not None and motion_name not in only:
+            continue
         out_pkl = out_dir / Path(bvh_path).parent.name / f"{motion_name}.pkl"
         if skip and out_pkl.exists():
             counts["skip"] += 1
             continue
-        yield motion_name, bvh_path, str(out_pkl), fps
+        yield motion_name, bvh_path, str(out_pkl), fps, robot, keep_heading
         n_jobs += 1
         if max_files > 0 and n_jobs >= max_files:
             return
@@ -577,11 +673,20 @@ def _dir_jobs(bvh_dir, out_dir, fps, skip, max_files, counts):
 # --------------------------------------------------------------------------- #
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch BVH SOMA → A3 Ultra SONIC motion_lib")
+    parser = argparse.ArgumentParser(description="Batch BVH SOMA → A3 Ultra / A3 SONIC motion_lib")
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--tar", help="Path to soma_proportional.tar.gz")
     src.add_argument("--bvh_dir", help="Directory containing BVH files (flat or nested)")
     parser.add_argument("--output", required=True, help="Output directory for pkl files")
+    parser.add_argument("--robot", choices=sorted(ROBOTS), default="a3_ultra",
+                        help="a3_ultra: 63-DOF T3D0 model (robot_filtered_v15 format); a3: the 035 contract's A3 (T2D5), "
+                             "written as a3_29 (29 dof, 32 bodies)")
+    parser.add_argument("--only_from", default=None,
+                        help="convert only the clips whose name (file stem) exists under this directory, e.g. the "
+                             "filtered robot_filtered_v15_clean library, so both robots cover the same clips")
+    parser.add_argument("--keep_heading", action="store_true",
+                        help="turn each clip back to its original capture heading after the IK (the frame of the SMPL "
+                             "data and of the G1 library); default: every clip faces +X at frame 0")
     parser.add_argument("--fps", type=int, default=30, help="Target FPS (default 30)")
     parser.add_argument("--no_skip", action="store_true",
                         help="Re-convert clips whose output pkl already exists")
@@ -592,13 +697,17 @@ def main():
 
     skip = not args.no_skip
     out_dir = Path(args.output)
+    only = None
+    if args.only_from:
+        only = {p.stem for p in Path(args.only_from).rglob("*.pkl") if p.name != "metadata.pkl"}
+        print(f"--only_from {args.only_from}: {len(only)} clip names", flush=True)
     counts = {"ok": 0, "fail": 0, "skip": 0}
-    print(f"Source: {args.tar or args.bvh_dir}\nOutput: {out_dir}  fps={args.fps}  "
-          f"skip_existing={skip}  workers={args.workers}", flush=True)
+    print(f"Source: {args.tar or args.bvh_dir}\nOutput: {out_dir}  robot={args.robot}  fps={args.fps}  "
+          f"skip_existing={skip}  workers={args.workers}  keep_heading={args.keep_heading}", flush=True)
     if args.tar:
-        jobs = _tar_jobs(args.tar, out_dir, args.fps, skip, args.max_files, counts)
+        jobs = _tar_jobs(args.tar, out_dir, args.fps, skip, args.max_files, counts, args.robot, only, args.keep_heading)
     else:
-        jobs = _dir_jobs(args.bvh_dir, out_dir, args.fps, skip, args.max_files, counts)
+        jobs = _dir_jobs(args.bvh_dir, out_dir, args.fps, skip, args.max_files, counts, args.robot, only, args.keep_heading)
     _run_jobs(jobs, args.workers, counts, out_dir)
 
 

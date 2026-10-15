@@ -569,6 +569,13 @@ set(EXE_INCLUDES
 )
 
 
+# The top-level CMakeLists builds everything with -ffast-math.  Its -ffinite-math-only folds std::isfinite() to
+# "true", which silently disables every NaN/Inf guard of the A3 deploy (a3_ref frame codec, teleop reference
+# buffer, SMPL source, policy output) -- unit test A3TaBridgeCodec.RejectsMalformedMessages caught it.  Keep the
+# other fast-math optimisations but not that one for the A3 sources; the G1 sources build exactly as upstream.
+file(GLOB A3_DEPLOY_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/*.cpp)
+set_source_files_properties(${A3_DEPLOY_SRCS} PROPERTIES COMPILE_OPTIONS "-fno-finite-math-only")
+
 # Build a static library, used by both the main executable and the tests:
 add_library(g1_deploy_shared STATIC ${PROJECT_SRCS})
 target_include_directories(g1_deploy_shared PUBLIC ${EXE_INCLUDES})
@@ -1037,6 +1044,39 @@ else()
   message(STATUS
     "Skipping ${A3_BODY_DRIVE_DEBUG_RECORD_NAME} "
     "(requires ENABLE_A3_AIMRT_BACKEND=ON and ENABLE_A3_ROS_MSGS=ON)")
+endif()
+
+# -----------------------------------------------------------------------------
+# a3_ta_bridge: ZMQ "a3_ref" (real-time Pico -> A3 retargeter) -> AimRT ROS2 channel
+# /ta/whole_body_command. Needs the TA protobuf bindings; the ROS2 publisher is only compiled
+# when AimRT's ros2_plugin_proto (RosMsgWrapper) is available, otherwise --dry-run only.
+# -----------------------------------------------------------------------------
+if(A3_TA_PROTO_AVAILABLE)
+  add_executable(a3_ta_bridge
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools/a3_ta_bridge/a3_ta_bridge.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/a3_deploy/a3_ta_bridge_codec.cpp)
+  target_include_directories(a3_ta_bridge PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${ZMQ_INCLUDE_DIR} ${CPPZMQ_INCLUDE_DIR})
+  target_compile_definitions(a3_ta_bridge PRIVATE HAS_A3_TA_PROTO=1)
+  target_link_libraries(a3_ta_bridge PRIVATE a3_ta_proto ${ZMQ_LIBRARY} pthread)
+  # rclcpp_FOUND is forced FALSE above when HAS_ROS2=0; AimRT located rclcpp in its own scope.
+  find_package(rclcpp QUIET)
+  if(A3_AIMRT_BACKEND_AVAILABLE AND rclcpp_FOUND AND TARGET ros2_plugin_proto::ros2_plugin_proto__rosidl_typesupport_cpp)
+    target_compile_definitions(a3_ta_bridge PRIVATE A3_TA_BRIDGE_WITH_ROS2=1)
+    target_link_libraries(a3_ta_bridge PRIVATE
+      rclcpp::rclcpp
+      ros2_plugin_proto::ros2_plugin_proto__rosidl_generator_cpp
+      ros2_plugin_proto::ros2_plugin_proto__rosidl_typesupport_cpp)
+    message(STATUS "✅ a3_ta_bridge: ROS2 publisher enabled")
+  else()
+    message(STATUS "a3_ta_bridge: ROS2/AimRT proto unavailable -> dry-run only")
+  endif()
+  set_target_properties(a3_ta_bridge PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${GS_RUNTIME_OUTPUT_DIR}"
+    CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF
+    BUILD_WITH_INSTALL_RPATH TRUE
+    BUILD_RPATH "$ORIGIN;/opt/ros/jazzy/lib;/opt/ros/humble/lib"
+    INSTALL_RPATH "$ORIGIN;/opt/ros/jazzy/lib;/opt/ros/humble/lib")
 endif()
 
 # test executable:

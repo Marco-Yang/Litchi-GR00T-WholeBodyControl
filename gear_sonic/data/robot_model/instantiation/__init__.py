@@ -1,5 +1,10 @@
 """Robot model instantiation helpers and the robot-name registry used by `--robot`."""
 
+from .a3 import (
+    instantiate_a3_robot_model,
+    instantiate_a3_ultra_robot_model,
+    instantiate_h2_robot_model,
+)
 from .g1 import instantiate_g1_robot_model
 
 # Add an entry here once a robot has both an instantiate_*_robot_model() function
@@ -7,6 +12,9 @@ from .g1 import instantiate_g1_robot_model
 # See docs/source/user_guide/new_embodiments.md.
 ROBOT_MODEL_REGISTRY = {
     "g1": instantiate_g1_robot_model,
+    "a3": instantiate_a3_robot_model,
+    "a3_ultra": instantiate_a3_ultra_robot_model,
+    "h2": instantiate_h2_robot_model,
 }
 
 
@@ -22,4 +30,11 @@ def instantiate_robot_model(robot: str, **kwargs):
     return ROBOT_MODEL_REGISTRY[robot](**kwargs)
 
 
-__all__ = ["instantiate_g1_robot_model", "ROBOT_MODEL_REGISTRY", "instantiate_robot_model"]
+__all__ = [
+    "instantiate_g1_robot_model",
+    "instantiate_a3_robot_model",
+    "instantiate_a3_ultra_robot_model",
+    "instantiate_h2_robot_model",
+    "ROBOT_MODEL_REGISTRY",
+    "instantiate_robot_model",
+]

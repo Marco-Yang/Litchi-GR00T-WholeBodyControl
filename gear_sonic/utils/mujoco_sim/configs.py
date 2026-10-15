@@ -22,7 +22,11 @@ WBC_VERSIONS = ["sonic_model12"]
 # See docs/source/user_guide/new_embodiments.md.
 ROBOT_WBC_YAML = {
     "g1": "g1_29dof_sonic_model12.yaml",
+    # A3 family: simulated by a3_sim.py (A3 body-drive ROS2 contract), not the Unitree-SDK2 sim.
+    "a3": "a3_035.yaml",
+    "a3_ultra": "a3_ultra_035.yaml",
 }
+DEFAULT_SIM_FREQUENCY = 200
 
 @dataclass
 class ArgsConfigTemplate:
@@ -346,6 +350,9 @@ class BaseConfig(ArgsConfigTemplate):
             wbc_config = yaml.load(file, Loader=yaml.FullLoader)
 
         wbc_config = override_wbc_config(wbc_config, self)
+        # Robots with their own preferred physics step keep it unless --sim-frequency was changed.
+        if "SIMULATE_DT_DEFAULT" in wbc_config and float(self.sim_frequency) == DEFAULT_SIM_FREQUENCY:
+            wbc_config["SIMULATE_DT"] = wbc_config["SIMULATE_DT_DEFAULT"]
 
         return wbc_config
 

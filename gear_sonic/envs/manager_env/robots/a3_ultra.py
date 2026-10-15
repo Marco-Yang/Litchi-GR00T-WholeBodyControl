@@ -1,16 +1,25 @@
 """A3 Ultra (T3D0) robot configuration.
 
-Kp/Kd, joint effort/velocity limits come from AgiBot's
-docs/robot_parameters/A3_Ultra/A3_关节控制参数KpKd.docx (31 body joints: legs,
-waist, arms, head). The hand (32 finger joints per both hands) has no vendor
-Kp/Kd data and is intentionally left out of `actuators` below, so it is
-unactuated by the training articulation — mirroring AgiBot's own
-a3_ultra_t3d0.xml MJCF, whose <actuator> section likewise only drives these
-same 31 body joints and leaves the fingers passive.
+Control parameters -- which Kp/Kd source is active
+--------------------------------------------------
+``A3_ULTRA_GAIN_SOURCE`` selects where the joint-level control parameters come from:
 
-The default standing pose (init_state.joint_pos) and spawn height come from
-the <keyframe> in gear_sonic/data/assets/robot_description/mjcf/a3_ultra_t3d0.xml
-(a vendor-provided default qpos), not an estimate.
+* ``"litchi_a3_024"`` (ACTIVE): the AgiBot A3 contract of Litchi_sonic_for_a3 (``a3.py``,
+  robot type ``a3_024`` = the released 035 checkpoint contract).  The 29 body joints get exactly the
+  A3_024 stiffness / damping / effort / velocity limits / armature / friction, the same default
+  standing pose and spawn height, and therefore the same position-action scale.  The deploy side
+  (``gear_sonic_deploy`` profile ``a3_024``: ``a3_024_kps`` / ``a3_024_kds`` / ``a3_024_action_scale``
+  and the fixed head gains Kp=40 / Kd=2 at q=0) uses the very same numbers, so a policy trained with
+  ``--robot a3_ultra`` sees the low-level contract it will be deployed with.  Because the values are
+  taken from ``a3.py`` itself, they cannot drift from the Litchi A3 definition.
+* ``"vendor_doc"`` (kept, NOT active): the values derived from AgiBot's
+  docs/robot_parameters/A3_Ultra/A3_关节控制参数KpKd.docx and armature.png / instructions.md
+  (31 body joints: legs, waist, arms, head).  Switch back by editing the constant below.
+
+What is A3-Ultra specific in either mode: the URDF/meshes/masses, the two head joints (Litchi's A3 URDF
+has none; they use the fixed-head gains of the deploy code, effort/armature of the 6 Nm PFP-41-48 motor), and
+the 32 finger joints, which have no actuator (they are excluded from the RL action space in
+sonic_a3_ultra_t3d0.yaml, mirroring AgiBot's own a3_ultra_t3d0.xml whose <actuator> only drives the body joints).
 
 IsaacLab<->MuJoCo DOF/body index mappings were computed (not hand-guessed) by:
   1. BFS traversal of the URDF kinematic tree via Pinocchio, which was verified
@@ -20,16 +29,17 @@ IsaacLab<->MuJoCo DOF/body index mappings were computed (not hand-guessed) by:
   3. A round-trip check (isaaclab -> mujoco -> isaaclab) over every joint and
      body name, which passed for all 63 DOF / 64 bodies.
 
-Armature values come from docs/robot_parameters/A3_Ultra/armature.png:
-  J_output = J_motor * N^2  (reflected rotor inertia at joint output)
-  Parallel joints (ankle, waist_roll/pitch) use the equivalent serial-joint
-  inertia from docs/robot_parameters/A3_Ultra/instructions.md.
-  Per instructions.md note 2, a 3% domain-rand spread is recommended.
+Vendor-doc armature values (also what the Litchi A3 uses, worklog #37): J_output = J_motor * N^2; parallel
+joints (ankle, waist_roll/pitch) use the equivalent serial-joint inertia from instructions.md.
 """
+
+import copy
 
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 import isaaclab.sim as sim_utils
+
+from gear_sonic.envs.manager_env.robots.a3 import A3_024_CYLINDER_CFG, A3_ACTIVE_JOINT_NAMES
 
 ASSET_DIR = "gear_sonic/data/assets"
 
@@ -134,33 +144,44 @@ A3ULTRA_ISAACLAB_TO_MUJOCO_MAPPING = {
     "mujoco_to_isaaclab_body": A3ULTRA_MUJOCO_TO_ISAACLAB_BODY,
 }
 
-A3_ULTRA_CFG = ArticulationCfg(
-    spawn=sim_utils.UrdfFileCfg(
-        fix_base=False,
-        replace_cylinders_with_capsules=True,
-        asset_path=f"{ASSET_DIR}/robot_description/urdf/a3_ultra/a3_ultra_t3d0.urdf",
-        activate_contact_sensors=True,
-        rigid_props=sim_utils.RigidBodyPropertiesCfg(
-            disable_gravity=False,
-            retain_accelerations=False,
-            linear_damping=0.0,
-            angular_damping=0.0,
-            max_linear_velocity=1000.0,
-            max_angular_velocity=1000.0,
-            max_depenetration_velocity=1.0,
-        ),
-        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            enabled_self_collisions=True,
-            solver_position_iteration_count=8,
-            solver_velocity_iteration_count=4,
-        ),
-        joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
-            gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(stiffness=0, damping=0)
-        ),
-    ),
-    # z=1.2 and all joint defaults below come from the <keyframe> in
-    # gear_sonic/data/assets/robot_description/mjcf/a3_ultra_t3d0.xml (vendor default pose).
-    init_state=ArticulationCfg.InitialStateCfg(
+# Where the joint-level control parameters come from: "litchi_a3_024" (active) or "vendor_doc" (kept for later).
+A3_ULTRA_GAIN_SOURCE = "litchi_a3_024"
+
+# The deploy code holds the head at q=0 with fixed gains (expand_to_backend.hpp: kA3HeadKp / kA3HeadKd); the
+# Litchi A3 URDF has no head joints, so these two joints take their gains from there.
+A3_ULTRA_HEAD_JOINTS = ["head_yaw_joint", "ultra_head_pitch_joint"]
+A3_ULTRA_HEAD_KP = 40.0
+A3_ULTRA_HEAD_KD = 2.0
+
+
+def _litchi_a3_024_init_state():
+    """Default pose / spawn height of the Litchi A3 contract; head at 0 like the deploy code; fingers stay at 0."""
+    src = A3_024_CYLINDER_CFG.init_state
+    joint_pos = {k: v for k, v in src.joint_pos.items() if k in A3_ACTIVE_JOINT_NAMES}
+    joint_pos.update(dict.fromkeys(A3_ULTRA_HEAD_JOINTS, 0.0))
+    return ArticulationCfg.InitialStateCfg(pos=tuple(src.pos), joint_pos=joint_pos, joint_vel={".*": 0.0})
+
+
+def _litchi_a3_024_actuators():
+    """The A3_024 actuator groups for the shared 29 body joints (the passive-foot spring group has no A3 Ultra joints)."""
+    actuators = {
+        name: copy.deepcopy(A3_024_CYLINDER_CFG.actuators[name])
+        for name in ("legs", "feet", "waist", "arms")
+    }
+    actuators["head"] = ImplicitActuatorCfg(
+        joint_names_expr=A3_ULTRA_HEAD_JOINTS,
+        effort_limit_sim=6.0,
+        velocity_limit_sim=12.78,
+        stiffness=A3_ULTRA_HEAD_KP,
+        damping=A3_ULTRA_HEAD_KD,
+        armature=0.000810,
+    )
+    return actuators
+
+
+def _vendor_doc_init_state():
+    """Vendor default pose (A3 Ultra <keyframe> in a3_ultra_t3d0.xml, z=1.2), for A3_ULTRA_GAIN_SOURCE == "vendor_doc"."""
+    return ArticulationCfg.InitialStateCfg(
         pos=(0.0, 0.0, 1.2),
         joint_pos={
             "left_hip_pitch_joint": -0.202414,
@@ -196,9 +217,12 @@ A3_ULTRA_CFG = ArticulationCfg(
             "ultra_head_pitch_joint": 0.014967,
         },
         joint_vel={".*": 0.0},
-    ),
-    soft_joint_pos_limit_factor=0.9,
-    actuators={
+    )
+
+
+def _vendor_doc_actuators():
+    """Kp/Kd/limits from AgiBot's A3_关节控制参数KpKd.docx; used when A3_ULTRA_GAIN_SOURCE == "vendor_doc"."""
+    return {
         # PFP-93-65: J_motor=138.5069e-6, N=21.906 → J_output=0.066466 kg·m²
         # Kp=200, Kd=7, effort=220 Nm, vel=12.04 rad/s
         "hip": ImplicitActuatorCfg(
@@ -328,9 +352,54 @@ A3_ULTRA_CFG = ArticulationCfg(
         # vendor Kp/Kd and are left unactuated here -- same as AgiBot's own
         # a3_ultra_t3d0.xml MJCF, whose <actuator> section only drives these 31 body
         # joints. They must also be excluded from manager_env.actions.joint_pos.joint_names
-        # in the experiment config (see sonic_a3_ultra.yaml), otherwise IsaacLab's default
+        # in the experiment config (see sonic_a3_ultra_t3d0.yaml), otherwise IsaacLab's default
         # joint_names=[".*"] action term would include them in the RL action space.
-    },
+    }
+
+
+def _init_state():
+    if A3_ULTRA_GAIN_SOURCE == "litchi_a3_024":
+        return _litchi_a3_024_init_state()
+    if A3_ULTRA_GAIN_SOURCE == "vendor_doc":
+        return _vendor_doc_init_state()
+    raise ValueError(f"unknown A3_ULTRA_GAIN_SOURCE={A3_ULTRA_GAIN_SOURCE!r}")
+
+
+def _actuators():
+    if A3_ULTRA_GAIN_SOURCE == "litchi_a3_024":
+        return _litchi_a3_024_actuators()
+    if A3_ULTRA_GAIN_SOURCE == "vendor_doc":
+        return _vendor_doc_actuators()
+    raise ValueError(f"unknown A3_ULTRA_GAIN_SOURCE={A3_ULTRA_GAIN_SOURCE!r}")
+
+
+A3_ULTRA_CFG = ArticulationCfg(
+    spawn=sim_utils.UrdfFileCfg(
+        fix_base=False,
+        replace_cylinders_with_capsules=True,
+        asset_path=f"{ASSET_DIR}/robot_description/urdf/a3_ultra/a3_ultra_t3d0.urdf",
+        activate_contact_sensors=True,
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            disable_gravity=False,
+            retain_accelerations=False,
+            linear_damping=0.0,
+            angular_damping=0.0,
+            max_linear_velocity=1000.0,
+            max_angular_velocity=1000.0,
+            max_depenetration_velocity=1.0,
+        ),
+        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+            enabled_self_collisions=True,
+            solver_position_iteration_count=8,
+            solver_velocity_iteration_count=4,
+        ),
+        joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
+            gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(stiffness=0, damping=0)
+        ),
+    ),
+    init_state=_init_state(),
+    soft_joint_pos_limit_factor=0.9,
+    actuators=_actuators(),
 )
 
 A3_ULTRA_ACTION_SCALE = {}

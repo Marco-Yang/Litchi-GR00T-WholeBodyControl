@@ -1,0 +1,22 @@
+# MuJoCo sim config for --robot a3_ultra (AgiBot A3 Ultra, T3D0), consumed by a3_sim.py.
+# The G1 sim speaks Unitree SDK2; the A3 family speaks the A3 body-drive ROS2 contract
+# (/body_drive/*_joint_state|_command, */imu/data) so the unmodified C++ a3_deploy_onnx_ref
+# runs against MuJoCo exactly as against the real robot.
+# Gains are NOT set here: the deploy binary sends kp/kd per joint (035 contract, profile a3_024).
+ROBOT_TYPE: 'a3_ultra_t3d0'
+SIM_BACKEND: 'a3_ros2'
+ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/a3_ultra/a3_ultra_t3d0.xml"
+ROOT_BODY: "pelvis_link"
+# topic joint name -> MJCF joint name (A3 Ultra's pitch joint on the head carries a different name)
+JOINT_ALIAS:
+  head_pitch_joint: ultra_head_pitch_joint
+SIMULATOR: "mujoco"
+SIMULATE_DT_DEFAULT: 0.002   # used unless --sim-frequency is changed from its default
+VIEWER_DT: 0.02
+STATE_PUBLISH_HZ: 250        # deploy side requires per-topic samples fresher than 10 ms
+ENABLE_ELASTIC_BAND: True    # hold the robot up until key 9 (same as the G1 sim)
+# Pelvis z while hanging. Standing pelvis is ~1.07 m; 1.35 m lifts the feet clear of the floor
+# so the bring-up matches G1 (suspended until the operator presses 9).
+BAND_HEIGHT: 1.35
+VIEWER_DISTANCE: 3.0
+ROS_DOMAIN_ID: 87            # dedicated domain, see plan 9.7 (never use the default 0 on a dev machine)

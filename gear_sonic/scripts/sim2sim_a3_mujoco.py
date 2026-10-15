@@ -1445,6 +1445,11 @@ DEFAULT_MOTION = (
 )
 FOOT_SPRING_JOINT_NAMES = PASSIVE_FOOT_JOINT_NAMES
 DEFAULT_REFERENCE_ON_END = "hold_last"
+DEFAULT_TELEOP_START_MOTION = (
+    Path(__file__).resolve().parents[2]
+    / "gear_sonic_deploy/assets/a3_runtime/teleop_motions"
+    / "BMD_0319_a3_filtered_20260319_164305__stand_Skeleton0.csv"
+)
 INIT_FRAME = 0
 PROGRESS_INTERVAL = 0.25
 PROGRESS_BAR_WIDTH = 32
@@ -4060,10 +4065,24 @@ class LoopSimRunner:
             self.config.future_valid_frames,
             self.config.future_zero_pad,
         )
+        return self._step_policy_with_encoder_input(encoder_input)
+
+    def _step_policy_with_encoder_input(
+        self,
+        encoder_input: np.ndarray,
+        target_il_filter=None,
+    ) -> PolicyStepResult:
+        """Run one policy tick for a prepared encoder input.
+
+        ``target_il_filter`` (optional) post-processes the decoded IsaacLab-order joint
+        target before it is sent to the PD loop (used by the live teleop fallback).
+        """
         actor_obs = flatten_history(self.history)
         raw_action_il = self.policy.act(encoder_input, actor_obs, self.device).astype(np.float64)
         raw_action_il = np.clip(raw_action_il, -ACTION_CLIP, ACTION_CLIP)
         target_il = self.runtime.mapping.default_q_il + raw_action_il * self.runtime.mapping.action_scale_il
+        if target_il_filter is not None:
+            target_il = target_il_filter(target_il)
         target_by_joint = target_il_to_actuator_targets(self.runtime.mapping, target_il)
 
         if self.action_delay_substeps <= 0:
@@ -4442,6 +4461,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start-paused", action="store_true", help="Start the MuJoCo viewer paused.")
     parser.add_argument(
+        "--teleop-zmq",
+        default=None,
+        metavar="URL",
+        help=(
+            "Live teleop: subscribe to 'a3_ref' joint-space frames from a3_teleop_retarget_node.py "
+            "(e.g. tcp://localhost:5560) and drive the policy from them in real time. --motion then only "
+            "provides the start pose (default: the standing teleop clip). Implements the same delayed "
+            "window as the deploy's /ta/whole_body_command path (see gear_sonic/utils/teleop/a3)."
+        ),
+    )
+    parser.add_argument("--teleop-seconds", type=float, default=0.0, help="Stop live teleop after N sim seconds (0 = run until closed).")
+    parser.add_argument("--teleop-viewer", action="store_true", help="Open the MuJoCo viewer during live teleop (default: headless).")
+    parser.add_argument("--teleop-delay-ms", type=float, default=None, help="Override the teleop window delay (default 940 ms for g1, 220 ms for a3_fast).")
+    parser.add_argument("--teleop-stale-ms", type=float, default=250.0, help="Hold the last command if the stream is older than this.")
+    parser.add_argument("--teleop-report", type=Path, default=None, help="Write a JSON summary of the live teleop run.")
+    parser.add_argument(
         "--encoder-mode",
         choices=("g1", "a3_fast", "a3_fast_100ms", "a3_fast_100ms_zero", "a3_fast_history"),
         default=None,
@@ -4632,6 +4667,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.teleop_zmq and args.motion is None:
+        # Live teleop only needs a start pose: use the deploy's standing teleop clip.
+        args.motion = DEFAULT_TELEOP_START_MOTION
 
     config = build_sim_config(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -4701,6 +4739,24 @@ def main() -> None:
         policy = A3Policy(config.checkpoint, device, encoder=config.encoder)
         print_loop_summary(config, model, runtime, motion_paths, initial_reference, policy, device)
         data = mujoco.MjData(model)
+        if args.teleop_zmq:
+            from gear_sonic.utils.teleop.a3.sim_teleop import run_teleop_sim
+
+            run_teleop_sim(
+                sys.modules[__name__],
+                model,
+                data,
+                runtime,
+                motion_paths,
+                initial_reference,
+                solver,
+                policy,
+                controls,
+                device,
+                config,
+                args,
+            )
+            return
         run_loop_sim(
             model,
             data,

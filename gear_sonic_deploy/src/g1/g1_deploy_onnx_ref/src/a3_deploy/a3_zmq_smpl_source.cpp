@@ -104,6 +104,8 @@ bool A3ZmqSmplSource::Start(const A3ZmqSmplSourceOptions& options) {
   if (!options_.enabled) return true;
 
   merger_ = std::make_unique<StreamedMotionMerger>();
+  // The merger logs a few lines per incoming chunk (150 lines/s at 50 Hz); keep that for smpl_zmq.verbose only.
+  StreamedMotionMerger::DebugLogging() = options_.verbose;
   subscriber_ = std::make_unique<ZMQPackedMessageSubscriber>(
       options_.host, options_.port, options_.topic,
       /*timeout_ms=*/100, options_.verbose, options_.conflate,

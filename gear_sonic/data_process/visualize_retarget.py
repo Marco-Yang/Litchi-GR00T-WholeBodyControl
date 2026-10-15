@@ -186,7 +186,8 @@ def render_soma_frame(frame: dict, img_size: int = 512, motion_text: str = "",
 # Render A3 Ultra MuJoCo frame
 # ---------------------------------------------------------------------------
 class MuJoCoRenderer:
-    def __init__(self, xml_path: str, width: int = 512, height: int = 512):
+    def __init__(self, xml_path: str, width: int = 512, height: int = 512, title: str = "A3 Ultra (front view)"):
+        self.title = title
         self.model = mj.MjModel.from_xml_path(xml_path)
         self.data = mj.MjData(self.model)
         self.renderer = mj.Renderer(self.model, height=height, width=width)
@@ -247,7 +248,7 @@ class MuJoCoRenderer:
             if uv is not None:
                 cv2.putText(img_bgr, tag, (uv[0] + 8, uv[1] + 6), cv2.FONT_HERSHEY_SIMPLEX,
                             0.7, col, 2, cv2.LINE_AA)
-        cv2.putText(img_bgr, "A3 Ultra (front view)", (10, 24),
+        cv2.putText(img_bgr, self.title, (10, 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1, cv2.LINE_AA)
         _put_bottom_text(img_bgr, motion_text)
         return img_bgr

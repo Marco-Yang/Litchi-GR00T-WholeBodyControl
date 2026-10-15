@@ -351,10 +351,14 @@ Training and deployment select the robot with one flag:
 |---|---|---|---|
 | `g1` (default) | `sonic_v1_1` | Original G1 path (TensorRT + `unitree_sdk2`) | Unchanged |
 | `a3` | `sonic_a3_035` | `deploy_a3.sh --robot a3` (ONNX Runtime CPU / RKNN) | AgiBot A3 (T2D5), 29 DOF, 035 contract |
-| `a3_ultra` | `sonic_a3_ultra` | `deploy_a3.sh --robot a3_ultra` | Own T3D0 63-DOF training contract. Deploy currently runs the 035 policy: A3 and A3 Ultra share the hardware platform, but a deploy export of the T3D0 contract does not exist yet |
+| `a3_ultra` | `sonic_a3_ultra` | `deploy_a3.sh --robot a3_ultra` | AgiBot A3 Ultra (T3D0). **Deploys the downloaded 035 weights** (officially stated to support A3 and A3 Ultra); head joints fixed at their default pose, fingers not driven. **Trains the A3 contract**: `sonic_a3_ultra` inherits `sonic_a3_035` (A3 URDF, a3_024 parameters, domain randomization tuned for A3 *and* A3 Ultra, 29 policy joints) on the Bones-SEED library retargeted onto the A3 itself (`batch_retarget_bvh_soma_a3ultra.py --robot a3`, `a3_29` format). The Ultra's own 63-DOF contract is `+exp=manager/universal_token/all_modes/sonic_a3_ultra_t3d0` (not deployable) |
 | `h2` | `sonic_h2` | not available (no C++ backend yet) | |
 
-The 035 and T3D0 contracts are independent: never reuse one's Kp/Kd for the other.
+For `a3_ultra`, the joint-level control parameters (Kp/Kd, effort/velocity limits, armature, friction,
+default pose, action scale) are the Litchi A3 `a3_024` contract everywhere -- training
+(`robots/a3_ultra.py`, `A3_ULTRA_GAIN_SOURCE = "litchi_a3_024"`), the C++ deploy profile `a3_024`, and the
+MuJoCo simulator (which receives them from the deploy binary). AgiBot's A3 Ultra Kp/Kd document is
+kept in `a3_ultra.py` but is not used (`"vendor_doc"`). `tests/test_a3_ultra_contract.py` keeps the three in sync.
 
 ### Quick start
 
@@ -379,8 +383,45 @@ accelerate launch --num_processes=1 gear_sonic/train_agent_trl.py --robot a3 \
     checkpoint=checkpoints/035_step200000/model_step_200000.pt +resume=false \
     headless=true num_envs=4096 \
     "++manager_env.commands.motion.motion_lib_cfg.motion_file=[/abs/path/to/a3_motionlib]"
-python gear_sonic/train_agent_trl.py --robot a3_ultra ...   # same flag for the other robots
+# once: retarget Bones-SEED onto the A3 with the A3 parameters (a3_29 library, 129k clips, ~2 h with 16 workers)
+python gear_sonic/data_process/batch_retarget_bvh_soma_a3ultra.py --robot a3 --tar data/bones_seed/soma_proportional.tar.gz \
+    --output data/motion_lib_a3_29d/robot_filtered_v15_clean --only_from data/motion_lib_a3ultra/robot_filtered_v15_clean --workers 16 \
+    --keep_heading   # keep the capture heading (the frame of the SMPL data); without it every clip faces +X at frame 0
+# a library made without --keep_heading is turned back in place of a re-run (SMPL encoder only; plan section 17.8):
+python gear_sonic/data_process/restore_a3_heading.py --library <lib> --output <lib>_heading
+python gear_sonic/data_process/compare_smpl_vs_a3.py --stats --robot <lib>_heading   # heading offset to data/smpl_filtered (~0)
+python gear_sonic/train_agent_trl.py --robot a3_ultra ...   # same flag for the other robots; reads that library (035 contract, DR over A3 and A3 Ultra)
+python gear_sonic/train_agent_trl.py +exp=manager/universal_token/all_modes/sonic_a3_ultra_smpl ...   # + our SMPL encoder; needs data/smpl_filtered (plan section 17)
 ```
+
+#### A3 Ultra with the downloaded weights (MuJoCo, same flow as G1)
+
+```bash
+python download_from_hf.py --robot a3_ultra                  # the same 035 weights; there is no A3U-specific checkpoint
+gear_sonic_deploy/scripts/setup_a3_sim_env.sh                # one-time: ROS 2 python env for the simulator
+python gear_sonic/scripts/run_sim_loop.py --robot a3_ultra   # terminal 1: MuJoCo with the A3 Ultra (T3D0) model
+gear_sonic_deploy/deploy.sh --robot a3_ultra sim             # terminal 2: unchanged C++ deploy binary (keys S, M, R / T, 3)
+```
+
+See `docs/notes/a3/mujoco_pico_sim_teleop.md` for the full A3 / A3 Ultra MuJoCo + Pico tutorial (three terminals; `docs/notes/g1/mujoco_pico_sim_teleop.md` section 8 is the short version) and
+`docs/workflow/a3_integration_plan.md` section 14 for what was and was not verified on A3 Ultra.
+
+#### Pico teleop encoder: `--encoder a3-fast|smpl`
+
+```bash
+gear_sonic_deploy/deploy.sh --robot a3_ultra --input-type zmq_manager sim --encoder a3-fast   # default: downloaded 035 a3_fast policy
+gear_sonic_deploy/deploy.sh --robot a3_ultra --input-type zmq_manager sim --encoder smpl --smpl-model <model_step_N_smpl.onnx>
+python gear_sonic/scripts/pico_manager_thread_server.py --robot a3_ultra --manager --num_frames_to_send 10   # Pico side
+```
+
+`--encoder a3-fast` (Pico SMPL -> GMR retargeting -> A3 joint references -> `a3_ta_bridge` -> `/ta/whole_body_command`)
+is fully usable with the downloaded weights. `--encoder smpl` (Pico SMPL stream + A3 wrist angles -> SMPL-encoder policy)
+needs an SMPL-encoder ONNX (`obs_dict[1,1770] -> action[1,29]`) that **does not exist for A3 / A3 Ultra yet**: the 035
+release only has the `g1` and `a3_fast` encoders. Without a model the flag exits with instructions;
+`--smpl-model stub` runs a plumbing-test policy that stands and ignores the operator. The chosen source is locked in the
+deploy binary (`--teleop-source`, keys `1/2/3` are rejected). Real robot: run `scripts/a3_operator_chain.sh --encoder ...`
+on the operator PC and `deploy.sh ... real --no-chain` on the robot. Details, verification and caveats:
+`docs/workflow/a3_integration_plan.md` section 15.
 
 Verified with the official weights: ONNX matches the PT policy to better than 4e-6 per step,
 and the PT and both ONNX models complete a 1652-step MuJoCo walk without falling. Always
@@ -394,6 +435,7 @@ validate in MuJoCo and use a safety gantry before touching a real robot.
 | Bones-SEED G1 CSV (`g1.tar.gz`) | Gated dataset, accept the license on Hugging Face first | `data/bones_seed/` (not in git) |
 | `data_process/convert_a3_csv_to_motion_lib.py` | A3 flat CSV to motion-lib PKL | |
 | `data_process/batch_retarget_bvh_soma_a3ultra.py` | SOMA BVH to A3 Ultra motion-lib | |
+| `data_process/restore_a3_heading.py`, `compare_smpl_vs_a3.py`, `make_compare_videos.py` | turn a retarget library back to the capture heading; SMPL-vs-robot checks and videos | |
 
 The internal motion dataset used for the 035 checkpoint is not released. The SOMA
 retargeter itself lives in [NVIDIA/soma-retargeter](https://github.com/NVIDIA/soma-retargeter).

@@ -1,0 +1,43 @@
+# @package _global_
+# A3 SMPL encoder: `sonic_a3_ultra` (A3 parameters, domain randomization over A3 and A3 Ultra, a3_29 motion library) plus the
+# SMPL encoder -- the encoder the A3 deploy loads with `deploy.sh --encoder smpl` (obs_dict[1,1770] -> action[1,29]).
+#
+# What it adds to the 035 contract:
+#   * the `smpl` encoder (inputs smpl_joints_multi_future_local_nonflat | smpl_root_ori_b_multi_future |
+#     joint_pos_multi_future_wrist_for_smpl = 840 floats, 10 frames x 0.02 s, wrist columns = IsaacLab 23..28: exactly what
+#     A3ZmqSmplSource builds from the Pico stream), sampled together with g1 so the SMPL latent is aligned to the g1 latent
+#     (g1_smpl_latent, reencoded_smpl_g1_latent) -- the same mechanism the G1 SONIC release uses;
+#   * SMPL motion data: `smpl_motion_file` (Bones-SEED SMPL, `python download_from_hf.py --training`, ~30 GB -> data/smpl_filtered).
+#     A motion without a matching SMPL entry cannot sample the smpl encoder; keys are the clip names, frame counts must equal
+#     the robot motion's (the A3 retarget keeps the BVH's 30 fps stride, like the G1 library).
+#   * the robot library must be in the SMPL data's world heading (retargeted with --keep_heading or turned back with restore_a3_heading.py;
+#     the default data/motion_lib_a3_29d/robot_filtered_v15_clean is).  Check with:
+#     python gear_sonic/data_process/check_smpl_pairing.py --robot <library> --smpl data/smpl_filtered   (exit 1 when not).
+# The teleop encoder stays off (not deployed on A3).  Nothing here has been trained to convergence; see
+# docs/workflow/a3_integration_plan.md section 17.
+
+defaults:
+  - /exp/manager/universal_token/all_modes/sonic_a3_ultra
+  - override /aux_losses: universal_token/g1_recon_smpl_and_a3_fast_latent_no_teleop
+  - _self_
+
+exp_var: a3ultra_smpl
+project_name: TRL_A3Ultra_SMPL
+
+manager_env:
+  commands:
+    motion:
+      encoder_sample_probs:
+        g1: 1.0
+        teleop: 0.0
+        smpl: 1.0
+        a3_fast: 1.0
+      motion_lib_cfg:
+        smpl_motion_file: data/smpl_filtered
+
+algo:
+  config:
+    actor:
+      backbone:
+        active_encoders: ["g1", "a3_fast", "smpl"]
+        reencode_smpl_g1_recon: true

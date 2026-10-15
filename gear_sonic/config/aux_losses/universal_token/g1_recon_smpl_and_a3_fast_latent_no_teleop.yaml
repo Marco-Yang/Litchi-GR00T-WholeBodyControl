@@ -1,0 +1,18 @@
+# @package algo.config.actor.backbone
+
+# A3 SMPL-encoder training (sonic_a3_ultra_smpl.yaml): keep the G1 reconstruction, align the A3-fast latent to g1 (as in the
+# 035 contract) and align the SMPL latent to g1 on motions that have matched SMPL data.  Same as
+# g1_recon_smpl_and_a3_fast_latent.yaml without the teleop terms: the teleop encoder is not part of the A3 deploy.
+defaults:
+  - terms/g1_recon@aux_loss_func
+  - terms/g1_smpl_latent@aux_loss_func
+  - terms/reencoded_smpl_g1_latent@aux_loss_func
+  - terms/a3_fast_g1_latent@aux_loss_func
+  - terms/reencoded_a3_fast_g1_latent@aux_loss_func
+
+aux_loss_coef:
+  g1_recon: 0.01
+  g1_smpl_latent: 1.0
+  reencoded_smpl_g1_latent: 1.0
+  a3_fast_g1_latent: 1.0
+  reencoded_a3_fast_g1_latent: 0.0  # as in 035 (reencode_a3_fast_g1_recon: false)

@@ -123,8 +123,13 @@ def get_g1_key_frame_poses(
     # Update forward kinematics
     robot_model.cache_forward_kinematics(q, auto_clip=False)
 
+    # Robots other than G1 (A3 / A3 Ultra) publish their own frames/offsets on their supplemental info.
+    info = getattr(robot_model, "supplemental_info", None)
+    frame_mapping = getattr(info, "key_frame_mapping", None) or G1_FRAME_MAPPING
+    key_offsets = getattr(info, "key_frame_offsets", None) or G1_KEY_FRAME_OFFSETS
+
     result = {}
-    for key, frame_name in G1_FRAME_MAPPING.items():
+    for key, frame_name in frame_mapping.items():
         # Get frame placement from Pinocchio — if the frame doesn't exist,
         # this is a fatal configuration error (wrong URDF or frame name).
         try:
@@ -138,8 +143,8 @@ def get_g1_key_frame_poses(
         rotation_matrix = placement.rotation
 
         # Apply offset in local frame, then transform to world frame
-        if apply_offset and key in G1_KEY_FRAME_OFFSETS:
-            local_offset = G1_KEY_FRAME_OFFSETS[key]
+        if apply_offset and key in key_offsets:
+            local_offset = key_offsets[key]
             world_offset = rotation_matrix @ local_offset
             position = placement.translation + world_offset + root_position
         else:

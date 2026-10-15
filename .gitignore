@@ -223,6 +223,9 @@ decoupled_wbc/control/robot_model/model_data/
 # Downloaded from HuggingFace (hf download)
 sample_data/
 sonic_release/
+# Official G1 training checkpoints (download_from_hf.py --training; last.pt is ~1 GB)
+sonic_v1_1/
+low_latency/
 
 ## Large generated asset files
 *.STL
@@ -279,7 +282,7 @@ gear_sonic_deploy/thirdparty/rockchip_sysroot/*.tar.gz
 # A3 motor model data package (T-N curve source next to the Jacobian .npz)
 !gear_sonic/data/a3_motor_model/*.csv
 # A3 sim2real reference tables (Jacobian grids, armature, T-N, passive foot)
-!docs/a3_024_sim2real_materials/**/*.csv
+!a3_data/a3_024_sim2real_materials/**/*.csv
 
 # --- gear_sonic/data: keep ignoring bulk assets, but track the small A3 files ---
 # The generic `data/` rule above matches gear_sonic/data/ too, which would hide

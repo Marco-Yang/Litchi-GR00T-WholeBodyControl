@@ -19,6 +19,7 @@
 #include "a3_deploy/a3_eval_recorder.hpp"
 #include "a3_deploy/expand_to_backend.hpp"
 #include "a3_deploy/a3_manual_control.hpp"
+#include "a3_deploy/a3_pico_zmq_command.hpp"
 #include "a3_deploy/a3_motion_rpc_controller.hpp"
 #include "a3_deploy/a3_motion_library.hpp"
 #include "a3_deploy/a3_obs_builder.hpp"
@@ -139,9 +140,9 @@ bool HasFlag(int argc, char** argv, const char* flag) {
 bool ValidateKnownFlags(int argc, char** argv, std::string* error) {
   const std::array<std::string, 4> bool_flags = {
       "--dry-run", "--probe", "--probe-manual", "--auto-start"};
-  const std::array<std::string, 4> value_flags = {
+  const std::array<std::string, 7> value_flags = {
       "--runtime-cfg", "--probe-source", "--aimrt-cfg",
-      "--frame-log-interval"};
+      "--frame-log-interval", "--teleop-source", "--zmq-host", "--zmq-port"};
   auto contains = [](const auto& values, const std::string& needle) {
     return std::find(values.begin(), values.end(), needle) != values.end();
   };
@@ -241,10 +242,12 @@ void PrintUsage(const char* progname) {
                " [--dry-run] [--probe] [--probe-manual] [--auto-start]"
                " [--probe-source g1|smpl|both]"
                " [--aimrt-cfg PATH] [--frame-log-interval N]"
+               " [--teleop-source g1|smpl|a3_fast]"
+               " [--zmq-host HOST] [--zmq-port PORT]"
                "\n"
             << "\nSee src/g1/g1_deploy_onnx_ref/config/a3_runtime_config.yaml\n"
                "for an annotated example.\n"
-            << "\n--dry-run Start transport/backend only; do not load policy or publish commands.\n"
+               << "\n--dry-run Start transport/backend only; do not load policy or publish commands.\n"
                "--probe  Run receive/sync + policy inference latency probe; do not publish commands.\n"
                "--probe-manual  Keep the keyboard state machine active during --probe.\n"
                "                Command publishers remain disabled; requires --probe.\n"
@@ -252,7 +255,14 @@ void PrintUsage(const char* progname) {
                "--auto-start Use the simulation/debug flow: PD warmup then policy inference.\n"
                "             Without this flag, startup is PASSIVE and keyboard-controlled.\n"
                "--aimrt-cfg PATH  Override backend.aimrt_cfg_path from runtime config.\n"
-               "--frame-log-interval N  Override logging.frame_log_interval (0 disables).\n";
+               "--frame-log-interval N  Override logging.frame_log_interval (0 disables).\n"
+               "--teleop-source g1|smpl|a3_fast  Preselect and LOCK the TELEOP encoder source\n"
+               "             (same as teleop.default_source). Keys 1/2/3 then cannot switch to another\n"
+               "             source, and a source that is not available is a startup error.\n"
+               "             Also enables G1-like Pico bring-up: auto PD stand + ZMQ command\n"
+               "             listener (A+B+X+Y start/stop) on --zmq-host/--zmq-port.\n"
+               "--zmq-host HOST  Pico ZMQ PUB host for the command topic (default localhost).\n"
+               "--zmq-port PORT  Pico ZMQ PUB port (default 5556).\n";
 }
 
 // --- Config accessors ------------------------------------------------------
@@ -1779,6 +1789,82 @@ int main(int argc, char** argv) {
     }
   }
 
+  // --- Optional startup selection of the TELEOP encoder source -------------
+  // `--teleop-source=g1|smpl|a3_fast` (or `teleop.default_source`) is what
+  // `deploy.sh --encoder smpl|a3-fast` passes: the operator side (retargeter /
+  // SMPL stream) was started for exactly this encoder, so the source is
+  // LOCKED -- keys 1/2/3 cannot switch to another one -- and a source that is
+  // not available is a startup error instead of a silent fallback to g1.
+  bool teleop_source_preselected = false;
+  a3_deploy::A3EncoderSource preselected_teleop_source =
+      a3_deploy::A3EncoderSource::kG1;
+  {
+    std::string requested = NormalizeConfigToken(
+        ParseStringFlag(argc, argv, "--teleop-source", ""));
+    if (requested.empty()) {
+      requested = NormalizeConfigToken(OptionalKey<std::string>(
+          teleop_cfg["default_source"], std::string{}));
+    }
+    if (!requested.empty()) {
+      if (requested == "g1") {
+        preselected_teleop_source = a3_deploy::A3EncoderSource::kG1;
+      } else if (requested == "smpl") {
+        preselected_teleop_source = a3_deploy::A3EncoderSource::kSmpl;
+      } else if (requested == "a3_fast" || requested == "a3fast") {
+        preselected_teleop_source = a3_deploy::A3EncoderSource::kA3Fast;
+      } else {
+        std::cerr << "--teleop-source / teleop.default_source must be one of "
+                     "g1, smpl, a3_fast (got '" << requested << "')\n";
+        return 64;
+      }
+      teleop_source_preselected = true;
+      if (!backend_only) {
+        if (preselected_teleop_source == a3_deploy::A3EncoderSource::kSmpl &&
+            !(smpl_zmq_enabled && smpl_policy_runtime_available)) {
+          std::cerr
+              << "TELEOP source 'smpl' was requested but is not available: it needs a monolithic "
+                 "SMPL-encoder policy (onnx.smpl_model_path, obs_dict[1,"
+              << a3_deploy::kA3SmplObsDictTotalFloats
+              << "] -> action[1,29]; RKNN: onnx.smpl_rknn_model_path) and smpl_zmq.enabled=true. "
+                 "No SMPL-encoder checkpoint is published for A3 / A3 Ultra; train and export one, "
+                 "or pass `deploy.sh --smpl-model <onnx>`.\n";
+          return 65;
+        }
+        if (preselected_teleop_source ==
+                a3_deploy::A3EncoderSource::kA3Fast &&
+            !a3_fast_policy_runtime_available) {
+          std::cerr << "TELEOP source 'a3_fast' was requested but is not "
+                       "available: set "
+                    << (rknn_policy_backend ? "onnx.a3_fast_rknn_model_path"
+                                            : "onnx.a3_fast_model_path")
+                    << " (monolithic mode)\n";
+          return 65;
+        }
+      }
+      std::cout << "✓ TELEOP encoder source preselected and locked: "
+                << a3_deploy::A3EncoderSourceName(preselected_teleop_source)
+                << "\n";
+    }
+  }
+
+  // Pico PUB endpoint for the G1-compatible "command" topic (A+B+X+Y).
+  const std::string pico_zmq_host =
+      ParseStringFlag(argc, argv, "--zmq-host", "localhost");
+  int pico_zmq_port = 5556;
+  {
+    std::string port_err;
+    std::uint64_t port_u = static_cast<std::uint64_t>(pico_zmq_port);
+    if (!ParseUint64Flag(argc, argv, "--zmq-port", &port_u, &port_err)) {
+      std::cerr << port_err << "\n";
+      return 64;
+    }
+    if (port_u == 0 || port_u > 65535) {
+      std::cerr << "--zmq-port must be in 1..65535\n";
+      return 64;
+    }
+    pico_zmq_port = static_cast<int>(port_u);
+  }
+
   // --- Reference motion library -------------------------------------------
   // Load one or more flat CSV motion files and build tokenizer[640] online
   // from the current robot root orientation.
@@ -2067,6 +2153,19 @@ int main(int argc, char** argv) {
       OptionalKey<std::uint64_t>(cfg["policy_driver"]["pd_stand_ticks"],
                                  150ULL);
   ManualControlState manual_control;
+  if (teleop_source_preselected) {
+    switch (preselected_teleop_source) {
+      case a3_deploy::A3EncoderSource::kSmpl:
+        manual_control.teleop_source.store(1, std::memory_order_release);
+        break;
+      case a3_deploy::A3EncoderSource::kA3Fast:
+        manual_control.teleop_source.store(2, std::memory_order_release);
+        break;
+      case a3_deploy::A3EncoderSource::kG1:
+        manual_control.teleop_source.store(0, std::memory_order_release);
+        break;
+    }
+  }
   manual_control.selected_motion_index.store(
       static_cast<int>(motion_library.InitialIndex()),
       std::memory_order_release);
@@ -3130,7 +3229,9 @@ int main(int argc, char** argv) {
         const auto requested_source =
             teleop_source_from_value(requested_source_value);
         if (requested_source != active_teleop_source) {
-          const bool accept_source = teleop_source_available(requested_source);
+          const bool locked_out = teleop_source_preselected;
+          const bool accept_source =
+              !locked_out && teleop_source_available(requested_source);
           if (accept_source) {
             active_teleop_source = requested_source;
             reset_teleop_source_runtime(active_teleop_source);
@@ -3142,8 +3243,13 @@ int main(int argc, char** argv) {
                 teleop_source_value(active_teleop_source),
                 std::memory_order_release);
             std::fprintf(stderr,
-                         "[teleop] source %s rejected: not enabled",
-                         a3_deploy::A3EncoderSourceName(requested_source));
+                         locked_out
+                             ? "[teleop] source %s rejected: locked to %s by --teleop-source (restart "
+                               "deploy.sh with the other --encoder to change)"
+                             : "[teleop] source %s rejected: not enabled%.0s",
+                         a3_deploy::A3EncoderSourceName(requested_source),
+                         a3_deploy::A3EncoderSourceName(
+                             preselected_teleop_source));
             const std::string last_error =
                 requested_source == a3_deploy::A3EncoderSource::kSmpl
                     ? smpl_zmq_source.LastError()
@@ -3525,6 +3631,11 @@ int main(int argc, char** argv) {
           if (!smpl_running_started) {
             obs_builder.Reset();
             smpl_running_started = true;
+            std::fprintf(stderr,
+                         "[teleop] smpl encoder running: SMPL stream -> %s\n",
+                         encoder_decoder_mode
+                             ? "encoder+decoder"
+                             : ModelNameFromPath(smpl_onnx_path).c_str());
           }
           clear_teleop_wait_log();
         }
@@ -4031,6 +4142,7 @@ int main(int argc, char** argv) {
     return 6;
   }
   std::thread keyboard_thread;
+  std::unique_ptr<a3_deploy::A3PicoZmqCommandWatcher> pico_cmd_watcher;
   if (auto_start) {
     std::cout << "✓ auto-start mode: PD warmup=" << configured_warmup_ticks
               << " ticks, then policy inference\n";
@@ -4040,6 +4152,21 @@ int main(int argc, char** argv) {
                  "1=g1, 2=smpl, q=quit\n";
     keyboard_thread = StartKeyboardControlThread(
         manual_control, motion_names, remote_motion_names, motion_shortcuts);
+
+    // G1-like Pico bring-up when deploy.sh passed --teleop-source (zmq_manager):
+    // auto PD stand (= Init ramp), then A+B+X+Y maps to teleop via ZMQ command.
+    if (teleop_source_preselected && !backend_only) {
+      a3_deploy::RequestDeployMode(manual_control, DeployMode::kPdStand,
+                                   std::cout);
+      std::cout << "✓ G1-like bring-up: auto PD stand (wait for Init Done)\n";
+      pico_cmd_watcher = std::make_unique<a3_deploy::A3PicoZmqCommandWatcher>(
+          manual_control, g_stop_requested, pico_zmq_host, pico_zmq_port);
+      if (!pico_cmd_watcher->Start()) {
+        pico_cmd_watcher.reset();
+        std::cerr << "[pico-cmd] continuing without Pico start/stop; use "
+                     "keyboard S/T instead\n";
+      }
+    }
   }
   std::cout << "✓ entering policy loop; Ctrl-C to exit\n";
   if (frame_log_interval > 0) {
@@ -4058,6 +4185,7 @@ int main(int argc, char** argv) {
                               latest_direct_mode);
 
   std::cout << "shutdown requested — stopping driver\n";
+  if (pico_cmd_watcher) pico_cmd_watcher->Stop();
   if (keyboard_thread.joinable()) keyboard_thread.join();
   driver->StopDriver();
   if (eval_recorder->Enabled()) {

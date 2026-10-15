@@ -712,9 +712,11 @@ ROBOT_EXP_MAP = {
     # same mechanical platform (worklog #37), so this is the CLI name going
     # forward for both training and sim/deploy selection.
     "a3": "manager/universal_token/all_modes/sonic_a3_035",
-    # Kept for this project's own from-scratch A3 Ultra training contract
-    # (separate PD gains/joint limits tuned for A3 Ultra specifically -- do
-    # not mix with the "a3" contract above when deploying either checkpoint).
+    # "a3_ultra" trains with the A3 parameters and randomizes over A3 and A3 Ultra -- the recipe the downloaded 035
+    # policy was made with (A3 URDF, Litchi a3_024 contract, domain randomization tuned for both robots, 29 policy
+    # joints) -- on the A3 Ultra's own retargeted library converted to the a3_29 format
+    # (gear_sonic/data_process/convert_a3ultra_to_a3_29d.py).  What it exports loads in the A3 deploy.  The Ultra's own
+    # 63-DOF T3D0 contract (31 actions, not deployable) is `+exp=manager/universal_token/all_modes/sonic_a3_ultra_t3d0`.
     "a3_ultra": "manager/universal_token/all_modes/sonic_a3_ultra",
 }
 

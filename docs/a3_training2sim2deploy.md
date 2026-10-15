@@ -18,7 +18,7 @@ It uses the 20 A3 flat CSV files included in the repository to:
 
 For the complete training parameters, see the [035 training contract](a3_035_training_contract.md).
 For T–N curves, Jacobian tables, and passive-foot fitting material, see
-[T–N / passive foot](a3_024_sim2real_materials/README.md).
+[T–N / passive foot](../a3_data/a3_024_sim2real_materials/README.md).
 
 ## 0. Scope, A3 model, and environment
 
@@ -102,13 +102,13 @@ gear_sonic/data/assets/robot_description/mjcf/
 This release also includes the **original quasi-static force–displacement CSV
 exports** for five A3 metal-shoe toe-cantilever locations (A–E; source labels
 X90, 117, 140, 160, and 182 mm), under
-[`docs/a3_024_sim2real_materials/03_passive_foot/raw/`](a3_024_sim2real_materials/03_passive_foot/raw/README.md).
+[`a3_data/a3_024_sim2real_materials/03_passive_foot/raw/`](../a3_data/a3_024_sim2real_materials/03_passive_foot/raw/README.md).
 They retain their original GB18030 bytes with no resampling, filtering, unit
 conversion, or encoding conversion; the five files total only 2,612,163 bytes.
 Each contains the instrument-exported summary table and the raw Result Table 2
 with time, displacement, force, and compressive strain. The complete source
 archive SHA-256, original member names, and per-file checksums are in
-[`raw_manifest.csv`](a3_024_sim2real_materials/03_passive_foot/raw/raw_manifest.csv).
+[`raw_manifest.csv`](../a3_data/a3_024_sim2real_materials/03_passive_foot/raw/raw_manifest.csv).
 
 The data can be inspected alongside the
 passive-foot stiffness/limit choice, but they are quasi-static curves: they do

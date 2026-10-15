@@ -2503,3 +2503,140 @@ conda run -n isaaclab python gear_sonic/eval_agent_trl.py \
 5. `ROBOT_MODEL_REGISTRY` / `ROBOT_WBC_YAML` 尚未注册 a3 / a3_ultra / h2（目前只有友好报错）。Phase 4（VR 实时重定向）、完整 G1/H2 回归未做。
 6. 清理被 gitignore 的构建目录（`gear_sonic_deploy/build/`、`build_verify_full/`、`dist/`）。
 7. 本条目之后的 README 补充（A3 章节）见仓库根 `README.md`。
+
+---
+
+## 44. [2026-10-14，接 #43] G1 数据/回归、A3 / A3 Ultra 的 MuJoCo 仿真 + Pico 链路、机器人模型注册、`a3_ultra` 参数对齐 Litchi a3（本条是摘要，细节、命令和数据在 `docs/workflow/a3_integration_plan.md` 第 10–13 节）
+
+**读者须知**：从 #43 的"`--robot g1|a3|a3_ultra|h2` 统一入口"往下继续。本条把 #43 之后同一天做完的事按时间顺序列出，每一项都标明验证到了哪一步、哪些没验证。用户的决策（不要再讨论）：`--robot` 取值是 `g1 / a3 / a3_ultra / h2`（**不要 `g1_old`**，用户两次明确说过，它是最初需求里的过时写法）；用户只有一台 **A3 Ultra** 真机；PICO 头显只能用户本人操作；仿真里 A3 Ultra 用它自己的模型（T3D0 MJCF），权重用下载的 035；`a3_ultra` 的关节级控制参数先用 Litchi 的 a3，不用官方文档。
+
+### 44.1 G1 数据与回归
+- 用户下载了 `data/bones_seed/g1.tar.gz`（23.5 GB），解压到 `data/bones_seed/g1_extract/`：142,220 个 CSV、124 个 session，与 Bones-SEED 总数一致。
+- `convert_soma_csv_to_motion_lib.py --fps 30 --fps_source 120 --individual` 全量转换：142,220/142,220 成功，0 失败，8.6 GB（`data/motion_lib_bones_seed/robot_all`）；`filter_and_copy_bones_data.py`（仓库默认 40 个关键词）：保留 129,785、过滤 12,435，7.9 GB，输出到 `sonic_v1_1.yaml` 默认读取的 `data/motion_lib_bones_seed/robot_filtered`。
+- G1 官方训练权重 `sonic_v1_1/last.pt` 已下载（`download_from_hf.py --training --sonic-v1-1 --no-smpl`），`.gitignore` 新增 `sonic_v1_1/`、`low_latency/`。
+- 冒烟：`--robot g1` 训练（16 envs、2 次迭代）`exit=0`，用默认 `motion_file` 加载 129,785 个动作；`eval_agent_trl.py` 用官方 `sonic_v1_1/last.pt`、1 env、20 步：strict 加载成功、无报错（补上 #42.6 第 7 项的 G1 运行时证据）；`a3_ultra` 训练用新默认 `motion_file`（`robot_filtered_v15_clean`）冒烟 `exit=0`，加载 129,116 个动作。
+- G1 的 MuJoCo + Pico 流程（`docs/notes/mujoco_pico_sim_teleop.md`，本机本来就能跑）在 CMake 大改之后重新验证：全新目录里按 `just build` 的参数重编译 0 error；终端 1 `run_sim_loop.py --robot g1`、终端 2 `deploy.sh --robot g1 --input-type zmq_manager sim`（日志出现 `Init Done`）、终端 3 `pico_manager_thread_server.py --robot g1 --manager`（连上 RoboticsService）都正常。**没有验证**：真实头显数据、v1.1 变体、G1 真机。文档里所有 G1 命令都加了显式 `--robot g1`。
+
+### 44.2 A3 / A3 Ultra 的 MuJoCo 仿真 + C++ 部署（与 G1 的做法对称，**没改一行 C++**）
+- 新增 `gear_sonic/utils/mujoco_sim/a3_sim.py`：MuJoCo 里用 A3 的 ROS2 `/body_drive/*` 话题冒充机器人（发布 `{leg,waist,arm,neck}_joint_state`、`{pelvis,torso}_imu/data`，订阅 `*_joint_command`，力矩 = `tau_ff + kp(q_des-q) + kd(dq_des-dq)`，弹性绳按 `9` 释放），所以 `a3_deploy_onnx_ref` 在仿真和真机上是同一个二进制。`run_sim_loop.py --robot a3|a3_ultra` 会自动切到带 ROS2 的 conda 环境 `a3_deploy_verify`（一次性准备：`gear_sonic_deploy/scripts/setup_a3_sim_env.sh`，向该环境装了 mujoco/scipy/tyro 和 `joint_msgs` Python 绑定）。ROS2 一律用 `ROS_DOMAIN_ID=87`、`ROS_LOCALHOST_ONLY=1`。
+- `deploy.sh --robot a3|a3_ultra [sim|real] [--input-type zmq_manager]`：`sim` 强制 ROS2 + 私有域；`zmq_manager` 会在部署程序旁自动起 `a3_teleop_retarget_node.py`（gmr 环境）和 `a3_ta_bridge`。部署程序是键盘状态机（要求 TTY）：`S`→`M`→`T`→`3`。
+- 机器人模型注册：`ROBOT_MODEL_REGISTRY` = `g1 / a3 / a3_ultra / h2`，`ROBOT_WBC_YAML` 注册 `a3 / a3_ultra`（`h2` 没有仿真配置：没有策略权重也没有 C++ 后端，无法闭环验证）。`get_g1_key_frame_poses` 不再写死 G1 链接名；`pico_manager_thread_server.py` 对非 G1 关闭 G1 网格叠加。
+- 联调结果（无头 + 定时释放弹性绳，用 Pico 模拟器代替头显）：`a3`（T2D5 模型）与 `a3_ultra`（T3D0 模型）都能站稳 60 s 以上，骨盆 1.07–1.075 m，倾角 <2°；Pico 全链路（SMPL `pose` 流 → 重定向 → `a3_ta_bridge` → `/ta/whole_body_command` → 部署程序 → 仿真）下，`synthetic:wave` 机器人跟着挥右臂，真实行走 SMPL 片段约 70 s 未摔倒。
+- **联调中发现并修好的真实问题**：(1) A3 Ultra 的 MJCF 地面 `contype=conaffinity=0`（worklog #3 手写内联地面时遗漏），机器人松绳后穿地，4 份拷贝都已改；(2) 重定向 `human_height` 默认 1.66 让站着的人变成 84° 膝盖的深蹲（pelvis 0.76 m，MuJoCo 里 0.83 m），改为 2.18（它是 GMR 尺度参考，不是操作者身高），这也更正了 plan 9.4/9.5 里"骨盆倾斜"的结论；(3) 3 点标定的关键帧映射写死 G1 链接名，对 A3 会崩。
+- 新增测试 `tests/test_a3_sim_model.py`（9 个）；`tests` + `gear_sonic/tests` 共 187 → 加上下面的 15 个后 202 通过、1 跳过。
+
+### 44.3 `--robot a3_ultra` 的机器人参数对齐 Litchi 的 a3（用户要求，"先不要用官方文档"）
+- 之前**训练侧**用官方 Kp/Kd 文档的数值（髋 200/7、膝 360/13…），而**部署侧**（C++ `a3_024` profile）和仿真（指令里的 kp/kd）本来就是 Litchi a3 的数值——也就是只有训练侧不一致。
+- `robots/a3_ultra.py` 新增 `A3_ULTRA_GAIN_SOURCE`，默认 `"litchi_a3_024"`：29 个身体关节的执行器组直接 `deepcopy` 自 `A3_024_CYLINDER_CFG`（刚度、阻尼、力矩/速度上限、转子惯量、摩擦、动摩擦）、默认站姿和出生高度取自同一个配置、动作缩放同公式推出；头关节 Kp=40/Kd=2（部署代码固定值）、q=0。官方文档的数值保留在 `_vendor_doc_*`，把开关改成 `"vendor_doc"` 即可切回（部署侧要先有对应 profile）。4 份 A3 Ultra MJCF 的 `wrist_roll` 转子惯量 0.00081 → 0.004967（#38 在训练配置里改过，MJCF 当时漏了）。
+- 新增 `tests/test_a3_ultra_contract.py`（15 个）：把"a3_ultra 训练配置 = Litchi A3_024 = C++ 部署头文件"锁住（用 g++ 编译 `a3_policy_parameters.hpp` 读出 `a3_024_kps/kds/action_scale/a3_default_angles` 逐关节比较），并核对 MJCF 转子惯量。`--robot a3_ultra` 训练冒烟 `exit=0`；`--robot g1` 训练冒烟 `exit=0`。
+- **没有对齐、有意没动**：`a3_ultra` 训练动作空间仍是 31（含 2 个头关节），Litchi a3 是 29；自碰撞开关；仿真力矩裁剪用 MJCF 厂商上限（膝 320，训练合约 300）；`a3_ultra` 仍是自研的 SMPL 跟踪合约（观测/奖励/数据与 035 不同）。
+
+### 44.4 仍未验证 / 本机做不了
+真实 PICO 头显、G1 与 A3 Ultra 真机（包括真机 `/body_drive/*` 的实际话题布局、头部关节命名、IMU 约定）、带窗口 viewer 里按键释放弹性绳、h2 的仿真与部署、从零训练的 `a3_ultra` 策略的部署导出。Phase 4 与本条涉及的文件仍**未提交 git**。
+
+**文件改动**（新增/修改）：`gear_sonic/utils/mujoco_sim/{a3_sim.py,configs.py,wbc_configs/a3_035.yaml,wbc_configs/a3_ultra_035.yaml}`、`gear_sonic/scripts/{run_sim_loop.py,run_a3_teleop_sim.py,pico_manager_thread_server.py}`、`gear_sonic_deploy/scripts/{deploy_a3.sh,setup_a3_sim_env.sh}`、`gear_sonic/data/robot_model/{instantiation/*,supplemental_info/a3,supplemental_info/h2}`、`gear_sonic/utils/teleop/vis/vr3pt_pose_visualizer.py`、`gear_sonic/utils/teleop/a3/retarget.py`、`gear_sonic/envs/manager_env/robots/a3_ultra.py`、`gear_sonic/config/exp/.../sonic_a3_ultra.yaml`（默认 `motion_file`、注释）、`gear_sonic/train_agent_trl.py`（注释）、4 份 `a3_ultra_t3d0.xml`、`.gitignore`、`docs/notes/mujoco_pico_sim_teleop.md`、`tests/test_a3_{sim_model,ultra_contract,teleop_retarget}.py`。
+
+---
+
+## 45. [2026-10-14，接 #44] A3 Ultra 直接使用下载的 A3 权重：官方兼容性确认 + 头部固定 + 闭环验证（细节与数据见 `docs/workflow/a3_integration_plan.md` 第 14 节）
+
+**用户要求**：Litchi 的 README 里也写了 a3_ultra，确定有没有可下载的权重真的兼容 a3_ultra；没有的话就把 a3_ultra 的两个头关节固定在默认姿态（和 a3 一致）、其余关节输出与 a3 一致；当前不训练自己的 a3_ultra sonic 模型，直接用下载的 a3 权重。
+
+**结论**
+- 可下载的权重**只有一个**：HF `sonic-for-a3/sonic` 的 `035_step200000`（该组织只有这一个仓库，只有 `main` 分支、无 tag；GitHub `AgibotTech/sonic_for_a3` 无 release、只有 `main`）。**官方明确声明它同时支持 A3 与 A3 Ultra**：README"其域随机化专门针对 A3 与 A3 Ultra（A3U）调过，因此对应模型也能在 A3 Ultra 上运行"，并说 Rockchip/RKNN 部署流程支持 A3U；HF 发布元数据 `config.json` 为 `"robots": ["A3","A3 Ultra"]`、`"policy_joints": 29`。本地 `Litchi_sonic_for_a3/README.md` 与 GitHub main 一致（忽略行尾空白后 diff 为 0）。**没有 A3 Ultra 专属权重。**
+- 本机核验：本机用的 PT 和两个部署 ONNX 的 SHA256 与 HF 当前 `SHA256SUMS` 一致；29 个策略关节的名字/顺序/动作缩放相同，A3 Ultra 的关节范围覆盖策略训练时的软限位范围（只有 hip_roll 85° vs 92°、knee 145° vs 143° 两类不同）；质量差（整机 +2.03 kg，+3.5%）落在 035 的域随机化范围内（torso ×[0.8,1.3]、腕上加质量 [-0.2,+2.0] kg、其它连杆 ×[0.9,1.1]），唯一超出比例范围的是头 yaw 连杆 +0.235 kg；MuJoCo 闭环：8 个官方参考动作（001/009/043/047/050/055/058/077）× 2 个模型（A3 的 T2D5、A3 Ultra 的 T3D0，同一个部署二进制、同一组权重、同一套增益），16 次运行全部完整播放、指令期间 0 次摔倒，A3 Ultra 与 A3 的全关节 RMSE 差异 ≤0.004 rad（腿最大 0.008 rad，深蹲）。**这是相对比较，两个仿真模型都是简化的串联踝/腰 + 刚性脚；真机没有验证。**
+- 头部固定（第 ② 点）：部署程序本来就把两个头关节固定在 q=0（Kp 40/Kd 2，与 A3 相同），29 个身体关节用策略输出 + A3 合约；本轮补上一个会破坏"固定"的细节——Pico 重定向会把 GMR 逆解里头关节的残留值作为头指令发出去并覆盖固定的 q=0，现在默认不发头（`A3RealtimeRetargeter(track_head=False)`，`--track-head` 才发）；仿真里头关节偏差 yaw ≤0.005 rad、pitch ≤0.026 rad。训练合约（31 个动作含头）因用户当前不训练而没有改，已记录。
+
+**其它改动**：`a3_sim.py`：无力矩限制信息的关节（T2D5 的头）不再被裁成 0 Nm；`JOINT_ARMATURE_IF_MISSING`（T2D5 MJCF 的转子惯量为 0，按合约值补上，使 A3 / A3 Ultra 两个仿真可比，`a3_035.yaml`）；`A3_SIM_LOG_CSV` 状态日志。`deploy_a3.sh`、`README.md`（A3 一节）、`docs/notes/mujoco_pico_sim_teleop.md` 的权重与头部说明。测试 `tests/test_a3_ultra_contract.py`（现 16 个）、`tests/test_a3_teleop_retarget.py`（+1）；全量 203 通过、1 跳过。
+
+**上真机前必须确认（本机做不了）**：①真机 `/body_drive/neck_joint_state` 的头关节名是否为 `head_yaw_joint`/`head_pitch_joint`（部署程序按名字匹配，缺这一路状态策略不启动；A3 Ultra 的 URDF 里叫 `ultra_head_pitch_joint`）；②你的 A3 Ultra 是 Rockchip RK3588S 还是 Drive Thor——公开仓库只有 x86_64 / rockchip 的部署包，Thor 运行时与教程官方还没发布（README 的 TODO）；③IMU 约定与并联踝/腰的关节空间读数；④官方策略的适用范围（不支持跪/躺/起身、不支持快跑，手腕跟踪较差）。
+
+
+## 46. [2026-10-14，接 #45] `deploy.sh --encoder a3-fast|smpl`：A3 Ultra 遥操的两条编码器路径可选（细节、命令与数据见 `docs/workflow/a3_integration_plan.md` 第 15 节）
+
+**用户要求**：根据 plan 11.13，A3-fast encoder（Litchi 实现、已移植）与 SMPL encoder（我们自己实现的）两条路径都希望在 MuJoCo 和真机上能准确使用，补 `--encoder smpl/a3-fast` 命令行选择；代码改动逻辑记入日志；完成后用户自己做 MuJoCo + Pico 验证。
+
+**结论**
+- `--encoder a3-fast`（默认）完整可用：下载的 035 `a3_fast` ONNX + Pico SMPL → GMR 重定向 → `a3_ta_bridge` → `/ta/whole_body_command`。MuJoCo 端到端（Pico 模拟器）通过：骨盆 1.073–1.075 m，倾角稳态 2.2°，右臂随挥手动作，桥转发 2200+ 帧 0 拒收。`--encoder g1` 是同一链路换 g1 编码器（≈940 ms），只作对照。
+- `--encoder smpl` **没有权重可用**：035 只有 `g1` + `a3_fast`，HF / GitHub 没有 A3 / A3U 的 SMPL-encoder 模型，本机 `a3_ultra` 训练只做过冒烟。我做完了接口、校验、锁定和安全逻辑，用“站立桩”（真正的 a3_fast 计算图 + 常量站姿 tokenizer，忽略 SMPL 输入）在 MuJoCo 里验证了数据通路——机器人**站着不跟随操作者**。这条路径的“准确度”现在无从谈起，要等你训练并导出 SMPL 模型（`--robot a3_ultra` 的训练合约还要先对齐 29 关节视角，见 plan 15.6 / 13.4）。
+- **plan 11.13 的对比表有一处写错**：SMPL 编码器的窗口是 10 帧 × 0.02 s（训练配置 `smpl_dt_future_ref_frames: 0.02`、部署 `kSmplFutureFrames=10`），不是 “skip 5 / ≈940 ms”（那是 `g1` 关节空间编码器）；a3-fast 的 tokenizer 也漏了关节速度。已在原表就地修正并写入 15.2。
+
+**代码改动逻辑（四层，启动时逐层校验，选错立刻报错）**
+1. C++ `a3_deploy_onnx_ref`：`--teleop-source g1|smpl|a3_fast`（或配置 `teleop.default_source`）预选并锁定 TELEOP 源；非法值退出 64，源不可用退出 65；按键 `1/2/3` 对已锁定的源提示 `rejected: locked to …`；SMPL 流首次驱动策略时打印 `smpl encoder running`。
+2. 运行时配置：`a3_make_runtime_cfg.py` 从打包配置生成 `a3_runtime_config.generated.yaml`（`smpl_model_path`、`smpl_zmq`），经 `A3_RUNTIME_CFG` 传给 `run_a3.sh`（C++ 的 `--runtime-cfg` 只认第一次出现，不能再追加）。
+3. 操作端链路 `a3_operator_chain.sh`：`a3-fast/g1` → `a3_teleop_retarget_node.py --mode a3-ref` + `a3_ta_bridge`；`smpl` → `--mode smpl-pose`，把 Pico `pose` 流原样转发到 :5561 并用 `A3SmplPoseAugmenter`（GMR 逆解，与 A3 训练参考同一族）补上 A3 的 6 个手腕角（官方 G1 发送端填的是 G1 关节轴公式）。
+4. 启动器 `deploy_a3.sh`：`--encoder`、`--smpl-model PATH|stub`（`A3_SMPL_MODEL`）、`--no-chain`；缺模型退出 66 并给训练/导出指引，接口不符（`a3_smpl_onnx_tool.py check`：`obs_dict[1,1770]`→`action[1,29]`）退出 65。`run_a3_teleop_sim.py` 也加了同名 `--encoder`（`smpl` 报错并指向 `deploy.sh`）。
+
+**这次测试里发现并修掉的四个问题**
+- 重建部署包会丢掉 `a3_ta_bridge`（脚本开头 `rm -rf` 包目录，桥原来是手动放进去的）→ `build_a3_deploy_pkg.sh` 现在编译并校验它。
+- SMPL 源日志刷屏（共享头 `StreamedMotionMerger` 每块 3 行，≈150 行/s）→ 改成运行期开关，**默认仍开（G1 不变）**，A3 按 `smpl_zmq.verbose`（默认关）。
+- **`-ffast-math`（顶层 CMake，上游原样）让 `std::isfinite` 恒为真，A3 部署里所有 NaN/Inf 守卫实际都是失效的**（单测 `A3TaBridgeCodec.RejectsMalformedMessages` 一直是红的）→ 对 `src/a3_deploy/*.cpp` 单独加 `-fno-finite-math-only`，该单测转绿。真机安全相关。
+- **Pico 退出 / 重进 POSE 模式后链路卡死**（流中断测试发现）：官方发送端 `on_mode_exit()` 里 `step = 0`，每次 A+X 重进 POSE，`frame_index` 都从 0 开始；`a3-ref` 节点按 `frame_index <= last_index` 丢帧，整个新会话被丢掉直到计数器超过旧最大值（手臂冻结）；`smpl-pose` 增强器则返回上一段的缓存手腕角。现在两处用同一规则（`frame_index_restarted`：最新索引小于已见最大值）开始新会话，`a3-ref` 的逐消息逻辑抽成 `A3RefStream`；+4 个测试（旧逻辑下会失败）。流中断 14 s 再重启的 MuJoCo 测试：`a3-fast` / `smpl` 桩都 “stale → holding last → restarted → reconnected”，机器人全程站稳。
+
+**验证**：`tests/test_a3_encoder_selection.py` 新增 16 个（含桩 = `a3_fast(站姿 tokenizer｜本体感知)` 的逐位比对）、`tests/test_a3_teleop_retarget.py` 新增 7 个；`isaaclab` 环境全量 219 通过 / 1 跳过；`gmr` 环境 22 通过；C++ `run_tests`（仓库根目录运行）228 个中 218 通过、9 跳过、1 失败（`FK.TestFKAndGlobalVelocities`，缺 G1 参考数据，无关）；三条失败路径（无模型 66、接口不符 65、非法编码器 2）与二进制侧校验（65 / 64）按设计退出。MuJoCo（最终二进制）：`a3_ultra` 的 `a3-fast` / `smpl` 桩 / `g1`、普通 `a3` 的 `a3-fast` 四条配置都跑通（桥转发 3400 帧 0 拒收，骨盆 1.07 m，倾角稳态 ≤2.4°，按 1/2/3 切到别的源被拒绝）；两机拓扑（操作端链路单独启动 + `--no-chain`）`a3-fast` 与 `smpl` 桩都通；流中断 + 重启两条路径都通。
+
+**没做到 / 必须说清楚**
+- 回归期间先后两次撞上用户的 G1 会话（第一次 23:16 左右，G1 `real` + `pico_manager_thread_server.py` 占 5556；第二次 23:29，G1 MuJoCo 会话刚启动），我都在发现后用 PID 杀掉了自己的进程。我的 `-j20` 编译、无头仿真，以及第二次最后约 40 s 在 5556 上发布的 A3 Pico 模拟器（合成 `wave`）与其重叠；没有碰用户的进程、5556/5557 的发布端或网卡，但用户的 G1 部署在那段时间启动，可能连上过我的模拟器流（不发 `command`，不应起步）。用户会话结束后（23:59）已把被打断的回归补跑完；测试脚本现在开跑前会检查用户会话和 5556 端口。
+- 真实头显、真机都没有测。真机上 `a3-fast` 需要操作端 PC 与机器人在同一 ROS2 域（`a3_ta_bridge` 经 AimRT ROS2 后端发布）；`smpl` 的 Pico 窗口要 `--num_frames_to_send 10`（默认 5 没有余量，按代码推断，未实测）。plan 14.5 的真机待确认项（头话题名、Rockchip/Thor、IMU 约定）依旧有效。
+- **流中断时机器人“保持最后一条指令”**（部署程序既有设计，已测）：摘下头显 / 停发后手臂停在最后姿态并保持站立，不会自动回位；真机上人走开要按 `P`。
+- `smpl` 仍然没有权重，而且“我们自己实现的 SMPL 编码器”只有代码、没有训练：`sonic_a3.yaml` 里 `encoder_sample_probs.smpl: 0.0`、`smpl_motion_file: dummy`，A3 Ultra 动作库的 `smpl_joints` 是占位零，G1 用的 `data/bones_seed_smpl` 也不在本机。缺的是 SMPL 数据 + 训练，不是部署接口；最短路径是沿用 A3 的 29 关节合约（导出天然 `[1,1770]→[1,29]`），而不是先改 a3_ultra 的 63 DOF 合约（plan 15.6）。这些都没做，是否做由你决定。
+
+
+## 47. [2026-10-15，接 #46] 重启规则与 G1 对齐；按 Litchi 的 a3 参数批量转换、`--robot a3_ultra` 训练 A3 合约，域随机按 A3 与 A3 Ultra 一起调（细节与数据见 `docs/workflow/a3_integration_plan.md` 第 16 节）
+
+**用户要求**：① #46 里“重启修复”的规则和 G1 在 Pico 发送端退出再重进 POSE 时的逻辑是否一致，不一致就对齐；② 按 Litchi_sonic_for_a3 的 a3 参数批量转换（035 用 A3 URDF 训练、域随机按 A3 与 A3 Ultra 一起调，所以能在 A3 Ultra 上跑；策略只输出 29 个身体关节，头两路固定 PD，`ultra_head_pitch_joint` 是 `head_pitch_joint` 的别名，手指不驱动）——“根据 a3 参数进行转换训练，域随机按 A3 和 A3 Ultra 一起调”。
+
+**① 不一致，已对齐**：G1 接收端是 `StreamedMotionMerger::CalculateSlidingWindow`（第一包 / `start <= window_start` / `end <= window_end` / 窗口间丢帧或游标落后 205 帧 → catch-up，之后 `current_frame = 0` 并重捕获航向）；我 #46 的规则只看“最新索引 < 已见最大值”，漏掉起点相等（短会话后重进，索引完全相同）和窗口间丢帧。现在把前三类逐条移植成 `pose_window_catch_up`（`restart` / `stale` / `gap`），`a3-ref` 节点（`A3RefStream`）与 `smpl-pose` 增强器共用，`smpl_zmq` 的 C++ 源本来就是同一份 merger。测试重写（15 个，含“短会话后重进”），MuJoCo 流中断两条路径重跑通过（stale → new Pico session → reconnected）。
+
+**② 批量转换与训练**
+- 核对：29 个身体关节名字 / 顺序 / 轴完全相同，共有 body 的 FK 差 ≤1.5 mm；限位只有 `hip_roll`（Ultra 更窄）与 `knee`（Ultra 145°，A3 143°）不同；足底高度差 −4.54 mm（A3 网格脚 vs Ultra 球脚）；头 `dof` 恒为 0。
+- `gear_sonic/data_process/convert_a3ultra_to_a3_29d.py`：按名字取 29 列、夹 A3 限位、按 `a3_t2d5.xml` 的 32 个 body 重新生成 `pose_aa`、根 z −4.54 mm，输出 Litchi `a3_29` 格式（与 `convert_a3_pkl_to_motion_lib_29d` 的 normalizer 互认）；`--check` 逐文件校验。**全库 129,116 条、28,394,944 帧，12 进程 18 s，0 失败**，输出 `data/motion_lib_a3_29d/robot_filtered_v15_clean`（22 GB）；膝限幅帧：左 92,451、右 98,569；300 条抽样 FK 对照：最大 14.6 mm（出现在被膝限幅夹过的帧），脚底最低点差均值 +1.4 mm。
+- **`--robot a3_ultra` 语义变更**：现在是 `sonic_a3_ultra` = 继承 `sonic_a3_035`（A3 资产 / a3_024 参数 / 奖励 / **035 域随机**），仅 `motion_file`、`project_name`、`exp_var` 三个键不同；Ultra 自己的 63 DOF 合约改名 `sonic_a3_ultra_t3d0.yaml`，`+exp=` 显式选用（不可部署，导出宽度对不上）。想回旧行为就用那个显式 exp。
+- 冒烟：`--robot a3_ultra` 从零 2 次迭代、加载 035 PT 热启动 2 次迭代都 `exit=0`；官方 `train_a3_035_fromscratch.sh --preflight` 通过。域随机覆盖性由 `tests/test_a3_ultra_training_recipe.py` 从两个 MJCF 推导并校验：躯干 ×1.037 ∈ [0.8,1.3]，每侧手 +0.50 kg ∈ [−0.2,+2.0]，其它连杆相同；**唯一例外是头 yaw 连杆 +0.235 kg**（头关节固定，影响很小，没有改 035 的域随机）。
+- 测试：新增 `tests/test_a3_data_conversion.py`（9）、`tests/test_a3_ultra_training_recipe.py`（5）；`isaaclab` 全量 233 通过 / 1 跳过，`gmr` 环境 33 通过。
+
+**没做 / 注意**：转换后的库里 `smpl_joints` 仍是零占位，SMPL 编码器的数据和训练都没做（plan 15.6）；`commands.py` 的 `lower_joint_indices_mujoco = range(12)` 是 G1 假设，启用 `teleop` 编码器前要改（035 配方不用）；没跑收敛训练；我发出的“转换数据 vs Litchi 自带 20 条数据”的 120 次迭代对照训练被用户拒绝，没有跑。RKNN / Thor 本次没动（README 的 Thor 教程仍未公开）。
+
+
+## 48. [2026-10-15，接 #47] 按 A3 参数用原来的重定向方法批量转换（为训练自研的 A3 SMPL 编码器）（细节与数据见 `docs/workflow/a3_integration_plan.md` 第 17 节）
+
+**用户澄清**：`--robot a3_ultra` 训练 A3 合约没问题；“批量转换”指的是——为了训练我们自研的针对 A3 的 SMPL encoder，需要 a3 重定向的数据集，所以要基于 a3 的机器人参数，采用之前做的重定向方法重新做数据转换。#47 里我做的“A3 Ultra 库 → `a3_29` 格式”只是格式转换，不是这个意思，保留为交叉验证。
+
+**做了什么**
+- `batch_retarget_bvh_soma_a3ultra.py` 加 `--robot a3|a3_ultra`（默认不变）、`--only_from`、原子写；运行时向 GMR 注册 `agibot_a3`（`a3_t2d5.xml`，不改 GMR 检出目录）；IK 标定表沿用 A3 Ultra 的（两机 14 个 IK link 在 qpos0 的姿态一致，有测试）；**足底高度改用精确最低点**（A3 的脚是网格，旧公式按 `geom_size` 会得到踝高 0.0941 m，真值 0.0675 m，机器人整体高 26 mm）；新增 `convert_gmr_a3_to_motion_lib.py`（GMR 38 维 qpos → `a3_29`）。
+- 验证：24 条（0.0008 rad）、210 条含 60 条蹲 / 跪 / 跳 / 翻滚等难动作（0 失败、帧数全同、RMSE 均值 0.0020 rad）后，**全量 129,116 条（只转 A3 Ultra `robot_filtered_v15_clean` 里的那批动作名）：109.9 min、0 失败、28,394,944 帧、22 GB**；`--check` 0 个问题；与格式转换版逐条对比 `dof` RMSE 均值 0.0011 rad（p99 0.0094，273 条 >0.02，最大 0.92 rad 的几条原因没追查）、根高度差均值 −0.07 mm（印证了 #47 的 −4.54 mm 常数修正）；相邻帧最大关节步长的分布与转换版几乎相同。
+- 数据路径：原生 A3 重定向 = `data/motion_lib_a3_29d/robot_filtered_v15_clean`（`--robot a3_ultra` 的默认训练库）；格式转换版改名 `converted_from_a3ultra_v15_clean`。`--robot a3_ultra` 训练冒烟（从零、035 PT 热启动）在原生库上重跑通过。
+- **A3 SMPL 编码器的训练配方**：新增 `sonic_a3_ultra_smpl.yaml`（继承 `sonic_a3_ultra`，编码器 `g1 + a3_fast + smpl`，teleop 关）和 `g1_recon_smpl_and_a3_fast_latent_no_teleop.yaml`（仓库里本来就有、但没人引用的 Litchi 配置去掉 teleop 两项）。用官方样例 `walk_forward_amateur_001__A001(_M)` 的 SMPL 数据 + A3 片段冒烟（16 envs、3 次迭代）通过，SMPL 潜变量对齐损失有值，SMPL 与 A3 帧数对齐（1202 @30 → 2002 @50）；**导出的 `model_step_000003_smpl.onnx` 是 `obs_dict[1,1770] → action[1,29]`**（`a3_smpl_onnx_tool.py check` 通过），部署包 ORT 1.16.3 的 probe 跑通（1.5 ms）。新增 `check_smpl_pairing.py`（按文件名配对 + 帧数 / fps 检查）。
+- 测试：新增 `tests/test_a3_retarget_batch.py`（5）、`tests/test_check_smpl_pairing.py`（3）、`tests/test_a3_ultra_training_recipe.py` +1；回归 `isaaclab` 环境 240 通过 / 3 跳过，`gmr` 环境 41 通过。
+
+**没做 / 需要你决定**：① SMPL 数据（`python download_from_hf.py --training`，约 30 GB，含训练检查点）本机没有，我没有下载；② `smpl` 编码器没有训练，采样概率和辅助损失系数沿用 G1 SONIC 的取值、没为 A3 调过；③ 12.9 万条动作的训练显存 / 内存占用没评估，没有收敛训练；④ 我发出的“转换数据 vs Litchi 自带 20 条”的 120 次迭代对照被拒绝，没跑。
+
+
+## 49. [2026-10-15，接 #48] 对比视频、SMPL 全量数据、A3 库与 SMPL 世界朝向差约 90° 的原因与修复（细节见 plan 17.8）
+
+**用户的要求**：(1) 下载 SMPL 数据并采样做 SMPL 与 A3 重定向的对比视频；(2) 也做 SOMA 与重定向 A3 的对比视频；(3) 解释“SOMA 和重定向视频没差异，为什么 A3 库与 SMPL 世界朝向差约 86°，SMPL 与 SOMA 什么关系”，以及 a3-fast 加重定向节点能否替代 SMPL 编码器；(4) “先修朝向，但是不训练”。
+
+- **视频**：`videos/compare_v15_a3/`（SOMA vs A3，32 条，`make_compare_videos.py --robot a3`）；`videos/compare_smpl_a3/`（SMPL vs A3，30 条，`compare_smpl_vs_a3.py`，三栏：SMPL 训练系 / 转到机器人朝向的 SMPL / A3）。
+- **SMPL 数据**：32.3 GB 经代理时 xet 卡死，改 `HF_HUB_DISABLE_XET=1` 走普通 HTTPS（约 9 MB/s），中途会话中断过一次，已续传；解压到 `data/smpl_filtered`（131,455 个 pkl，31 GB）。配对 129,109 / 129,116。
+- **朝向差的原因**：重定向脚本为让 IK 偏移通用，把每条 BVH 整体转到“第 0 帧面朝 +X”（`_yaw_f0`）；SMPL 与 G1 库保留采集朝向。SMPL 与 SOMA 在同一世界系（样例原始 BVH −87.8° / SMPL −86.6° / G1 −86.9° / A3 −2.2°）。修前全库：±10° 内仅 6.5%（+60…+120° 约 66%）。
+- **修复**：`restore_a3_heading.py` 按每条 BVH 自己的 `_yaw_f0` 把根位置 xy / 根朝向转回（关节角不变；`_yaw_f0` 一遍读 45 GB 压缩包约 8 分钟，转库不到 1 分钟）；重定向脚本加 `--keep_heading`。旧库保留为 `data/motion_lib_a3_29d/robot_filtered_v15_clean_yawnorm`，新库换名成 `robot_filtered_v15_clean`（默认训练库）。修后全库：均值 −1.3°，p50 / p95 = 1.4° / 3.9°，±10° 内 99.2%（G1 库 vs SMPL 基线 99.5%），帧数 0 不一致；`--check` 0 问题；`--preflight` 通过。`check_smpl_pairing.py` 加朝向守卫（新库过，旧库退码 1）。
+- **检查器 bug**：帧数换算在 `T-1` 为 3 的倍数时多算 1 帧（曾报 43,138 对假不一致），已按库的 `arange` 规则修并加测试。
+- **没有训练**；SMPL 编码器的采样概率 / 损失系数仍沿用 G1 SONIC 的取值。
+- **关于“a3-fast + 重定向节点能否替代 SMPL 编码器”**：回答在对话里（结论：遥操已经能用，训 SMPL 编码器不是必须；即使训了，`smpl-pose` 模式仍要 GMR IK 给 6 个腕角）。建议先在真机 + 真实头显上评估 a3-fast 链路。
+- **docs 被覆盖**：这次中途发现 plan 与 worklog 在磁盘上被回退到了较早的状态（两个文件修改时间都是 09:48:57，疑似 IDE 里打开的旧缓冲区被保存），上面的内容与 plan 17.8 / 17.9 是据实重新写入的；编辑器里请先从磁盘重新加载再保存。
+- 测试：`tests/test_a3_heading_restore.py`（6）、`tests/test_compare_smpl_vs_a3.py`（4）、`tests/test_check_smpl_pairing.py`（+2）；回归 `isaaclab` 249 通过 / 5 跳过（4 个需要 GMR / mink，1 个需要 onnxruntime），`gmr` 52 通过。
+
+
+## 50. [2026-10-15，接 #49] A3 的 MuJoCo + Pico 遥操教程 `docs/notes/a3/mujoco_pico_sim_teleop.md`（按用户给的三条命令原样验证后写成）
+
+**要求**：三个终端分别执行 `run_sim_loop.py --robot a3_ultra`、`./deploy.sh --robot a3_ultra --input-type zmq_manager sim --encoder a3-fast`、`pico_manager_thread_server.py --robot a3_ultra --manager --num_frames_to_send 10`，仿照 `docs/notes/g1/mujoco_pico_sim_teleop.md` 在 `docs/notes/a3/` 下写一份 A3 的 Pico + MuJoCo 使用教程。
+
+**验证（本机，命令原样、路径带空格、没有用软链接）**：
+- 终端 1 弹出 MuJoCo 窗口（用户桌面 `:1`），吊在弹性绳上；终端 2 的 `a3_backend` 6 个话题 `ready=yes`、`Init Done`、自动 PD 站立，仿真 `cmd_rx` 持续增长；`[a3-chain]`、重定向节点（mode=a3-ref，:5556 → :5560）、`a3_ta_bridge`（→ ROS2 `/ta/whole_body_command`）都由 `deploy.sh` 自己拉起，不用另开终端。
+- 终端 3 的真实命令能起来、连上本机 PC Service（`initialize sdk, connect 127.0.0.1:60061`），没有头显在发数据，一直 `waiting for body data...`。**没有真实头显的验证**——这部分仍要你戴头显走。
+- 终端 3 换成 `pico_pose_zmq_replay.py --clip synthetic:wave`，终端 2 按 `T`：`mode=teleop`，重定向每帧平均 2.17–2.27 ms（p95 2.5–2.8 ms，最大 3.96 ms），`a3_ta_bridge` 转发 2600+ 帧 `rejected=0`，策略周期 20.0 ms、`sync=ok`；仿真里弹性绳按 `A3_SIM_BAND_RELEASE_S=75` 松开后机器人没有摔倒（没有 `robot fell` 提示）。
+- 插曲：第一次起的仿真进程在 80 s 后无日志地退出了（原因没查清，可能是用户桌面上的窗口被关掉），部署程序随后一直 `ready=no samples=0`、仿真 `cmd_rx` 全 0——教程第 6 节写了这个现象与处理（先确认终端 1 的进程还在）。重新起后一切正常。
+- 验证用的两个小工具（PTY 驱动按键、无人值守松绳）在会话临时目录里，没进仓库；仓库里只有仿真已有的 `A3_SIM_BAND_RELEASE_S` 环境变量（教程第 5 节提到）。
+- 所有验证进程都按各自的 PID 结束，没有碰你的会话（开始前 5556 / 5557 / 5560 / 5561 都空，结束后也空）。
+
+**教程内容**：架构图与和 G1 的区别表；一次性准备；连头显（指向 G1 文档第 1 节）；三个终端的命令与每个终端该看到的日志；第一次遥操（A+B+X+Y → `9` → A+X）；急停；键盘备份；没有头显时的联调；常见问题；这份文档验证过 / 没验证什么；真机（指向 plan 12.7，未验证）。G1 文档第 8 节加了指向它的链接，README 的链接改指它。

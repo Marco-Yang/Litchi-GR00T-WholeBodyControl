@@ -466,6 +466,14 @@ configure_and_build() {
   cmake "${cmake_args[@]}"
   cmake --build "${BUILD_DIR}" --target a3_deploy_onnx_ref -j"${JOBS}"
   cmake --build "${BUILD_DIR}" --target a3_policy_runtime_probe -j"${JOBS}"
+  # Pico a3-fast / g1 operator chain (deploy.sh --input-type zmq_manager, scripts/a3_operator_chain.sh):
+  # ZMQ "a3_ref" -> ROS2 /ta/whole_body_command.  Optional: needs the TA protobuf bindings.
+  if cmake_target_exists "${BUILD_DIR}" "a3_ta_bridge"; then
+    cmake --build "${BUILD_DIR}" --target a3_ta_bridge -j"${JOBS}"
+  else
+    echo "note: CMake target a3_ta_bridge is not available (needs the TA protobuf bindings); the Pico" >&2
+    echo "      --encoder a3-fast / g1 operator chain cannot start its bridge from this package" >&2
+  fi
   if cmake_target_exists "${BUILD_DIR}" "a3_body_drive_debug_record"; then
     cmake --build "${BUILD_DIR}" --target a3_body_drive_debug_record -j"${JOBS}"
   else
@@ -1080,8 +1088,10 @@ elif [[ -f /opt/ros/humble/setup.bash ]]; then
 fi
 
 echo "[a3] transport=${A3_TRANSPORT} aimrt_cfg=${A3_AIMRT_CFG}"
+# A3_RUNTIME_CFG overrides the packaged runtime config (deploy.sh --encoder / --smpl-model generate one);
+# a second --runtime-cfg in "$@" would be ignored because the first occurrence wins.
 exec "${SCRIPT_DIR}/a3_deploy_onnx_ref" \
-  --runtime-cfg="${SCRIPT_DIR}/config/a3_runtime_config.yaml" \
+  --runtime-cfg="${A3_RUNTIME_CFG:-${SCRIPT_DIR}/config/a3_runtime_config.yaml}" \
   --aimrt-cfg="${A3_AIMRT_CFG}" \
   "$@"
 RUN_A3
@@ -1247,6 +1257,9 @@ verify_package() {
   if [[ "${ARCH}" == "rockchip" && ! -e "${PKG_DIR}/librknnrt.so" ]]; then
     echo "missing Rockchip RKNN runtime library: librknnrt.so" >&2
     exit 1
+  fi
+  if [[ ! -x "${PKG_DIR}/a3_ta_bridge" ]]; then
+    echo "warning: ${PKG_DIR}/a3_ta_bridge missing: scripts/a3_operator_chain.sh (--encoder a3-fast / g1) cannot start its bridge" >&2
   fi
   local exe needed
   for exe in "${PKG_DIR}/a3_deploy_onnx_ref" "${PKG_DIR}/a3_policy_runtime_probe"; do

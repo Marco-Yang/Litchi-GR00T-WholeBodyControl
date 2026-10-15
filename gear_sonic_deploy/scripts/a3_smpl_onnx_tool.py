@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Make / check the monolithic SMPL-encoder policy the A3 deploy loads for ``--encoder smpl``.
+
+The deploy (``a3_deploy_onnx_ref``) runs a monolithic ONNX per encoder:
+
+    obs_dict float32[1, 1770]  ->  action float32[1, 29]
+    1770 = 840 SMPL tokenizer (10 x 24 joints x 3 | 10 x root-orientation 6D | 10 x 6 wrist joints)
+         + 930 proprioception history (10 x (3 ang-vel + 29 joint-pos + 29 joint-vel + 29 last-action + 3 gravity))
+
+That is what ``eval_agent_trl.py +checkpoint=... +export_onnx_only=true`` writes as ``model_step_<N>_smpl.onnx`` for a
+policy whose training contract has the 29-DOF A3 policy view (see docs/workflow/a3_integration_plan.md, section 15).
+No SMPL-encoder checkpoint is published for A3 / A3 Ultra, so there is nothing to download.
+
+  a3_smpl_onnx_tool.py stub  --out PATH [--base-model A3_FAST.onnx]
+        write a PLUMBING-TEST policy, the "stand stub": the SMPL tokenizer (first 840 floats) is ignored, the
+        proprioception history is fed to the real a3_fast policy together with the constant default-stand
+        tokenizer (the same 640 floats ``BuildDefaultStandTokenizerSlice`` produces).  The robot therefore balances
+        and stands like the deploy's own stand fallback while the whole SMPL data path (Pico -> ZMQ -> window ->
+        tokenizer slice -> ONNX -> PD) runs.  It does NOT track the operator.
+  a3_smpl_onnx_tool.py check PATH
+        verify an exported model has the interface above
+
+Needs a Python with ``onnx`` and ``numpy`` (the ``isaaclab`` conda env has them); ``onnxruntime`` (optional) adds a
+numerical self-check of the stub.  Run with the repository root on PYTHONPATH or from inside the checkout (the script
+adds it itself).
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+OBS_DIM = 1770
+SMPL_TOKENIZER_DIM = 840
+PROPRIO_DIM = 930
+FAST_OBS_DIM = 640 + PROPRIO_DIM  # 1570: the g1 / a3_fast monolithic export
+ACT_DIM = 29
+
+
+def default_base_model() -> Path | None:
+    """The a3_fast monolithic export of the packaged deploy (``dist/a3_deploy_<arch>/models``)."""
+    found = sorted((REPO_ROOT / "gear_sonic_deploy" / "dist").glob("a3_deploy_*/models/*a3_fast.onnx"))
+    return found[0] if found else None
+
+
+def make_stand_stub(out: Path, base_model: Path) -> None:
+    import numpy as np
+    import onnx
+    from onnx import helper, numpy_helper
+
+    from gear_sonic.utils.teleop.a3.reference_buffer import build_default_stand_tokenizer_slice
+
+    model = onnx.load(str(base_model))
+    graph = model.graph
+    ins = [i for i in graph.input if i.name not in {t.name for t in graph.initializer}]
+    if [i.name for i in ins] != ["obs_dict"] or [o.name for o in graph.output] != ["action"]:
+        raise SystemExit(f"{base_model}: expected a monolithic a3_fast export (obs_dict -> action)")
+    in_dims = [d.dim_value for d in ins[0].type.tensor_type.shape.dim]
+    if in_dims != [1, FAST_OBS_DIM]:
+        raise SystemExit(f"{base_model}: obs_dict is {in_dims}, expected [1, {FAST_OBS_DIM}] (a3_fast / g1 export)")
+    if any(a.type in (onnx.AttributeProto.GRAPH, onnx.AttributeProto.GRAPHS) for n in graph.node for a in n.attribute):
+        raise SystemExit(f"{base_model}: graphs with sub-graphs are not supported by this tool")
+
+    # The real policy keeps working on its own input name; the wrapper owns `obs_dict` [1, 1770].
+    inner = "stub_obs_dict_a3_fast"
+    for node in graph.node:
+        for k, name in enumerate(node.input):
+            if name == "obs_dict":
+                node.input[k] = inner
+    ins[0].type.tensor_type.shape.dim[1].dim_value = OBS_DIM
+
+    stand = build_default_stand_tokenizer_slice().astype(np.float32).reshape(1, 640)
+    graph.initializer.extend(
+        [
+            numpy_helper.from_array(np.array([SMPL_TOKENIZER_DIM], dtype=np.int64), "stub_proprio_starts"),
+            numpy_helper.from_array(np.array([OBS_DIM], dtype=np.int64), "stub_proprio_ends"),
+            numpy_helper.from_array(np.array([1], dtype=np.int64), "stub_proprio_axes"),
+            numpy_helper.from_array(stand, "stub_stand_tokenizer"),
+        ]
+    )
+    wrapper = [
+        helper.make_node(
+            "Slice",
+            ["obs_dict", "stub_proprio_starts", "stub_proprio_ends", "stub_proprio_axes"],
+            ["stub_proprio"],
+            name="stub_drop_smpl_tokenizer",
+        ),
+        helper.make_node("Concat", ["stub_stand_tokenizer", "stub_proprio"], [inner], axis=1, name="stub_stand_tokenizer_cat"),
+    ]
+    nodes = wrapper + list(graph.node)  # keep the graph topologically sorted
+    del graph.node[:]
+    graph.node.extend(nodes)
+    graph.name = "a3_smpl_stand_stub"
+    model.doc_string = (
+        "PLUMBING-TEST SMPL policy: ignores the SMPL tokenizer and stands (a3_fast policy fed with the default stand "
+        "tokenizer). Generated by a3_smpl_onnx_tool.py stub from " + base_model.name
+    )
+    onnx.checker.check_model(model)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    onnx.save(model, str(out))
+    print(f"wrote PLUMBING-TEST SMPL policy (stands, ignores the SMPL tokenizer): {out}")
+    _self_check(out, base_model, stand)
+
+
+def _self_check(stub: Path, base_model: Path, stand) -> None:
+    """stub(obs) must equal a3_fast(stand_tokenizer | obs[840:]) for any obs."""
+    import numpy as np
+
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        print("  (onnxruntime not installed: numerical self-check skipped)")
+        return
+    rng = np.random.default_rng(0)
+    s_stub = ort.InferenceSession(str(stub), providers=["CPUExecutionProvider"])
+    s_base = ort.InferenceSession(str(base_model), providers=["CPUExecutionProvider"])
+    worst = 0.0
+    for _ in range(5):
+        obs = rng.normal(size=(1, OBS_DIM)).astype(np.float32)
+        a = s_stub.run(["action"], {"obs_dict": obs})[0]
+        b = s_base.run(["action"], {"obs_dict": np.concatenate([stand, obs[:, SMPL_TOKENIZER_DIM:]], axis=1)})[0]
+        worst = max(worst, float(np.abs(a - b).max()))
+        if not np.array_equal(a, b):
+            raise SystemExit(f"stub self-check failed: max |stub - a3_fast(stand | proprio)| = {worst:.3g}")
+    print(f"  self-check OK: stub == a3_fast(default stand tokenizer | proprio) on 5 random observations (max diff {worst:.1g})")
+
+
+def check(path: Path, obs_dim: int = OBS_DIM, act_dim: int = ACT_DIM) -> list[str]:
+    import onnx
+
+    model = onnx.load(str(path))
+    problems: list[str] = []
+
+    def dims(vi):
+        return [d.dim_value if d.dim_value else d.dim_param or "?" for d in vi.type.tensor_type.shape.dim]
+
+    ins, outs = list(model.graph.input), list(model.graph.output)
+    init_names = {i.name for i in model.graph.initializer}
+    ins = [i for i in ins if i.name not in init_names]
+    if [i.name for i in ins] != ["obs_dict"]:
+        problems.append(f"inputs must be exactly ['obs_dict'], got {[i.name for i in ins]}")
+    elif dims(ins[0]) != [1, obs_dim]:
+        problems.append(f"obs_dict shape must be [1, {obs_dim}] (840 SMPL tokenizer + 930 proprioception), got {dims(ins[0])}")
+    if [o.name for o in outs] != ["action"]:
+        problems.append(f"outputs must be exactly ['action'], got {[o.name for o in outs]}")
+    elif dims(outs[0]) != [1, act_dim]:
+        problems.append(
+            f"action shape must be [1, {act_dim}] (the 29 A3 body joints; the two head joints are held by the deploy), "
+            f"got {dims(outs[0])}"
+        )
+    for vi in list(ins) + list(outs):
+        if vi.type.tensor_type.elem_type != onnx.TensorProto.FLOAT:
+            problems.append(f"{vi.name} must be float32")
+    return problems
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("stub", help="write the stand stub (plumbing test policy)")
+    s.add_argument("--out", type=Path, required=True)
+    s.add_argument("--base-model", type=Path, default=None, help="a3_fast monolithic ONNX (default: the packaged one)")
+    c = sub.add_parser("check", help="verify the SMPL policy interface")
+    c.add_argument("path", type=Path)
+    args = ap.parse_args()
+    try:
+        import onnx  # noqa: F401
+    except ImportError:
+        print("this tool needs the `onnx` package (e.g. the isaaclab conda env's python)", file=sys.stderr)
+        return 3
+    if args.cmd == "stub":
+        base = args.base_model or default_base_model()
+        if base is None or not base.is_file():
+            print(
+                "no a3_fast model found; pass --base-model (e.g. gear_sonic_deploy/dist/a3_deploy_x86_64/models/"
+                "model_step_200000_a3_fast.onnx) or build the package first (deploy.sh --robot a3_ultra --build-only)",
+                file=sys.stderr,
+            )
+            return 66
+        make_stand_stub(args.out, base)
+        return 0
+    problems = check(args.path)
+    if problems:
+        print(f"{args.path}: NOT a valid A3 SMPL-encoder policy for the deploy:")
+        for p in problems:
+            print("  -", p)
+        return 1
+    print(f"{args.path}: OK (obs_dict[1,{OBS_DIM}] -> action[1,{ACT_DIM}], float32)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

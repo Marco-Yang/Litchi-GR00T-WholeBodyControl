@@ -2296,6 +2296,10 @@ if __name__ == "__main__":
     # Main execution modes
     # G1 robot visualization is enabled by default when vis_vr3pt is used
     with_g1_robot = not args.no_g1
+    if with_g1_robot and args.robot != "g1" and getattr(args, "vis_vr3pt", False):
+        # The 3-point visualizer renders G1 STL meshes; it cannot draw another robot.
+        print(f"[Pico] --robot {args.robot}: G1 mesh overlay disabled (implies --no_g1)")
+        with_g1_robot = False
 
     if args.manager:
         run_pico_manager(

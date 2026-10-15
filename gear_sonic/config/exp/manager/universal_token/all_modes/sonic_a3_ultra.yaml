@@ -1,181 +1,34 @@
 # @package _global_
-# SONIC A3 Ultra (T3D0) config, based on sonic_h2.yaml's pattern (no pre-retargeted
-# motion library yet -- SMPL-only tracking). See gear_sonic/envs/manager_env/robots/a3_ultra.py
-# and docs/robot_parameters/A3_Ultra/A3_关节控制参数KpKd.docx for the robot's real
-# Kp/Kd/limits. Hands (32 finger joints) are unactuated -- see a3_ultra.py.
+# SONIC A3 Ultra, trained with the A3 parameters and randomized over A3 AND A3 Ultra  (what `--robot a3_ultra` trains).
 #
-# A3 Ultra's URDF/MJCF use capitalized "_Link" body names (vs G1/H2's all-lowercase
-# "_link"), so every body-name reference below is overridden from the G1 defaults.
-# These overrides are a first pass -- verify with `num_envs=1`: IsaacLab raises a
-# clear error naming any body that doesn't exist (see docs/source/user_guide/new_embodiments.md
-# Step 4 / "What to do if names differ").
+# The downloaded 035 policy was trained on the A3 URDF (Litchi a3_024 contract, 29 policy joints) and its domain
+# randomization was tuned for A3 and A3 Ultra together, which is why it also runs on the A3 Ultra (README of
+# Litchi_sonic_for_a3: "the corresponding models can therefore also run on A3 Ultra").  This experiment is that recipe
+# for the A3 Ultra: the 035 contract unchanged -- A3 robot asset and Kp/Kd, rewards, domain randomization, encoders --
+# on the Bones-SEED library retargeted onto the A3 itself with the A3 parameters (`a3_29` format: 29 joints, A3 MJCF / limits / foot)
+#
+#     python gear_sonic/data_process/batch_retarget_bvh_soma_a3ultra.py --robot a3 --tar data/bones_seed/soma_proportional.tar.gz \
+#         --output data/motion_lib_a3_29d/robot_filtered_v15_clean --only_from data/motion_lib_a3ultra/robot_filtered_v15_clean --workers 16 \
+#         --keep_heading   # ~2 h
+#
+# `--keep_heading` keeps each clip's capture heading, the world frame of the SMPL data (`smpl_root_ori_b` needs both in one frame).  The g1 / a3_fast
+# encoders do not care; a library made without it is turned back with gear_sonic/data_process/restore_a3_heading.py (plan section 17.8).
+#
+# Everything it exports matches the deploy interface (obs_dict[1,1570] -> action[1,29]); the two Ultra head joints stay at their
+# default pose and the fingers are not driven, exactly like the 035 weights on the Ultra.  The SMPL encoder is defined (sonic_a3.yaml) but
+# not trained: it needs SMPL motion data (`smpl_motion_file`) and `encoder_sample_probs.smpl > 0`, see docs/workflow/a3_integration_plan.md.
+#
+# The Ultra's own 63-DOF T3D0 contract is sonic_a3_ultra_t3d0.yaml; it is not deployable.
 
 defaults:
-  - /algo: ppo_im_phc
-  - /manager_env: base_env
-  - /callbacks/read_eval
-  - /callbacks/im_resample
-  - /aux_losses: universal_token/g1_recon_and_all_latent
-  - override /trainer: trl_ppo_aux
-  - override /actor_critic: universal_token/all_mlp_v1
-  - override /manager_env/observations/tokenizer: unitoken_all_noz
-  - override /manager_env/observations/policy: local_dir_hist
-  - override /manager_env/observations/critic: privileged_mf_hist
-  - override /manager_env/events: tracking/level0_4
-  - override /manager_env/terminations: tracking/base_adaptive_strict_ori_foot_xyz
-  - override /manager_env/rewards: tracking/base_5point_local_feet_acc
+  - /exp/manager/universal_token/all_modes/sonic_a3_035
+  - _self_
 
-use_manager_env: true
-
-exp_base: ${hydra:runtime.choices.exp}
-exp_var: test
-experiment_name: ${exp_base}_${exp_var}
-experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
-
-num_envs: 4096
+exp_var: a3ultra_a3params
 project_name: TRL_A3Ultra_Track
 
-actor_prop_history_length: 10
-actor_actions_history_length: 10
-
-critic_prop_history_length: 10
-critic_actions_history_length: 10
-
 manager_env:
-  rewards:
-    feet_acc:
-      weight: -2.5e-6
-    anti_shake_ang_vel:
-      params:
-        body_names: ["left_wrist_yaw_Link", "right_wrist_yaw_Link", "head_yaw_Link"]
-    undesired_contacts:
-      params:
-        sensor_cfg:
-          body_names:
-            - "^(?!left_ankle_roll_Link$)(?!right_ankle_roll_Link$)(?!left_wrist_yaw_Link$)(?!right_wrist_yaw_Link$)(?!left_elbow_Link$)(?!right_elbow_Link$).+$"
-  events:
-    base_com:
-      params:
-        asset_cfg:
-          body_names: "torso_Link"
-    randomize_rigid_body_mass:
-      params:
-        asset_cfg:
-          body_names: ".*wrist_yaw.*|torso_Link"
-  terminations:
-    ee_body_pos:
-      params:
-        body_names:
-          - "left_ankle_roll_Link"
-          - "right_ankle_roll_Link"
-          - "left_wrist_yaw_Link"
-          - "right_wrist_yaw_Link"
-        threshold: 0.25  # loosened from 0.15 -- A3 Ultra retarget has systematic L_hip_roll offset
-    foot_pos_xyz:
-      params:
-        body_names:
-          - "left_ankle_roll_Link"
-          - "right_ankle_roll_Link"
-        threshold: 0.5  # loosened from 0.2 -- avoids immediate termination due to L_hip_roll bias
-  config:
-    robot:
-      type: a3_ultra
-    terrain_type: trimesh
   commands:
     motion:
-      anchor_body: "pelvis_link"
-      vr_3point_body: ["left_wrist_yaw_Link", "right_wrist_yaw_Link", "torso_Link"]
-      vr_3point_body_offset: [[0.18, -0.025, 0.0], [0.18, 0.025, 0.0], [0.0, 0.0, 0.35]]
-      reward_point_body: ["torso_Link", "left_wrist_yaw_Link", "right_wrist_yaw_Link"]
-      reward_point_body_offset: [[0.0, 0.0, 0.5], [0.0, -0.0, 0.0], [0.0, -0.0, 0.0]]
-      body_names: [
-        "pelvis_link",
-        "left_hip_roll_Link",
-        "left_knee_Link",
-        "left_ankle_roll_Link",
-        "right_hip_roll_Link",
-        "right_knee_Link",
-        "right_ankle_roll_Link",
-        "torso_Link",
-        "left_shoulder_roll_Link",
-        "left_elbow_Link",
-        "left_wrist_yaw_Link",
-        "right_shoulder_roll_Link",
-        "right_elbow_Link",
-        "right_wrist_yaw_Link",
-      ]
-      num_future_frames: 10
-      dt_future_ref_frames: 0.1
-      smpl_num_future_frames: 10
-      smpl_dt_future_ref_frames: 0.02
-      cat_upper_body_poses: true
-      cat_upper_body_poses_prob: 0.5
-
-      freeze_frame_aug: true
-      teleop_sample_prob_when_smpl: 0.5
-
       motion_lib_cfg:
-        adaptive_sampling:
-          adp_samp_failure_rate_max_over_mean: 200
-        motion_file: data/motion_lib_a3ultra/robot_filtered
-        smpl_motion_file: dummy
-        smpl_y_up: true
-        asset:
-          assetFileName: "a3_ultra_t3d0.xml"
-
-  actions:
-    joint_pos:
-      # Exclude the 32 (unactuated) finger joints from the RL action space -- the
-      # base_env default is joint_names: [".*"], which would otherwise include them.
-      # Must match the 31 joint names actuated in gear_sonic/envs/manager_env/robots/a3_ultra.py.
-      joint_names: [
-        "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
-        "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
-        "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
-        "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
-        "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
-        "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
-        "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
-        "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
-        "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
-        "head_yaw_joint", "ultra_head_pitch_joint",
-      ]
-
-algo:
-  config:
-    empty_cache_every_n_ppo_epoch: -1
-    num_steps_per_env: 24
-    use_clampped_std: true
-    std_clamp_min: 0.001
-    std_clamp_max: 0.5
-    max_grad_norm: 0.1
-    actor:
-      backbone:
-        reencode_smpl_g1_recon: true
-        encoders:
-          g1:
-            inputs: ["command_multi_future_nonflat", "motion_anchor_ori_b_mf_nonflat"]
-          teleop:
-            inputs:
-              [
-                "command_multi_future_lower_body",
-                "vr_3point_local_target",
-                "vr_3point_local_orn_target",
-                "motion_anchor_ori_b",
-              ]
-          smpl:
-            inputs:
-              [
-                "smpl_joints_multi_future_local_nonflat",
-                "smpl_root_ori_b_multi_future",
-                "joint_pos_multi_future_wrist_for_smpl",
-              ]
-        decoders:
-          g1_kin:
-            outputs: ["command_multi_future_nonflat", "motion_anchor_ori_b_mf_nonflat"]
-
-    critic:
-      backbone:
-        module_config_dict:
-          layer_config:
-            hidden_dims: [2048, 2048, 1024, 1024, 512, 512]
+        motion_file: data/motion_lib_a3_29d/robot_filtered_v15_clean
