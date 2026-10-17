@@ -1141,7 +1141,7 @@ OMP_NUM_THREADS=1 python gear_sonic/data_process/batch_retarget_bvh_soma_a3ultra
 
 | 目录 | 内容 | 用途 |
 |---|---|---|
-| `data/motion_lib_a3_29d/robot_filtered_v15_clean` | **A3 原生重定向，已转回采集朝向**（17.8，2026-10-15）：与 SMPL 数据同一世界朝向 | `--robot a3_ultra` / `sonic_a3_ultra*.yaml` / `train_a3_035_fromscratch.sh` 的默认训练库 |
+| `data/motion_lib_a3_29d/robot_filtered_v15_clean` | **A3 原生重定向，已转回采集朝向**（17.8，2026-10-15）：与 SMPL 数据同一世界朝向；**2026-10-16 起是左右对称修正后的版本**（19.6：IK 表里腿 / 手的 `rot_offset` 各改了一半，整库重跑）。修正前的版本是同目录的 `robot_filtered_v15_clean_lrbias` | `--robot a3_ultra` / `sonic_a3_ultra*.yaml` / `train_a3_035_fromscratch.sh` 的默认训练库 |
 | `data/motion_lib_a3_29d/robot_filtered_v15_clean_yawnorm` | 同一份重定向结果，**每条动作第 0 帧面朝 +X**（批量脚本原样输出，上面一行的“转回之前”） | 只作备份；`g1` / `a3_fast` 编码器用它与用上一行等价 |
 | `data/motion_lib_a3_29d/robot_filtered_v15_clean.capture_heading.csv` | 每条动作的原始采集朝向 `_yaw_f0`（弧度 / 度，来自各自的 BVH） | 转回朝向用的表 |
 | `data/motion_lib_a3_29d/converted_from_a3ultra_v15_clean` | 第 16 节的格式转换版（由 A3 Ultra 库换算）；**朝向没有转回**（面朝 +X） | 交叉验证 / 快速通道（18 s，`convert_a3ultra_to_a3_29d.py` 的默认输出） |
@@ -1478,3 +1478,590 @@ ros2 后端本身定义了统配 QoS：发布和订阅都是 `best_effort / vola
 - 二进制须用 `build/a3_pkg_x86_64`（`ENABLE_A3_AIMRT_BACKEND=ON`）编；本机默认 `build/` 是 OFF，拷进 dist 后仿真 `cmd_rx` 一直为 0。无 MCAP 时 evaluation recorder 只告警、不再 `return 1`。
 - 流程：A+B+X+Y → `Init Done` → 松绳 → A+X 跟随（`pd_stand -> teleop`）→ A+X → `[pico-cmd] A+X -> policy stand`、`[teleop] policy stand: default-stand tokenizer through a3_fast`、`frames … mode=teleop … policy_stand=1`；`cmd_rx` 持续增长；仿真日志无 `fell` / `resetting`。
 - 本轮用的是挥手片段，不是绕肩一整圈后的大后倾。大幅度退出仍建议先在有窗口的仿真里再确认一次。
+
+### 18.17 智元第二次答复：开放 body_drive 的前提是关闭运控；PD 入参接口下周更新，但建立在运控之上（2026-10-16，用户转述）
+
+**原话**（用户转述；后三句我分不出是智元原话还是用户的补充，都按智元的意思记）：
+- 「body_drive 是底层关节通信话题，开放的前置条件是关闭我们的运控。」
+- 「可 PD 入参接口我下周会更新上去，不过是在我们的运控基础上的。」
+- 「运控指的是部署 policy。」
+- 「这个开源项目就是 Litchi_sonic_for_a3。」随贴的公告是：SONIC 在 A3 上的适配开源（训练代码、MuJoCo sim2sim、C++ 部署框架、035 / 200k 的 PT / ONNX / RKNN 权重，RK3588 NPU 推理，模型也适用于 A3 Ultra）；已展示行走、转向、跳跃、下蹲、弓步和简单操作，“腕部追踪等方面还有提升空间”；仓库 `AgibotTech/sonic_for_a3`，即我们的参考仓库 `Litchi_sonic_for_a3`。
+
+**我的解读（未向智元确认）**
+1. “运控”= 机器人上跑的那个部署 policy，也就是 `mc`（`motion_control`），而它就是这个开源项目的部署。这和 18.11 / 18.12 看到的一致：`mc` 订阅 `/ta/whole_body_command` 和 `/wbc/infer/reference_window`（遥操参考进、推理在里面）。所以“关闭运控”是把 035 策略停掉，不是关掉一个无关的运动模块。
+2. “body_drive 是底层关节通信话题，开放的前提是关运控”回答了 18.12 问题 3 里“`motion_control` 是否必须先关掉”：**必须**。这与 `pico_real_teleop.md` 第 4 节的做法（`sm_config` 里 `Motion` 只留 `agent`）一致，但“怎么关、怎么恢复”仍不是官方步骤（问题 4 没答）。它还暗示智元愿意在运控关闭后“开放”body_drive，但没说开放的方式（只给 MDU 本机的 iceoryx，还是再加 ros2 后端）、要不要重启主站（问题 1、2 没答）。
+3. “PD 入参接口”应是上午那句“部分指令可传 Kp/Kd，3.3 会更新”的具体化。**它建立在运控之上**，也就是说它是给“运行中的部署 policy”传 PD 参数的入口，不是绕开运控直接写关节的通道。它是只能改 policy 的增益档，还是能把外部的 `q_des + Kp + Kd` 经运控再送到电机，不知道。
+
+**对我们的影响**
+- **没有变的**：运控开着时，我们不能写 `/body_drive`（本来就在 `real_mdu_body_drive.md` 6.3 的“明确不做”里）；ROS 2、在 MDU 上跑、ZMQ 中继三条路线都要先关运控。机器人上目前什么都没动。
+- **路线**：A（MDU 上跑）和 C（ZMQ 中继）= 关运控后，我们的进程在 MDU 上经 iceoryx 拥有 `/body_drive`，不需要智元改配置，和开源项目自己的真机流程一致，所以仍是最符合智元预期的两条；B（PC 经 ROS 2）= 关运控 + 智元改 `hal_ethercat` 并重启，智元没表态。新增待评估的 **D：下周的 PD 入参接口**——若它允许外部节点在运控开着时送目标 + PD，就能保留智元的保护层；但它基于运控，而我们的 SMPL 策略是另一个策略，关键是它能不能让“运控里跑的策略”换成我们的模型（见问题 a）。
+- **关运控后机器人没有智元的站立 / 平衡**：此后站立、失联保护全是我们的（中继的“保持 → 阻尼”、PD 站立），只能在吊架上做，物理急停在手。
+- **对 SMPL 编码器训练没有影响**（训练和部署路径独立）。对导出有一点：如果最终要让智元的部署（运控）加载我们的模型，接口得一致——035 的 g1 / a3_fast 是 `[1,1570] → [1,29]`，我们的 smpl 是 `[1,1770] → [1,29]`，输入含 SMPL 分词器，而 SMPL 不是它现有的遥操来源（它现有的是 `/ta/whole_body_command` 的 a3_fast 参考），要问清楚。
+- 公告里说“腕部追踪等方面还有提升空间”，与 19.7 里我们量到的实时 GMR 腕输入误差大（均值 0.48 rad）同一类问题——旁证，不是因果证明。
+
+**建议再问智元的（用户转达）**
+- a. “运控”在 MDU 上是不是就是开源仓库 `gear_sonic_deploy` 的 `a3_deploy_onnx_ref` 原样（二进制、配置、模型文件在哪个目录，由 `sm_config` 的哪个条目启动）？能不能把我们导出的模型（RKNN / ONNX）放到同一个位置、用同一种启动方式替换？
+- b. “PD 入参接口”的话题名、消息字段、版本（3.3？）；它是给运行中的运控调增益（档位 / Kp、Kd），还是让外部节点送 `q_des + Kp + Kd`、经运控再到电机？
+- c. 官方关闭运控以及恢复的步骤（`sm_config` / `agibot_pm`）；关闭之后 MDU 上普通用户（`agi`）的进程经 iceoryx 读写 `/body_drive` 是否就够，有没有别的权限或 roudi 配置要求？
+- d. 指令超时后 `hal_ethercat` 的行为（保持最后一帧 / 阻尼 / 掉使能）与超时时间（18.12 问题 3 的后半，仍没回答）。
+
+**没有做**：没有碰机器人，没有登录 MDU，没有改代码或配置。等下周的接口说明再决定。
+
+### 18.18 智元第三次答复（售后）与官方 `joint_demo`（2026-10-16，用户转述，并给出 `docs/robot_parameters/A3_Ultra/joint_demo.zip`）
+
+**售后原文**（回答 18.17 建议的前三问）
+- 问 1，运控的模型能否替换：「**不可以替换**」。
+- 问 2，PD 入参接口：手臂控制话题 `/motion/control/pnc/arm_joint_command`；消息 `joint_msgs::msg::JointCommand`（`joint_demo` 里可直接引用）；可传 Kp / Kd 和关节位置，关节与 `/motion/control/arm_joint_state` 的 `name` 字段一一对应，Kd 放 `damping`，Kp 放 `stiffness`。
+- 问 3，关闭 / 重启运控：`curl -i -H 'content-type:application/json' -X POST 'http://127.0.0.1:50080/json/stop_app' -d '{"app_name": "mc"}'`；重启把 `stop_app` 换成 `start_app`。
+- 补充：「body_drive 访问有两种方式：一种是 iceoryx 直接读写，一种是改为 ros2 控制。」
+- 第 4 问（指令超时后 `hal_ethercat` 的行为）没有回答。
+
+**`joint_demo.zip`**（只读：解到临时目录，没有运行任何东西）
+- readme：demo 针对 `/body_drive/leg_joint_command` 和 `/body_drive/leg_joint_state`。步骤：①**改机上通信形式**——真机在 MDU 上对应机型的 yaml（以 T2.5 为例 `agibot/config/hal_ethercat/hal_ethercat_a3_t2d5_cfg.yaml`）里，给这两个话题**添加 ros2 通信形式**；仿真把 aimsim 里的 `/body_drive/leg_joint_state` 改成 ros2；②加载预编译的 `joint_msgs`（x86_64 / aarch64）；③关闭 `mc`——readme 里的地址是 **`http://10.42.10.10:50080`**（仿真不启动 mc 即可）；④`demo_state.py` / `demo_command.py`（真机先 `source /agibot/software/v0/entry/env/env.sh`）。
+- `demo_command.py`：50 Hz、QoS `BEST_EFFORT` depth 10，向 `/body_drive/leg_joint_command` 发布 `JointCommand`（`header.frame_id = "base"`；每个关节一个 `Command`：`name`、`sequence = 0`、`position`、`velocity`、`effort`、`stiffness`（示例 40）、`damping`（示例 4））；`demo_state.py` 订阅 `/body_drive/leg_joint_state`（`State`：`name`、`sequence`、`position`、`velocity`、`effort`）。`ros_logs` 里有一条 QoS 不兼容告警（订阅端默认 reliable，发布端 best_effort）。
+- **与我们的核对**：`gear_sonic_deploy/thirdparty/joint_msgs` 里的 `JointCommand.msg`、`Command.msg`、`JointState.msg`、`State.msg` 与智元的**逐字节相同**；话题名、关节名（`left_hip_pitch_joint` …）、best_effort、50 Hz 与我们的 `a3_aimrt_config.ros2.yaml` 一致。这顺带解决了 18.12 里“配置注释写 `hal_msgs`、我们用 `joint_msgs`”的担心：智元自己的 demo 用的就是 `joint_msgs`。
+
+**解读（未向智元确认）和影响**
+1. **路线 B 有了官方做法，而且是“客户自己改”**：在 MDU 上给 `hal_ethercat` 的配置加 ros2 通信形式（demo 只演示腿；我们需要的是 5 个指令话题和腿 / 臂 / 腰 / 脖子 / 手的状态，手在 `hal_elink`），关掉 `mc`，PC 上的部署进程发 `JointCommand`。这与 18.12“要智元改”的判断不同。但这仍是动力级配置（EtherCAT 主站），**我不做**：按智元的步骤，机器人悬空、物理急停在手，由你或智元的人来改。**改完怎么生效**（要不要重启 `aimrt_main_hal`、能不能也用 `stop_app / start_app` 对它）readme 没写，需要问。
+2. **关 / 开运控有了官方命令**（HTTP，`app_name: mc`），比 Litchi 的“改 `sm_config.yaml` + 重启 `agibot_pm`”轻，不用改配置、不用重启服务。**但地址不一致**：售后写 `127.0.0.1:50080`（在跑 `agibot_pm` 的那台机器上执行），readme 写 `10.42.10.10:50080`（HDU）；18.11 的只读检查里 `agibot_pm` 在 MDU 上。**我没有验证**；先问清楚是哪台、能不能从 PC 直接 curl，再用。停掉 `mc` 之后机器人没有智元的站立 / 平衡：只能吊起来做，重启也走 `start_app`。
+3. **运控模型不能替换** → 自研 SMPL 策略不能“放进运控里跑”，只能停 `mc` 后自己占 `body_drive`（路线 A / B / C）。
+4. **“PD 入参接口”= `/motion/control/pnc/arm_joint_command`，只有手臂**：它是 `mc` 活着时的手臂 PD 入口（腿和腰仍由 `mc` 自己的策略管）。整身自研策略用不上它；但可以做一条退路 D′——保留智元的站立 / 行走，手臂由 SMPL 重定向后直接下发 PD（与自研 SMPL 策略无关，也没有做）。关节顺序以 `/motion/control/arm_joint_state` 的 `name` 为准，要订阅才知道，我没有读。
+5. **失联保护没有答案**：`hal_ethercat` 指令超时后的行为没回答。路线 B 没有中继的“保持 → 阻尼”，PC 或网络挂了时只有 `hal_ethercat` 自己的行为兜底；路线 C 的中继在 MDU 上自己兜底（但要在 MDU 上放我们的 aarch64 进程）。
+6. MDU 的负载（10.4/8）仍是顾虑：B 要把全部关节状态从 MDU 导出到 ROS 2，多占 CPU 和网口；A / C 不需要。
+
+| | 要改机器人配置 | MDU 上放我们的进程 | 失联兜底 | 软件现状 |
+|---|---|---|---|---|
+| B：PC 经 ROS 2 | 是（客户改 `hal_ethercat` / `hal_elink` 的 yaml + 关 `mc`） | 否 | 只有 `hal_ethercat` 的超时行为（未知） | `deploy.sh --remote` 已有 ROS 2 传输和门检查，未在真机跑过 |
+| C：ZMQ 中继 | 否（只关 `mc`） | 是（`a3_zmq_relay`；aarch64 包已构建（18.20），未在 MDU 上跑过） | 中继 60 ms 重发 → 150 ms 保持 → 300 ms 阻尼（已实现，MuJoCo 验证） | 已实现 |
+| A：MDU 上整个部署 | 否（只关 `mc`） | 是（整个 aarch64 / RKNN 包） | 部署进程自己 | 包已构建（18.20），未在 MDU 上跑过 |
+
+**需要你定 / 再问智元**：路线 B 还是 C（B 不需要 aarch64，但失联兜底和 MDU 负载没答案；C 已有失联保护，但要在 MDU 上放进程）；再问智元三件事：①改完 `hal_ethercat` 配置怎么生效（重启哪个 app）；②`hal_ethercat` 指令超时行为（保持 / 阻尼 / 掉使能，多久）；③ `50080` 到底在哪台机器上、能不能从 PC 调。**这三件有答案之前不动机器人。**
+
+**没有做**：没有碰机器人，没有登录 MDU，没有发任何 curl，没有改代码或配置。
+
+### 18.19 一个开关选路线：`--telecom iceoryx|ros2|zmq`（2026-10-16，用户要求“B 和 C 都实现，用 `--telecom ros2` 或 `zmq` 选择和调用”）
+
+**结论：B 和 C 本来就都在同一个部署二进制里，缺的只是一个统一的选择开关；现在补上了。**
+- 部署二进制 `a3_deploy_onnx_ref` 的机器人后端是两种：AimRT（传输 iceoryx 或 ros2，由配置文件 / `A3_TRANSPORT` 选）和 ZMQ 中继（`--robot-link zmq`，18.13）。路线 B = AimRT + ros2，路线 C = ZMQ，路线 A = AimRT + iceoryx。三条路线共用同一套策略、遥操、Pico 状态机和安全逻辑，只有“怎么读状态、怎么发指令”不同。
+- 之前的入口是分开的：B 用 `--remote`（只对真机、不能和 `--robot-link zmq` 同时用），C 用 `--robot-link zmq`，A 靠环境变量。现在 `scripts/deploy_a3.sh`（`deploy.sh --robot a3|a3_ultra` 会原样转交）新增 **`--telecom iceoryx|ros2|zmq`**：
+  - `ros2`：真机上等于旧的 `--remote`（ROS 域检查、Cyclone、内存上限、只读的门）；仿真上就是 MuJoCo 的传输，也是仿真的默认；
+  - `zmq`：等于 `--robot-link zmq`（必须 `--relay-host` 和 `--teleop-input zmq`）；
+  - `iceoryx`：部署进程在 MDU 上，导出 `A3_TRANSPORT=iceoryx`；连不上仿真（仿真只说 ROS 2），会直接报错；
+  - 真机不写参数：和以前一样（`A3_TRANSPORT` 决定），横幅里显示 `telecom=site default`。
+  - `--remote`、`--robot-link zmq` 保留为旧写法；与 `--telecom` 矛盾（如 `--telecom ros2 --robot-link zmq`）或同时给两个旧写法会报错退出（退出码 2）。
+- 门失败的提示改成了现在知道的做法：给 `hal_ethercat` 配置加 ros2 通信形式再停 `mc`（智元 `joint_demo`），或者用 `--telecom zmq`，或者在 MDU 上部署 aarch64 包。
+- 测试：`tests/test_a3_zmq_relay_launch.py` 新增 4 个、`tests/test_a3_real_deploy_scripts.py` 新增 1 个（`--telecom zmq` 与 `--robot-link zmq` 参数逐字相同；`ros2` 是仿真默认；`iceoryx` 连不上仿真、真机导出 `A3_TRANSPORT=iceoryx`；非法值和矛盾组合；真机 `--telecom ros2` 与 `--remote` 的 ROS 域检查、门、Cyclone 设置完全一致），原有的 21 个启动脚本测试不改动地通过。
+- 文档：`pico_real_teleop.md` 新增 4.4（选路线表 + 三条命令），4.5 / 4.6 / 仿真教程 / README / `real_mdu_body_drive.md` 改用新开关。
+
+**两条路线的真实差别（选哪条要看这个，不是开关能抹平的）**
+
+| | B：`--telecom ros2` | C：`--telecom zmq` |
+|---|---|---|
+| 机器人上要做的事 | 关 `mc`；改 `hal_ethercat` / `hal_elink` 配置（动力级，客户做）；改完怎么生效没答复 | 关 `mc`；放 `a3_zmq_relay`（aarch64 包已构建，见 18.20） |
+| PC 或网线出问题 | 只有 `hal_ethercat` 的超时行为兜底（**没答复**）；部署进程的看门狗只在链路还通时有用 | 中继 60 ms 重发 → 150 ms 保持 → 300 ms 渐变阻尼并锁存 |
+| 指令校验 | 无（直发 body-drive） | 中继逐帧校验（有限数、增益上限、离实测姿态的距离、步长、序号、单一会话） |
+| MDU 负载（10.4/8） | 全部关节状态要导出到 ROS 2，额外占 CPU 和网口 | 中继只做转发，开销小（没实测） |
+| 验证状态 | 仿真里验证过（仿真就是这条 ROS 2 传输）；真机没跑过 | 仿真里验证过；真机没跑过 |
+
+**没有做 / 没有验证**：这次改动只在脚本层（参数解析、校验、环境变量、横幅），部署二进制没有改；我没有重跑 MuJoCo 的整链路——只跑了启动脚本测试（用假的包记录参数）。因为你的 A3 部署会话还在跑，B/C 同时开会占用同一个 AimRT 端口（50901），所以我没有再起一遍；改动前后传给二进制的参数逐字相同（测试里对比了 `--telecom zmq` 和 `--robot-link zmq`）。`a3_real_preflight.sh` 是按“在 MDU 上跑”写的，没有加 `--telecom`。
+
+### 18.20 更正：aarch64 包和 Docker 其实已经有了；仿真里两条路线怎么对应（2026-10-16，用户追问时发现）
+
+**更正**：我在 18.18 / 18.19 和前一轮的回答里说“C 缺 aarch64 包和 Docker”，**是错的**。核实（只读）：`/usr/bin/docker` 是 Docker 29.1.3，`/var/run/docker.sock` 建于 02:40；`gear_sonic_deploy/dist/a3_deploy_rockchip/` 建于 02:45–02:47，里面是 **ARM aarch64** 的 `a3_zmq_relay`、`a3_deploy_onnx_ref`、`a3_ta_bridge`，以及 `run_a3_relay.sh`、ONNX Runtime 1.19.2、`librknnrt.so`、035 的 g1 / a3_fast 的 `.onnx` 和 `.rknn`。不是我装的、也不是我构建的（那一段时间我没有碰 Docker），应当是用户装好 Docker 后自己构建的，我没有记录到。我这个会话的用户不在 `docker` 组里（`permission denied while trying to connect to the docker API`），所以我自己没法再构建；也没有必要。我的记忆和文档因此过时了，已改：`pico_real_teleop.md` 0.2 表和 4.4–4.6、仿真教程、`real_mdu_body_drive.md`、18.19 的表。
+
+**核对了什么、没核对什么**
+- 核对：两个二进制都是 ELF ARM aarch64；需要 GLIBC ≤ 2.34、GLIBCXX ≤ 3.4.30（MDU 按 18.11 是 Debian 12，glibc 2.36，应满足）；RUNPATH 是 `$ORIGIN:/opt/ros/jazzy/lib:/opt/ros/humble/lib`（MDU 有 `/opt/ros/jazzy`）；`run_a3_relay.sh` 用 `A3_RUN_TARGET=relay` 转 `run_a3.sh`。
+- **潜在问题：包里没有 `libzmq.so.5`**，而 `a3_zmq_relay` 和 `a3_deploy_onnx_ref` 都 `NEEDED libzmq.so.5`；sysroot 里有（`libzmq.so.5.2.4`），但构建没有把它拷进包。Litchi 自己的部署二进制同样依赖它、也不带，所以多半是 MDU 系统自带，但我没有核实。上 MDU 前在包目录里 `ldd ./a3_zmq_relay | grep 'not found'`（只读）；有输出就把 sysroot 里的 `libzmq.so.5` 拷进包的 `lib/`。（我没有改打包脚本。）
+- 没做：没有在 MDU 上运行过；x86 机器上也没法跑这个包（没有 aarch64 模拟）。
+
+**仿真里的 B / C（用户问“仿真也牵扯到路线 B 和 C 吗”）**：牵扯，但含义是“仿真扮演机器人这一侧”，两条在 PC 上都跑得起来：
+- B（`--telecom ros2`，仿真默认）：部署进程直接和 MuJoCo 仿真走 ROS 2（域 87，`ROS_LOCALHOST_ONLY=1`）。仿真就是一个“body-drive 已经在 ROS 2 上”的机器人；**所以仿真里 B 能跑，不能证明真机的 MDU 能做到**——真机的 `hal_ethercat` 还没加 ros2，门在真机上才会拦（仿真没有门）。
+- C（`--telecom zmq --relay-host 127.0.0.1`）：多开一个中继（`scripts/a3_relay_sim.sh`，x86 的 `a3_zmq_relay`，接仿真的 ROS 2），部署进程只说 ZMQ。真机上同一个中继换成 aarch64 版放在 MDU 上、改走 iceoryx；部署进程那一端完全相同。
+- A（`--telecom iceoryx`）在仿真里不存在：仿真只说 ROS 2。
+
+### 18.21 真机上 B（ros2）和 C（zmq）现在能跑通吗：依赖核查与预检补强（2026-10-16，用户问“都能跑通吗，没装的包继续装”）
+
+**结论：两条都没有在真机上跑过，也都还不能直接启动；仿真里两条都通。** 本机（PC）侧的依赖都齐了，没有需要新装的包；缺的是 MDU 侧的事，我不能登录 / 装。
+**本机核查（只读）**：x86 包三个二进制（`a3_deploy_onnx_ref`、`a3_zmq_relay`、`a3_ta_bridge`）`ldd` 全部解析；`a3_deploy_verify` 环境有 rclpy、Cyclone DDS（`librmw_cyclonedds_cpp.so`、`libddsc`）、PyYAML；`systemd-run`（B 的内存上限用）在；`gmr` 环境有 mujoco / mink / pyzmq / GMR；`.venv_teleop` 有 pyzmq。`a3_deploy_verify` 没有 Python 的 `zmq`，但真机流程里没有哪一步在那个环境里用它。**发现并修了一处文档问题**：`pico_real_teleop.md` 4.6 让人用 `python3 …/a3_relay_tool.py listen` 检查中继链路，而 conda base 和系统 `python3` 都没有 pyzmq，会直接 `ModuleNotFoundError`；已改成 `.venv_teleop/bin/python`。operator 侧预检（只读）的两个 FAIL 是当下状态而不是缺包：RoboticsService 没在跑（Pico 服务要用时才开）、`ROS_DOMAIN_ID` 没设（B 才需要）；一个 WARN 是 5560 被用户正在跑的会话占着。
+
+**预检补强**（`a3_real_preflight.sh` 机器人侧新增“共享库”检查，已同步进 x86 和 aarch64 两个包的根目录，只拷了脚本、没有重编译）：对 `a3_deploy_onnx_ref` 和 `a3_zmq_relay` 跑 `ldd`（遵循二进制的 RUNPATH，不用 source 厂商环境），缺库就 FAIL 并点名；`libzmq` 缺失时给出两条补救路径。在 x86 PC 上两个二进制都 PASS；在 PC 上检查 aarch64 包时 `ldd` 看不了外架构，只提示“到 MDU 上跑”。测试 `test_preflight_reports_missing_shared_libraries_of_the_robot_binaries`（用假 `ldd`，同时断言预检不创建任何文件）。
+
+**为什么不直接把 `libzmq.so.5` 拷进包**：它自己还依赖 `libbsd`、`libsodium`、`libpgm-5.3`、`libnorm`、`libgssapi_krb5` 五个库，要拷一串、还要核对 MDU 上的版本，拷错比不拷更糟；更干净的做法是用预检在 MDU 上先看缺不缺，缺了再决定装系统包（要 root / 厂商）或者带着依赖一起拷，或者静态链接 libzmq（sysroot 里有 `libzmq.a`，要重新构建，我没有 Docker 权限）。Litchi 自己的部署二进制同样依赖、同样不带 `libzmq.so.5`，而它是在这台 MDU 的出厂环境里验证过的，所以**多半 MDU 自带，但我没有核实**。
+
+**真机上各条路线还差什么**
+
+| | 差什么 | 谁来做 |
+|---|---|---|
+| B：`--telecom ros2` | ① 关 `mc`（`stop_app`，地址没确认）；② MDU 的 `hal_ethercat` / `hal_elink` 配置给 `/body_drive/*` 加 ros2 通信形式——**没有这一步门就会拦住，什么都不会发布**；③ 改完怎么生效、指令超时行为智元没回答；④ 本机设 `ROS_DOMAIN_ID=232`、`ROS_LOCALHOST_ONLY=0`、`--ros-iface-ip 10.42.10.99` | ②是动力级配置，你或智元的人在悬空 + 物理急停下做 |
+| C：`--telecom zmq` | ① 关 `mc`；② 把 `dist/a3_deploy_rockchip/` 拷到 MDU；③ 在 MDU 上跑预检（尤其 `libzmq.so.5`）；④ 先用 `--listen-only` 起中继、本机 `a3_relay_tool.py listen` 确认链路，再去掉 `--listen-only`；⑤ 本机 `--telecom zmq --relay-host 10.42.10.12` | 需要登录 MDU，只能你来；我不登录 |
+| 两条共有 | 没在真机上跑过；手（O10）不转发；吊架 + 物理急停；智元的运控停掉后没有他们的站立保护 | — |
+
+**没有做**：没有碰 MDU / Docker / 机器人；没有改打包脚本；没有重编译；没有提交。
+
+### 18.22 路线 C 上线准备（2026-10-16，用户决定“先选 C 先走”）
+
+**我做了什么（全部在本机，没有登录 MDU、没有碰机器人 / Docker）**
+1. **中继专用小包**：新增 `gear_sonic_deploy/scripts/a3_make_relay_bundle.py`。文件清单是算出来的（从 `a3_zmq_relay` 和 iceoryx 配置里的 AimRT 插件出发，用 `readelf -d` 顺着 `NEEDED` 在包目录里找），不是手写的。产物 `gear_sonic_deploy/dist/a3_relay_rockchip.tar.gz`（6.5 MB，22 MB 解开，23 个文件，带 `MANIFEST.sha256` 和旁边的 `.sha256`）：只有 aarch64 的 `a3_zmq_relay`、三个 AimRT 插件、`joint_msgs` / `ros2_plugin_proto` / `libtbb`、`config/`、`run_a3*.sh`、预检和 `a3_relay_tool.py`；没有模型、动作库、ONNX Runtime、RKNN。脚本同时报告“必须由 MDU 提供的库”：libc / libstdc++、ROS 2 Jazzy 的 rcl / rclcpp / rmw / fastcdr 2 / typesupport 等（对着 18.11 里 MDU 的 `/opt/ros/jazzy`），以及 **`libzmq.so.5`**。在 x86 包上做了同样的打包，解开后用预检验证文件清单完整（所有库解析）。
+2. **预检补强**（`a3_real_preflight.sh`，已同步进两个包和中继包）：
+   - 新增 **`--relay`**（MDU 上、中继包里跑）：中继包文件、`ldd`（中继和三个插件）、`A3_ROBOT_ENV`、`mc` 是否在跑（`--listen-only` 时只警告）、RouDi、有没有别的中继 / 完整部署、端口 5570 / 5571 / 50901、`--bind-ip` 是不是本机地址、负载和磁盘。
+   - 新增操作端 **`--relay-host IP`**（C 用）：跳过 ROS 2 / `a3_ta_bridge` 检查，改查中继主机能否 ping、状态端口 5570 是否有东西接受连接、pyzmq 是否可用。之前 `--operator` 对 C 硬要求 `ROS_DOMAIN_ID`，是不适用的；预检以前也不查中继是否可达（18.13 的遗留项），现在查了。
+   - **修了预检里 3 个会误判的检查**：`pgrep -x` 比较的是内核进程名，被截成 15 个字符，对 `a3_deploy_onnx_ref`（18 个字符）和 `RoboticsServiceProcess`（21 个）永远匹配不到。后果：“另一个部署在跑”的检查从来没生效过（这台机器上我自己的会话就是证据：它的进程名是 `aimrt_main`），操作端预检还把正在跑的 RoboticsService 报成 FAIL。现在改为匹配命令行。`mc` 的检查也加了一层命令行匹配（AimRT 会改进程名，不能只靠名字；**这个我没有在 MDU 上验证过**，`mc` 在 MDU 上具体叫什么进程名 / 命令行我没有实证）。
+   - 新增 4 个测试（`--relay` 的逐项输出、被截断的进程名用真实进程验证、中继包文件清单、操作端 `--relay-host`），全套 257 通过 / 5 跳过。
+3. **runbook**：`pico_real_teleop.md` 4.6 的“上线步骤”，分 4 步，每步通过再做下一步：第 0 步本机；**第 1 步 MDU 上只听**（`--listen-only`，`mc` 不用停、机器人不会动、只读状态）；第 2 步悬空 + 急停 + 第二个人，停 `mc` 后放行指令；第 3 步本机起部署、IDLE 起步、空中故意断线一次看 `HOLD → DAMP`；以及收尾恢复。
+
+**我核实过 / 没核实的**
+- 核实：`--listen-only` 下中继报 `mode=DISARMED`、`fwd=0`（源码）；包里两个二进制是 aarch64、需要 GLIBC ≤ 2.34；中继的依赖链（含插件）完整。
+- 没核实：`libzmq.so.5` 在 MDU 上有没有；`mc` 在 MDU 上的进程名；`stop_app` 的地址（售后 `127.0.0.1:50080` / readme `10.42.10.10:50080`）；RouDi 在 MDU 上的进程名（预检按 `roudi` 子串匹配，没找到只警告）；`imu2` 在这台机器上应该是几；整个中继在 MDU 上从没跑过。
+- stock 的 AimRT 配置会让中继加载 `ros2_plugin`（在厂商 ROS 域里多一个名为 `a3_deploy_onnx_ref` 的节点）和 `net_plugin`（127.0.0.1:50901）：与厂商验证过的部署一致，所以第一次不改；只含 iceoryx 插件的中继专用配置没做、没测。
+
+**第 1 步进展（2026-10-16 18:07，用户贴回的输出）**：`scp` 成功（6341 KB，`sha256` 文件 91 B），本机 `enp11s0` 有 `10.42.10.99/24`，本机侧校验 OK。登录 MDU 后，`ssh` 后面和它一起粘贴的命令被密码提示吞掉，**MDU 上的校验 / 解压 / 预检都还没有执行**；随后单独执行的 `uptime` 给出负载 7.93 / 8.58 / 7.31（8 核；18.11 时是 10.4），`./run_a3_relay.sh` 因为当前目录是 `/agibot`、包没解压而失败（无副作用）。顺带读到的 MDU 信息：`rk3588-v0.7.6`、`full_version v3.2.17`（智元说带 Kp/Kd 的接口在 3.3，这台还是 3.2.17）、内核 6.1.118 PREEMPT_RT、Debian GNU/Linux、`up 26 min`（刚上电或重启过）；MDU 的时钟与实际日期不一致（上次登录显示 Aug 28），18.11 记过“无对时服务”。
+
+**第 1 步结果（2026-10-16 18:13–18:14，用户贴回的输出）：通过。**
+- **MDU 预检 `--relay --listen-only`：0 FAIL，1 WARN**（WARN 是 `mc` 在跑，`--listen-only` 下预期）。`libzmq.so.5` 在 MDU 上有（之前没核实的一项解决了）：中继和三个插件的共享库全部解析；`mc` 的检测在 MDU 上生效（命令行匹配对了）；RouDi 在跑；5570 / 5571 / 50901 都空闲；`10.42.10.12` 是本机地址；剩余磁盘 3.6 GB；预检里 `nproc` 报 3（18.11 说 8 核，没查原因，可能是 ssh 会话的 CPU 亲和被限制）；负载 8.15 / 8.56 / 7.73。
+- **中继在 MDU 上第一次启动成功**：三个 AimRT 插件都加载；经 iceoryx 订阅了 6 路状态（waist / leg / arm / neck / pelvis_imu / torso_imu），启动门里全部 `ready=yes`；`command publishers disabled (publish_enabled=false)`、`hand bridge disabled`；`[relay] up: state tcp://10.42.10.12:5570 (PUB), commands tcp://10.42.10.12:5571 (SUB) … LISTEN-ONLY`；约 37 秒内每 2 秒一行 `DISARMED … cmd_rx=0/s published=0 state=ok-once`（`ok-once` = 至少收到过一次有效状态，不是“当前有效”）；Ctrl-C 后 `nothing was ever commanded, nothing to damp; exiting`，`published to robot 0`。
+- **本机 `listen` 10 秒**：2001 帧（200 Hz，和 `--state-hz` 默认值一致）、0 坏帧、`mode=DISARMED valid=1 imu2=1 fwd=0`、`state_age` 1–3 ms、`data_age` 0.5–2.6 ms；`q[0:3]`（waist yaw / roll / pitch）= 0.197 / −0.018 / −0.155，`q[19:22]`（左髋 pitch / roll / yaw）= −0.136 / 0.047 / −0.195，十秒内三位小数完全不变。左髋 pitch −0.136 与默认站姿 −0.131 吻合（也旁证了槽位顺序）；腰 yaw 0.197、pitch −0.155 不在默认值 0，髋 yaw −0.195 与默认 −0.035 差 0.16 rad，原因不知道。**三位小数不变不等于数据是死的**（`data_age` 在变、`seq` 在涨），但需要全精度看一眼：新增 `a3_relay_tool.py snapshot`。
+- **观察到但没处理**：中继的 ROS 2 插件在 **DDS 域 0**（不是机器人的 232）创建了名为 `a3_deploy_onnx_ref` 的节点，自动发现没有限制在本机（启动日志：`ROS_LOCALHOST_ONLY is deprecated … 'localhost_only' is disabled`）。对中继的正确性没有影响，只是 MDU 的网口上多一个域 0 的 DDS 参与者；想关掉可以在启动前 `export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`——**这个没有在这台机器上试过**，第一次不改。
+
+**第 1b 步前的现场情况（2026-10-16，用户回答）**：机器人在龙门架上、**脚着地站着**；有龙门架；**没有能立刻切断动力的急停，唯一能切断动力的是关闭电源**。结论：**不进第 2 步**（停 `mc`、放行指令）。理由：① 厂商指南 6.1 要求 safety tether + emergency stop + 现场监督，并明确 `P` 只是软件兜底；② 脚着地站着时停 `mc`，`hal_ethercat` 没有指令后的行为智元没回答，机器人可能倒；③ 软件手段（`P`、A+B+X+Y、中继的 HOLD → DAMP）都依赖 PC / 网络 / MDU 上的进程，且 kp = kd = 0 对站着的机器人就是瘫软。第 1 步（只读、`mc` 不停、不发指令）不受影响，可以继续做 1b。第 2 步的前提已写进 `pico_real_teleop.md` 4.6：脚离地且绳子承重；有急停或专人守着电源开关并先做一次切断测试；第二个人。需要问智元的：A3 Ultra T3D0 有没有物理急停（按钮 / 遥控器）以及官方的快速断动力方式；电源开关切的是什么（只电机还是连 MDU）。
+
+**智元对急停的回答（2026-10-16，用户转述；回答 18.23 的问题 5）**：① **遥控器上有急停**，除电源键外没有别的物理切断方式；② 电源键是**全部下电**：正常关机没有风险，不要太频繁；**强制关机有一定风险**。据此修正上面“只有关电源”的判断：物理急停存在（遥控器）。**第 2 步仍然没有放行**，剩下的条件：脚离地且绳子承重；遥控器在专人手里且连上、电量足；**放行前先按一次急停看它做了什么、怎么恢复**（智元没说急停做什么：断动力、阻尼还是别的；怎么复位也没说，复位可能要重启，所以要先问清楚再试）；第二个人。电源键不当急停用。我推断“急停由 `hal_ethercat` / `hal_elink` 层处理，`mc` 停了也有效”（18.12 看到 `hal_elink` 发布 `/hal_state/emergency`、`hal_ethercat` 订阅），**这是推断，没有验证**，所以要在“`mc` 已停、我们的指令正在发送”的状态下再按一次确认。
+
+**急停的具体内容（2026-10-16 20:45，用户贴的智元文档 4.6 截图 + 一句话）**：智元文档 4.6「急停功能」：用于机器人突发情况时的紧急停止；可通过「**软急停**」方式触发急停状态；**进入急停状态后四肢下电失能、会摔倒在地面上，有一定风险损坏机器，务必谨慎使用**。4.6.1 触发软急停的方式一是通过 **AimMaster**（手机 App 的悬浮球页面）；截图在这里截断，**方式二（口头说的遥控器）和“恢复 / 解除急停”一节没有看到**。用户补充：**恢复需要重启**。修正我之前的理解：这个急停是**软急停**（厂商软件栈里的状态，走遥控器 / App），**不是独立于 MDU 的硬件断电**；电源键（全部下电）才是最后手段。这带来三点：① 急停 = 瘫软，所以机器人必须在龙门架上承重，不是脚着地站着；② 按一次要重启一次，“放行前先试一次”要做好准备、只做一次；③ 它是否在 `mc` 已停、我们的指令正在发送的配置下仍然有效，没有证据（我推断是，18.12 看到 `hal_elink` 发布 `/hal_state/emergency`、`hal_ethercat` 订阅，但没验证），要在放行后第一次悬空 PD 站立时确认。**还要你拿到**：文档里 4.6.1 的“方式二”和“恢复”两页；重启的是整机还是 MDU、要多久。
+
+**急停的触发方式和恢复（2026-10-16 21:0x，用户贴的智元文档 4.6.1 两页 + 回答）**：方式一，AimMaster：点悬浮球 → 按住【紧急停机】按钮向右滑到底（弹窗：“急停可能损坏机器人，右滑以确认执行”）→ 界面“机器人急停中 / 重启后再操作”；方式二，遥控器：**遥控器已连上机器人时，同时按 L1+L2+R1+R2 超过 0.5 秒**。用户回答：**重启的是机器人整机**；AimMaster 和遥控器都有。用户说“已经准备好了，可以开始测试了”——但脚是否离地、绳子是否承重、是否有专人和第二个人，用户没有逐项确认；我把这些写成第 1c 步的前提，**脚着地时不要按**。已知（文档）与未知：已知急停 = 四肢下电失能、恢复要整机重启；未知：整机重启要多久、重启后 `mc` 是否自动恢复、急停期间 body-drive 状态话题是否继续、急停在 `mc` 已停且指令在发送时是否有效。第 1c 步（`mc` 在跑、只听）用来拿前三个；最后一个放在第 2 步之后第一次悬空 PD 站立时用 AimMaster 再确认一次（第二种触发方式）。
+
+**第 1c 步第一次尝试（2026-10-16 21:10–21:12）：急停没有按；顺带拿到第一份 MDU 基线和一份带满载的全精度读数。**
+- **发生了什么**：中继（`--listen-only`）21:11:52 启动、21:12:33 被 Ctrl-C；本机 `snapshot` 跑完后 `listen | tee` 十几秒没有任何输出，用户 Ctrl-C。**原因是我的命令有毛病**：stdout 接管道时 Python 默认块缓冲，`listen` 的行既没显示也没写进文件（`listen_during_estop.txt` 0 字节，Ctrl-C 把缓冲区丢了）。已修：`a3_relay_tool.py` 启动时 `sys.stdout.reconfigure(line_buffering=True)`，新增回归测试（实测去掉修复时该测试失败，加回后通过）。中继日志显示全程 `published=0`，没有指令；急停应该没有按（要用户确认）。
+- **基线脚本的两个 bug（我的）**：① `V0` 没有 `export`，子 shell 里为空，所以所有厂商配置指纹、通道定义、`sm_config` 的 Motion 组都是空的；② 非交互 ssh 里没有 ROS 环境，`ldd` 报了几个假的 `not found`（传递依赖，`run_a3.sh` 会 source `/opt/ros/jazzy/setup.bash`）。均已修，用假厂商目录干跑两次逐行相同。**所以 `mdu_baseline_before_estop.txt` 作废，要重新生成**。预检里 aarch64 的 `ldd` 也补上了 `/opt/ros/jazzy/lib`。
+- **基线里已经有用的事实**：`127.0.0.1:50080` **在 MDU 上监听**（与智元售后说的 `stop_app` 地址一致；readme 里的 `10.42.10.10` 是别的板，不用）；`agibot_pm`、`agibot_roudi` 在跑；`mc` 的进程是 `./motion_control --cfg_file_path=../config/motion_control/configuration/robot/a3_ultra_t3d0/aimrt/default.yaml`（进程名 `motion_control`，预检的检测没问题）；还有 `aimrt_main_hal`（`hal_ethercat_a3_ultra_t3d0_cfg.yaml`）、`hal_elink`、`hal_thermal`、`motion_player`、`colistener`；库：`libzmq5 4.3.4-6`、`libfastcdr 2.2.6`（`/opt/ros/jazzy`）、`librknnrt 2.3.2`；Debian 12；MDU 对外还监听 NFS（2049 / 111）、MQTT（1883）等，与我们无关。
+- **全精度读数（`snapshot`，10 s，中继启动后立刻采）**：2000 帧 / 0 个序号缺口；`valid=1864/2000`、`state_age` 均值 23.4 ms、最大 661.5 ms——136 个无效帧 ≈ 0.68 s（200 Hz）≈ 最大年龄 0.66 s，**很像中继刚启动、几路 iceoryx 订阅还没都出样本的那一段**（上一次 10 秒 `listen` 全程 `valid=1`、age 1–3 ms）；这是推断，要在中继起来 5 秒后再采一次确认。关节 `q` 大多数槽位标准差 1e-15（编码器量化后的读数，机器人没动时恒定）；`dq` 几乎全是 ±0.0073（同一个量级的量化噪声）；**腿的 `tau_est` 全部 ≤ 0.21 N·m**——如果腿在承担体重来站稳，髋 / 膝力矩会大得多，所以这说明**腿现在基本没有承重**，与“重量在龙门架上”一致（只是支持，不是证明“脚离地”）；骨盆加速度 (−1.14, −0.06, 9.76)（前倾约 6.7°），躯干 (0.59, 0.08, 9.79)（约 3.4°）；手臂姿态很不像默认站姿（L 肩 yaw +0.82 / R −1.37、肘 ≈ 1.4）、髋 yaw −0.24 / −0.40，腰 yaw −0.15，看起来像松弛 / 悬挂的姿态。**这时 `mc` 处在什么模式（站立平衡、待机、还是别的）不知道**，要问用户 AimMaster 上显示的状态。
+
+**现场确认和 AimMaster 状态（2026-10-16 21:20–21:23，用户回答 + 照片）**：五条前提用户全部回答“是”（机器人完全挂在龙门架上、脚离地、绳子承重；周围没有人和物；专人拿遥控器；第二个人在；遥控器已连上、电量足）。AimMaster 照片（我放大看过）：状态标签 **“初始”**；有 **“站起 | 躺下”** 两个按钮；模式切换 “默认背景 | 2D 地图”；右下角两个电池图标，读数模糊，约 **50% 和 31%**（不知道各是哪个设备）；一个带红色感叹号的定位图标（含义不明，多半是没有定位 / 地图）。新基线（21:22，已填充，`ldd` 没有 `not found` 了）里 `motion_control` 的配置目录有 `get_up`、`lie_down`、`fall_protect`、`damping` 等——“站起 / 躺下”就是 `mc` 里的 `get_up` / `lie_down` 策略，**机器人现在在 `mc` 的“初始”状态，不是站立平衡**，与腿 `tau_est` ≈ 0 一致。基线里还看到：`hal_ethercat` 的 t3d0 配置订阅 `/hal_state/emergency`（ros2 后端，由 `hal_elink` 发布）和 `/mc/state/motion_info`（ros2）——**急停信号是经 ROS 2 传给 `hal_ethercat` 的软件路径**，而 `hal_ethercat` 还订阅 `mc` 的状态：`mc` 停掉时它会不会因此改变行为，是前面那个没回答的问题，配置里很可能有线索；基线脚本新增了一段把配置里与 timeout / watchdog / heartbeat / emergency / safe / damp 等相关的行打出来（只读），升级前后也能对比。
+
+**第 1c 步结果：急停试验（2026-10-16 21:25–21:28，遥控器 L1+L2+R1+R2；`mc` 在跑、中继 `--listen-only`、机器人悬空、状态“初始”）**
+- **时间线（由 `listen_during_estop.txt` 重建，90 s 全程 17,999 帧、0 个序号缺口）**：`snapshot` 在中继起来后采样，**2001/2001 帧有效、`state_age` 平均 1.2 ms、最大 2.8 ms**（证实 18.22 里“`valid=1864/2000` 是启动瞬态”的推断）。`listen` 开始后 **5.5 s 最后一帧有效，6.0 s 起 `valid=0`，`age` 从 223 ms 起随时间线性增长（斜率 ≈ 1 s/s，即一个新样本都没有），一直到录制结束的 90 s 都没有恢复（`age` 被中继封顶在 10 s）**；`q` 冻结在最后的读数；`mode` 始终 `DISARMED`、`imu2=1`（这个标志只表示配置里有第二个 IMU，不表示它有数据）。**中继和 MDU 在这 90 s 里一直活着**。
+- **用户观察**：“四肢没有任何变化”。**这两条合起来的解释**：遥控器的急停触发后，`body-drive` 的六路状态（含 IMU）在不到 0.2 s 内全部停止发布，并且直到重启都没有恢复；机器人当时在“初始”状态，腿 `tau_est` ≈ 0（上一轮读数），关节本来就没有在出力，所以肉眼看不到变化。**用户已确认（21:3x）：按压就在约 6 s 时，遥控器和 AimMaster 上都出现了“机器人急停中”**——所以上面的解释成立，急停的触发路径和效果（body-drive 状态全部停止、界面提示急停中、整机重启恢复）已经验证。
+- **重启之后（`mdu_baseline_after_estop.txt` 21:28:10 vs 重启前 21:25:06，完整 diff 读过）**：厂商配置的 sha256 **全部不变**；`hal_ethercat` / `hal_elink` 里与 timeout / emergency 等相关的行不变；版本不变（`v3.2.17`）；`~/a3_relay_rockchip` 还在；差异只有临时端口、`colistener` 的临时参数文件、`motion_control/tmp/tmp3.yaml → tmp7.yaml`（`mc` 重新生成了临时配置），以及 **基线采样那一刻 `motion_control` 进程还没起来**；紧接着在 MDU 上跑的预检显示 **`mc` 在运行**（WARN）、负载 7.40 / 2.24 / 0.78（刚开机的特征）——**所以 `mc` 开机后自动恢复，只是比 ssh 晚几十秒**；重启整机在这次不到 1 分钟（21:27:08 录制结束 → 21:28:10 已能登录），用户没有说具体用时。
+- **配置里的新线索**（`hal_ethercat_a3_ultra_t3d0_cfg.yaml` 里关键字行）：① **没有任何可配置的“指令超时 / 看门狗 / 保持”参数**（`timeout|watchdog|stale|lost|hold` 没有命中控制相关的行，只有线程池名和 `/aima/heartbeat` 话题）——`hal_ethercat` 在指令中断后的行为不是配置出来的，是代码里写死的，仍然没有答案；② `emergency_topic: /hal_state/emergency`（protobuf `aimdk::protocol::EmergencyStateChannel`，ros2 后端）和一个 `emergency_worker` 线程池：**急停是经 ROS 2 话题传给 `hal_ethercat` 的**；③ `mc_motion_info_topic: /mc/state/motion_info`，注释“`is_dancing` 门控**腰部软限位保护**”：**`mc` 停掉后这个话题没人发，`hal_ethercat` 的腰部软限位保护大概率保持在非跳舞的（更严的）状态**，035 的腰部动作可能被它限制——要在第一次带指令时看腰部的跟踪；④ `sm_config.yaml`：状态机里 `"EStop": ["hal_ethercat"]`、`"Motion": ["agent", "mc"]`；`Ready` 的下一个模式是 `Manual / EStop / Poweroff / Failed`——急停是 `agibot_pm` 状态机的一个模式。
+- **结论**：急停的**触发路径管用**，效果是“body-drive 全部停止、要整机重启恢复”，重启后一切（配置、我们的文件、`mc` 的自动启动）恢复；**没有验证的**：① 在 `mc` 已停、我们的指令正在发送时急停是否同样有效（放在第一次悬空 PD 站立后再按）；② 机器人在“初始”状态时关节是否使能（看起来没有；要看我们的第一条指令会发生什么）；③ AimMaster 那种触发方式。
+
+**第 2a 步开头的意外（2026-10-16 21:45–21:52）：`mc` 不在运行，原因不明；状态流 150 s 全程正常；电池变红。**
+- **更正（21:54，用户贴回 `ps`）：`mc` 一直在运行，没有消失。** `ps -eo pid,etime,comm,args` 显示 pid 6064，**进程名（comm）是 `mc`**，命令行是 `./motion_control --cfg_file_path=…`，已运行 25:46（即 21:28:2x 开机后自动启动，与 `tmp7.yaml` / `temp_cfg_file_for_MotionControlModule.yaml` 的 21:28:25 时间戳一致）。我让用户跑的 `pgrep -a -x motion_control` 匹配的是进程名，所以没有输出——**是我的命令错了**（18.22 前面“进程名 `motion_control`”的说法也是错的：进程名是 `mc`）。预检的 `mc_running` 第一个条件就是 `pgrep -x mc`，所以预检一直是对的；下面关于“`mc` 为什么不在”的内容作废，只留作记录：
+- （作废）`pgrep -a -x motion_control` 无输出（`mc` 不在）。用户确认：**没有执行过 `stop_app`**，AimMaster 上没点过什么；AimMaster（21:51 照片）状态仍是 **“初始”**；机器人没有任何动作，用户补充“**不管是否急停都处于松弛悬吊状态**”（即“初始”状态下关节本来就不出力：松弛 = 零增益或未使能，肉眼分不出，所以急停时“四肢没有变化”）。
+- **`listen_stop_mc.txt`（21:47 起，150 s，30,000 帧、0 坏帧）**：`valid=1` 全程、无任何无效帧、`age` 最大 3.16 ms、关节读数不变——**`mc` 不在时 `hal_ethercat` 照常发布状态**（这正是第 2a 步想知道的）。但 `mc` 为什么不在不知道：重启后约 21:28 预检还看到它在运行，之后消失，而用户没有 stop；可能是它自己退出 / 崩溃，或预检那次是误报（预检用命令行匹配，`ps` 的 `etime` 才能分辨）。**必须弄清**：如果 `agibot_pm` 会把它重新拉起，它会和我们的指令发布者同时写 body-drive。
+- **电池**：21:20 的照片两个电池约 50% / 31%（读数模糊）；21:51 的照片**两个电池图标都只剩一小截红色**（低电量的红色），30 分钟里掉得很快。**不知道是机器人电池还是遥控器 / 平板**；要用户读数。结论：**在任何会发指令的步骤（第 2b 步起）之前先充电**——电量低时带载运动可能触发低电保护、突然下电，而厂商说强制关机对 MDU 有风险。第 2a 步（只停 `mc`）和只听不受影响。
+
+**第 2a 步结果（2026-10-16 21:56–21:58）：通过。** 用户贴回：`pgrep -a -x mc` 见到 pid 6064；`stop_app` → `HTTP/1.1 200 OK {"message":"stop APP success","status":"success"}`，3 s 后 `mc` 进程消失；`start_app` → `{"message":"start APP success","status":"success"}`，5 s 后 `mc` 以新 pid 63978 回来。同时 `listen_stop_mc.txt`（21:56 起，108 s、21,573 帧，用户 Ctrl-C 结束）：**`valid=1` 全程、状态年龄最大 2.96 ms、`data_age` 最大 1.65 ms、关节读数不变、`mode` 始终 `DISARMED`、只有 1 处序号缺口（86.7 s 处丢 1 帧，网络丢包量级）**——**停 / 起 `mc` 不影响 `hal_ethercat` 的状态发布，也不触发急停或故障**；`stop_app` / `start_app` 的接口、地址（`127.0.0.1:50080`）和恢复路径都验证了。**用户没有报告**：停 / 起期间机器人有没有动作、AimMaster 状态文字有没有变化（要问）。电池：用户确认两个电池图标是**机器人的电池、机器人靠电池供电**；“和充不充电没有关系”这句我没有完全理解；红色小格的具体百分比还不知道。**电池是第 2d 步（第一次让电机出力）的门槛，不是 2b / 2c 的**（2b / 2c 不发任何指令）。
+
+**第 2a 的补答和第 2b 步结果（2026-10-16 22:25）**
+- 用户补答第 2a：停 / 起 `mc` 时机器人**没有任何动作、AimMaster 没有变化**。
+- **第 2b 步（非 `--listen-only` 的中继，`mc` 已停，仍不发指令）：通过。** `listen_2b.txt`（22:25 结束，35 s、7,037 帧）：`mode=DISARMED`、`valid=1` 全程、**`fwd=1`**（中继允许转发、本机还没发过指令）、状态年龄最大 2.09 ms、无无效帧、关节读数在录制内不变。
+- **观察：关节姿态和第 2a（21:56）相比变了很多**：`q[0:3]`（腰 yaw / roll / pitch）−0.151 / 0.027 / −0.169 → −0.071 / −0.034 / −0.187；`q[19:22]`（左髋 pitch / roll / yaw）−0.093 / 0.005 / −0.245 → −0.154 / −0.133 / **−1.176**（左髋 yaw 转了约 53°，现在离默认 −0.035 有 65°）。机器人是松弛悬吊的，所以是被外力（手 / 重新吊挂）动过；用户没说。**第 2d 步的 PD 站立会用 3 s 把所有关节从当前姿态拉到默认站姿**（中继的首帧校验是“指令 ≈ 实测”，会通过），左髋 yaw 要扫过 65°，所以要先确认这个姿态是不是有意的，周围要有空间，必要时先用手把腿摆回接近默认。
+- **第 2c 步第一次启动失败（我的 bug）**：`./deploy.sh … real … --telecom zmq` 打印横幅、用户确认、重定向链起来之后，`a3_deploy_onnx_ref` 报 `error while loading shared libraries: libsensor_msgs__rosidl_typesupport_cpp.so`，链被停掉（`a chain process exited; stopping the rest`）。**原因**：x86 部署二进制即使走 ZMQ 也链接了 ROS 2 的消息库（typesupport），库在 conda 环境 `a3_deploy_verify` 里；`deploy_a3.sh` 里设置 `LD_LIBRARY_PATH` 的只有“仿真 + ZMQ”那条分支，**“真机 + ZMQ”从来没有用真二进制跑过**（之前只在假包上测了参数）。已修：任何 `--telecom zmq`（仿真和真机）都从 `A3_ROS_PREFIX/lib` 设置库路径；新增测试（实测恢复旧条件时失败、修好后通过）；用真二进制验证：不带库路径报同样的错，带库路径能加载并打印用法（`ldd` 的 `not found` 从 11 个变 0 个）。失败的启动没有向机器人发任何东西，也没有留下残留进程；旧的仿真会话（5560）已经不在了。
+
+**第 2c 前的状态核对和第 2d 的预演（2026-10-16 22:32–22:50）**
+- 用户：`pgrep -a -x mc` 无输出（`mc` 停着）；在 MDU 上又跑了一次非 `--listen-only` 的预检——**4 个 FAIL 全是因为非只听的中继本来就在跑**（“another a3_zmq_relay is already running”、5570 / 5571 / 50901 被占），不是新问题（预检要在**启动中继之前**跑；中继在跑时再跑它必然 FAIL）；`mc is not running` PASS，RouDi PASS。用户没有回答“左髋 yaw −1.18 是不是有意的”，也没有贴部署（本机此刻没有 `a3_deploy_onnx_ref` 在跑，5560 / 5556 都空），所以第 2c 还没有重新做；电池数字也没给。
+- **新增 `gear_sonic_deploy/scripts/a3_pd_stand_preview.py`（离线，什么都不读不发）**：读 `a3_relay_tool.py snapshot` 的输出，按部署里 PD 站立的真实逻辑（`DeployMode::kPdStand`：进入时锁存实测姿态，之后每个关节**线性**走到 `a3_default_angles`，`pd_stand_ticks` = 150 个 50 Hz 周期 = 3 s，PD 站立增益）算出每个关节的起点、终点、行程、平均速度、kp，并标出行程大于 0.5 rad 的；`--collision` 再把这条线性路径逐步放进 A3 Ultra T3D0 的 MuJoCo 模型（`a3_ultra_t3d0.xml`，带手），算手臂对身体 / 另一只手臂的最小间隙。**部署本身没有任何自碰撞检查**，中继的首帧校验是“指令 ≈ 实测”（对 PD 站立必然通过），所以这是唯一能提前知道轨迹会不会让手臂撞身体的办法。度量的有效性：相隔不超过两节的连杆和手内部指节在简化碰撞形状下设计上就重叠，已排除；用 400 个随机全范围手臂姿态做阳性对照，最小距离 −125.6 mm（能测到穿透）。6 个测试通过。
+- **用 21:25 那份旧快照（左髋 yaw −0.244 的姿态）跑出的结果**：6 个关节行程超过 0.5 rad——右肩 yaw −1.367 → 0（78°，0.46 rad/s）、右腕 roll −1.095 → 0（63°）、左肩 yaw 0.818 → 0（47°）、左腕 roll 0.743 → 0（43°）、左肘 1.442 → 0.8（37°）、右肘 1.373 → 0.8（33°）；右髋 yaw 25°、膝 18–21°，其余更小；**手臂对身体：模型里没有穿透，最紧的是起始姿态下左手与左髋连杆之间 2.5 mm**（手本来就几乎贴着髋），之后间隙变大。**这是旧姿态的结果**；机器人现在的姿态变了（左髋 yaw −1.176 等），要用新快照重算，所以向用户要一份新的 `snapshot`。
+- 含义：手臂这次几乎全是“松弛时垂成的奇怪姿态”回到默认站姿，行程大但没有碰撞；髋 yaw 的 65° 是新出现的，是否有意要用户说。
+
+**第 2c 步启动部分通过；电池满足门槛（2026-10-16 22:40）**
+- 用户：左髋 yaw 的姿态“已经摆回”；**电池几乎满电**（机器人靠电池供电，所以第 2d 步的电池门槛满足）。
+- `./deploy.sh … real … --telecom zmq …` **启动成功**（库路径的修复生效）：`A3ZmqBackend initialised: relay 10.42.10.12 state=5570 commands=5571`；`[a3_zmq] relay state is flowing (relay mode DISARMED)`；`✓ startup IDLE, no commands sent`；`✓ entering policy loop`；策略模型 `monolithic backend=ort_cpu`、`g1` 与 `a3_fast` 两个 ONNX 都载入（输入 1570、输出 29），遥控参考 `zmq tcp://localhost:5560`（没有 `/ta` 订阅），键盘状态机 IDLE，Pico 命令通道 `tcp://localhost:5556 topic 'command'` 在听。本机 `ps`：`a3_deploy_onnx_ref`（pid 482151）和重定向节点（pid 481994）在跑，5560 在监听，5556 空（Pico 管理脚本没开，预期）。**部署终端的键盘是活的**。
+- 还没做 / 没看到：本机 `listen` 里的 `fwd=1 mode=DISARMED acc=0`、MDU 上中继状态行的 `cmd_rx=0/s published=0`；**姿态变了之后的新 `snapshot` 和预演**（`snapshot_before_2d.txt` 还没有）。第 2d 步要等预演看完。
+
+**第 2c 步完成；2d 前预演结果（2026-10-16 22:50）**
+- 中继状态行连续 `DISARMED owner=0 acc=0 rej=0 cmd_rx=0/s published=0`（`acc` / `rej` 是中继启动以来的累计值，所以覆盖了部署 IDLE 的全部时间，比 60 s 的 `listen` 更强）。`listen` 前 5.6 s：`fwd=1 mode=DISARMED acc=0`，q 不变（只有 1e-3 量级的编码器抖动）。2c 通过。
+- 新快照（`snapshot_before_2d.txt`，1000 帧 / 5 s，200 Hz，无丢帧）和 21:25 的那份差别很大（腰 yaw −0.15 → +0.44，左肩 yaw 0.82 → 1.70，右踝 pitch +0.09 → −0.30 …）：松弛的肢体会被人手 / 摔倒带到别的地方，“摆回”不等于回到默认。PD 站立总是从当前姿态出发，所以这不是错误，只是行程大。
+- 预演：7 个关节行程 > 0.5 rad，最大是左肩 yaw 97°（平均 0.57 rad/s）；其余为右肩 yaw 78°、两个腕 roll 64–68°、右髋 yaw 38°、两个肘 37–38°。关节范围都很宽（肩 / 腕 ±2.79，髋 yaw ±2.72），起点都在范围内。碰撞扫描：最小间隙全在斜坡的起点（0.00），最小是左髋 roll 连杆与左腕 roll 连杆 1.2 mm（左手本来就搭在左大腿上），之后间隙只会变大；路径上没有穿透。手 / 线缆没有建模。
+- 颈部：现在 yaw +0.30 rad（17°），部署把它直接设成 q = 0（kp 40 / kd 2），**不是斜坡**（`expand_to_backend.cpp`）：头会很快弹回正中。中继对颈部的首帧容差是 1.0 rad，所以能通过。
+- 中继的限幅只是“荒谬值”边界（`max_q_err` 7 rad、`max_q_step` 6 rad，关节限位不在中继里检查），所以斜坡不会被它拦；真正的保护是急停和吊着。
+- 不知道的：“初始”状态下我们的第一条指令会不会让关节上使能。如果使能比斜坡晚，关节会直接跳到斜坡当时的位置（行程最大的是肩 / 腕，腿的行程小）；吊着、周围清空的情况下可以接受。
+- 键盘（`a3_deploy/main.cpp`）：`s` = PD 站立，`p` = 被动（`BuildSafeHaltCommand`，kp = kd = 0），`t` = 遥操，`q` = 退出。链路故障（机器人状态丢失 / 过期）部署会自己进被动。
+- 2d 流程改成：不开 Pico 管理脚本，部署不重启，在部署终端按一次 `s`（见 pico_real_teleop.md 4.6）。
+- 两个 IMU 的 yaw 参考不同（pelvis 约 153°，torso 约 −3°，腰 yaw 只有 25°）：yaw 是各自上电后积分的；PD 站立不用，**上策略之前要弄清部署用哪一个**（后续项，未查）。
+
+**第 2d-1 步结果：悬空 PD 站立成功（2026-10-16 23:20）**
+- 部署：`[mode] idle -> pd_stand` → `robot enabled: new session …` → `relay mode ACTIVE (accepted 1, refused 0)` → `Init Done`；`p` 之后 `[mode] pd_stand -> passive`。用户：按 `s` 机器人回到默认站姿，按 `p` 机器人松弛。
+- `listen_2d1.txt`（60 s，12001 帧，0 坏帧，`valid=1 fwd=1 imu2=1` 每一行，状态年龄最大 3 ms，seq 和帧数的差恒定 = PC 一侧没有丢帧）。**注意：行首的 `[n]` 是已收到的状态帧数（200 Hz），不是毫秒；每行间隔 0.5 s**（我第一次读成了毫秒；`a3_relay_tool.py listen` 现在每行多打印 `t=…s`）。
+  - DISARMED 约 6.8 s，之后 ACTIVE；`acc` 以 50/s 增长，斜坡 150 帧 = 3 s（腰 pitch −0.385 → +0.007，左髋 pitch −0.525 → −0.146，和预演一致）。**第一条指令之后关节就跟着走，说明在 mc 停止的“初始”状态下，我们的第一条指令就让关节上了使能**（之前不知道）；腰 pitch 从 −0.385 走到 0，没有被腰的软限位保护拦住。
+  - 稳态误差：腰 yaw / roll / pitch ≤ 0.007；左髋 pitch +0.015、roll +0.039（kp 400 → 约 16 N·m）、yaw +0.02：吊着的腿有重力，正常。
+  - `rej` 在 ACTIVE 里涨到 4（全部是 `no_state`，每次 1 帧，下一帧恢复）：约在 `s` 后 10 / 14 / 19 / 28 s；最后 25 s 没有。原因是中继在处理指令的那一刻 `TryReadLatestState` 没取到状态（`a3_relay_guard.hpp:118`，`main.cpp:339`）；单帧 = 20 ms，小于 60 ms 的 stale 门限，部署日志里没有 HOLD。PC 一侧的状态流没有缺口，所以是 MDU 一侧（3 核 + 厂商栈）的抖动。**要继续观察**：如果以后出现连续几帧，会进 HOLD。
+  - **43 s 那一下已解释**：用户在 `s` 后约 43 s 按了 `p`（被动：kp = kd = 0，肢体松弛），腰 pitch 0.007 → −0.131、左髋 roll 0.045 → 0.081 就是松弛后在重力下的下垂（指令没变，是增益变成 0）。我把它当成“未解释”问了一轮用户，是我没有把 listen 的时间轴（0.5 s 一行）和用户的操作时间对上。PD 站立保持约 43 s（不是 20 s，也不是 55 s 以上）。
+  - **`p` 之后中继仍然是 ACTIVE**：被动命令（kp = kd = 0，q_des = 测得值）仍然是合法指令，部署一直在以 50 Hz 发，中继一直在转发。部署终端在 passive 里的 `[a3_zmq] relay mode ACTIVE`、`accepted` 一直增长到 18060（约 6 min）；`rej` 到 12。**所以 `p` 不是“停止发布”，而是“发零增益”；要让中继进 HOLD / DAMP，只能停部署（Ctrl-C）或让指令流中断。**
+  - **`no_state` 的原因（读代码，未在机器上证实）**：中继的 `measured.valid` 来自 `A3SyncLoop::TryBuildLatestFrameLocked`：waist / leg / arm / neck / pelvis IMU / torso IMU 六路样本任何一路比 `max_sample_age_ms`（默认 10 ms）旧，就判无效，那一帧指令被拒。状态 200 Hz（5 ms 周期），所以六路里任何一路停顿 ≥ 10 ms（MDU 只有 3 核，还跑着厂商的栈）就会丢掉当时的那一帧指令。整个 6 min 里 12 次、每次 1 帧、都在下一帧恢复，没有触发 60 ms 的 stale。中继有命令行选项 `--max-sample-age-ms F`（默认 10，`a3_relay/main.cpp:97`）：**如果以后策略跑起来出现连续几帧被拒，再把它放宽到 20 ms 左右**；现在不改（单帧、自愈、低于 60 ms 的 stale 门限）。
+- 还没看到：MDU 中继终端的状态行（尤其是 `p` 前后）。**2d-3 之前需要**：`p` 之后中继的状态（仍 ACTIVE，还是已经 HOLD / DAMP 锁存），因为 2d-3 的“再按 `s`”取决于它。
+
+**第 2d-2b / 2d-3 结果：`p` 后再 `s` 的接管、故意断线的失效保护都在真机上通过（2026-10-16 23:10–23:15）**
+- 流程：部署新进程 `s`（session 696316…）→ 站立约 40 s → `p` → 约 20 s → 再 `s`（新 session 26b80d…）→ 站立约 49 s → 部署 Ctrl-C。`listen_2d23.txt`：240 s、47999 帧、0 坏帧、`valid=1 fwd=1` 每行、状态年龄 ≤ 2.74 ms。
+- **2d-2b（passive → pd_stand 的 session 接管）**：部署 `robot enabled: new session 26b80d…`；中继先拒新 session（`other_session`，10 帧 ≈ 0.2 s），`ACTIVE → HOLD → DAMP`，然后 `DAMP → ACTIVE (owner 26b80d…, accepted 2970)`；部署日志 `ACTIVE → HOLD → DAMP → ACTIVE`，后端的 1.5 s 宽限够用，没有进 `[link] … -> passive`。listen：69.3 s 新 owner，腰 pitch −0.122 → +0.009 用 3 s，之后 49 s 纹丝不动（0.009–0.010）。**和代码预测完全一致**。
+- **2d-3（部署 Ctrl-C = 纯静默）**：中继 `ACTIVE → HOLD → DAMP`（`accepted 5594`）；DAMP 状态行 `cmd_rx=42/s`（上一窗口的残余）→ `0/s`，`published` 继续以 50/s 增长（阻尼指令）。listen（0.5 s 分辨率）：121.5 s 仍 ACTIVE 且姿态不变；122.0 s `mode=DAMP`，腰 pitch 开始动（+0.013）；123.0 s 腰 pitch −0.137（最大过冲，终值 −0.119，多 0.017 rad）；124 s 以后稳定，**终值和 `p` 的被动姿态相同**（腰 pitch −0.12，左髋 pitch −0.125…−0.146）；之后 50 s 以上没有再动。部署退出日志：`commands sent 5606 … relay accepted 5594 refused 12 … safe_halts=0`（5606 = 5594 + 12，全部对得上）。
+- 中继本次的 `q_err_max=0.042 rad (j29)`（所有非首帧的指令 − 测得值）：两次悬空 PD 站立的跟踪误差都在 0.042 rad（2.4°）以内；`step_max=0.083 rad (j15)` 是 `p` 那一刻 q_des 的帧间跳变。
+- 6 min 的 ACTIVE 里 `no_state` 只有 2 次（上一轮 12 次）。
+- 现在的状态：中继锁存在 DAMP（以 50/s 发阻尼指令，不会自己恢复）；部署已退出；`mc` 仍停着；机器人松弛地吊着。新部署进程可以直接接管（新 session 在测得位姿 0.35 rad 以内即被接受），不必重启中继（这条路径刚刚在 `p` 之后验证过，DAMP 后的接管本身是同一条代码）。
+- 没有回答：`hal_ethercat` 在**指令发布者消失**时的行为（中继 Ctrl-C 会先阻尼 2 s 再退出，所以最后一条指令总是阻尼；只有中继崩溃 / `kill -9` 时最后一条才可能是刚度）。
+
+**第 2d-5 结果：中继被 `kill -9` 之后，机器人保持最后一条（刚度）指令，不松弛（2026-10-16 23:55）**
+- 做法：悬空 PD 站立（部署 session 425f6cc2…，`ACTIVE`，`acc=44804`，q_err 0.042 rad），MDU 上 `kill -9 116695`（用户输入 `KILL` 确认），M2 打印 `relay killed (pid 116695)`，M1 打印 `Killed`，PC 的 `listen_2d5d.txt` 在 t=27.7 s、5535 帧（≈ 200 Hz × 27.7 s）处**停止**（没有 DAMP，没有 mode 变化，只是流断了）。三项判据都满足，这次是真杀了（前两次 `pkill -x` / 空 `$RP` 都没杀成，见 #99 / #101）。
+- 机器人：**僵硬地保持原站姿**，无异响、抖动、大动作（用户观察）。我在 23:57:05 看到：中继状态流已断（0 帧），部署（pid 512040）仍在跑；杀后至少过了 69 s，用户观察的时长和“现在是否仍僵硬”待问。
+- 含义：**`hal_ethercat` 在指令发布者消失时保持最后一条指令，而且（至少 1 分钟）不超时、不松弛。**好处：中继崩溃不会让站着的机器人瘫软；坏处：中继一死，机器人被卡在最后一个目标上（落地后站着是好事，但遥操动作中间崩溃就是卡在一个可能失衡的目标上，kp 很大），而且**除了重启中继（DISARMED，首帧在测得位姿 0.35 rad 内）+ 部署 `p`、急停、断电之外，没有办法放开它**。中继自己的 HOLD → DAMP 只在中继活着时才有用，**中继崩溃 / 被杀 / MDU 上它挂掉的情况不被任何东西覆盖**。要在落地前决定：MDU 上给中继加一个看门狗（进程守护 + 崩溃后自动发阻尼？），或接受“崩溃 = 卡住 = 靠急停”。这是对厂商问题 3（hal_ethercat 超时行为）的经验答案，仍应问智元（是否有超时 / 是否可配）。
+- 没有测的：保持更久（> 几分钟）是否会超时；MDU 重启 / 总线故障时的行为。
+
+**第 2d-4 结果：命令流动时按急停，四肢立刻软掉（2026-10-17 00:05）**
+- 做法（用户自己做，没有等我放行；没有录 `listen`）：悬空 PD 站立，`accepted 450`（≈ 9 s：3 s 斜坡 + 约 6 s 保持），然后按急停。用户：“急停以后立马软掉”。
+- 部署日志：`ACTIVE, last refused: no_state (accepted 450, refused 1)` → `HOLD … refused 3`（≈ 60 ms 后）→ `[link] robot state lost or stale (watchdog safe-halt) -> passive` → `DAMP … refused 10`（≈ 200 ms）→ `DAMP … latched`。含义：急停一发生，`hal_ethercat` 立刻停止发布状态（和 1c 一致），中继看不到状态、拒绝指令、60 ms 后 HOLD、约 0.2 s 后 DAMP 锁存；部署的链路监督也在同一时间让它回 passive。**我们正在发 kp 很大的指令，急停仍然让四肢下电：急停优先于我们的指令。**
+- 事后 PC 侧（00:08）：状态流 0 帧（hal 不再发布，符合 1c：持续到整机重启）；部署（pid 522943）和中继都还活着，等人停。
+- 恢复：整机重启（智元）。重启后 `mc` 自启，MDU 上的中继进程没了，`~/a3_relay_rockchip` 应当还在（1c 验证过），下次要重新 `stop_app mc`、起中继。
+- 没有测的：另一种急停方式（AimMaster 悬浮球）是否一样；落地后急停（摔倒）的后果；重启后的恢复流程的耗时。
+
+**第 2 步（真机，悬空）总结（2026-10-17）：**route C 在悬空下全部通过——PD 站立、`p`、passive → pd_stand 接管（≈ 0.2 s）、Ctrl-C 断线 → HOLD → DAMP（≈ 0.5 s 从刚度到阻尼）、中继崩溃（hal 保持最后一条指令）、中继重启后接管、命令流动时急停（立刻软掉）。**落地前要决定的**：(1) 中继崩溃 = 机器人卡在最后一条指令，需要看门狗或接受“靠急停”；(2) 断线 0.5 s 内从站立变阻尼，够不够；(3) 向智元确认 hal_ethercat 的超时（实测至少 1 分钟不超时）；(4) 两个 IMU 的 yaw 参考，上策略前要查；(5) 腰的软限位保护在 `mc` 停止时没有拦（未验证极限位置）。
+
+**要你来做的**（我不登录 MDU）：第 1 步的 `scp` 和 MDU 上的命令。第 1 步不需要停 `mc`，也不会让机器人动；把预检和 `listen` 的输出贴回来，我再判断能不能进第 2 步。
+
+### 18.23 智元建议把机器人版本升到 3.3（2026-10-16，用户转述）
+
+**事实**：这台 MDU 现在是 `rk3588-v0.7.6` / `full_version v3.2.17`（用户贴回的登录横幅）。智元此前说带 Kp/Kd 的指令入口写进 3.3（18.17 / 18.18）；这次建议升到 3.3。**我不知道 3.3 改了什么**——智元只说了“建议”，没给发行说明。
+
+**我的判断**
+- **对路线 C 不是前置条件**：第 1 步已经在 3.2.17 上通过（18.22）。升级会改变我们刚验证过的基线（ROS 2 发行版和库、`joint_msgs`、`/body_drive/*` 的通道定义、`mc` 的启停接口、`~agi` 下的文件是否还在），所以**升级后第 1 步要整套重做**。
+- **有可能解决我们悬着的问题**：`hal_ethercat` 指令中断后的行为、物理急停、PD 入参接口、`body_drive` 的 ros2 暴露方式（路线 B）。但这些都是“可能”，要智元明确回答，不能假设。
+- **升级不解决急停问题**：现场没有物理急停（18.22）与版本无关。
+- **不要在不知道发行说明和回滚办法时自己升级**：这是系统镜像级别的操作，机器人会离线，可能覆盖 `/agibot` 配置、标定和 `~agi`。
+
+**该问智元的（一次问完）**
+1. 3.3 的发行说明：相对 3.2.17 改了什么，尤其是 `hal_ethercat` / `body_drive`（话题名、消息类型 `joint_msgs`、iceoryx / ros2 后端）、`mc` 的启停接口（`stop_app`）、ROS 2 发行版（现在 `/opt/ros/jazzy`）。
+2. 升级由谁做、怎么做（OTA 还是重刷）、要多久；**能否回滚**到 3.2.17；会不会清掉 `~agi`、关节零位 / 标定、网络配置（`10.42.10.x`）。
+3. 3.3 里 `hal_ethercat` 在外部指令中断后的行为（保持 / 阻尼 / 掉使能，超时多久）——这个一直没回答。
+4. 3.3 的 `body_drive` 是否要我们改配置才能用 ros2（路线 B），还是已经默认暴露。
+5. A3 Ultra T3D0 有没有物理急停（按钮 / 遥控器），以及电源开关切断的范围（18.22）。
+6. 3.3 的 Kp/Kd 指令入口（`/motion/control/pnc/arm_joint_command` 之外）有没有整身的。
+
+**升级前我做了什么**：新增 `gear_sonic_deploy/scripts/a3_mdu_baseline.sh`，只读，不写文件、不用 sudo、不发任何话题；打印版本、ROS 2 和中继所链接的库（`libzmq`、`libfastcdr` 等）的版本、中继包的 `ldd` 和 sha256、厂商配置（`sm_config.yaml`、`env.sh`、t3d0 的 `hal_ethercat` / `hal_elink` / `mc` 配置）的 sha256、`/body_drive/*` 通道定义、监听端口、服务和进程名（去掉时间、PID、负载，使不变的系统两次输出逐行相同——在本机干跑两次验证过 208 行完全一致）、`~` 下的文件。用法：升级前 `ssh agi@10.42.10.12 'bash -s' < gear_sonic_deploy/scripts/a3_mdu_baseline.sh > mdu_baseline_3.2.17.txt`，升级后同样存成 `mdu_baseline_3.3.txt`，`diff -u` 比较。
+
+**升级之后要做的（顺序）**：① 再跑 `a3_mdu_baseline.sh` 并 diff；② 中继包是否还在、`./a3_real_preflight.sh --relay …` 是否仍 0 FAIL（`libzmq`、fastcdr、`mc` 检测、RouDi、端口）；③ 重做第 1 / 1b 步（`listen` 与 `snapshot`，对照升级前的关节读数）；④ 如果中继或预检因为库版本失败，需要重新构建中继（Docker 在本机，但我这个会话的用户不在 `docker` 组，要你来构建，或把用户加进组）；⑤ 之后才谈第 2 步。
+
+
+## 19. 上服务器训练 A3 自研 SMPL 编码器之前的完整性审查（2026-10-16，用户要求：“迁移之前检查 smpl 实现的完整逻辑是否正确，并参考 g1 的 smpl encoder 训练逻辑”）
+
+背景（用户的判断）：A3 的肩限位在 GMR 里改不成和 G1 同一套；035 权重没有 SMPL 编码器，所以让 `smpl` 编码器直接吃 SMPL（对齐 G1 的做法），人的肩转出机器人范围时由网络少转一点肩，而不是由逆解另解一套。本节只做审查（读代码、读 yaml、量数据、4 次迭代冒烟），**没有训练、没有改训练代码**。
+
+### 19.1 与 G1 一致、已核对的部分
+
+| 项 | 结论 |
+|---|---|
+| SMPL 分词器 | `smpl_joints_multi_future_local_nonflat`(720) + `smpl_root_ori_b_multi_future`(60) + `joint_pos_multi_future_wrist_for_smpl`(60) = 840，10 帧 × 0.02 s；顺序、6D 约定（旋转矩阵前两列按行交错）、腕关节取 IsaacLab 索引 23…28（A3 映射已核对：左/右腕 roll/pitch/yaw）与 G1 一致，也与部署 `A3ZmqSmplSource` 一致。 |
+| 根朝向 | `smpl_root_ori_b = quat_inv(机器人 anchor) * smpl_root`，经 `smpl_y_up → ytoz → remove_smpl_base_rot`。在 120 条随机配对片段上量**完整相对旋转**（不只是航向）：A3 俯仰均值 −1.5°、横滚 0.0°，测地角中位 3.5°、p95 10.7°；G1 同一批动作：−0.5°、0.0°、2.8°、7.9°。A3 略大于 G1 但同量级。 |
+| 配对 | A3 库 129,116 条，SMPL 131,454 条，配对 129,109 条；航向差 ±10° 内 99.2%（`check_smpl_pairing.py`，见 17.8）。 |
+| 辅助损失 | `g1_recon` 0.01、`g1_smpl_latent` 1.0、`reencoded_smpl_g1_latent` 1.0、`a3_fast_g1_latent` 1.0，均为普通 MSE，`reencode_smpl_g1_recon: true`；与 G1 release 的 `aux_losses` 一致（去掉 teleop 两项）。 |
+| 编码器采样 | `g1:1 / a3_fast:1 / smpl:1 / teleop:0`；`motion_has_smpl` 屏蔽没有 SMPL 配对的动作；smpl 与 g1 同时激活，使 SMPL 潜变量对齐 g1 潜变量——与 G1 release 同一机制。 |
+| PPO | 与 G1 release 相同（`num_envs` 4096、mini-batch、学习率、clip 等）；`soft_joint_pos_limit_factor` 0.9、`joint_limit` 奖励 G1 和 A3 都有。 |
+| 热启动 | `load_checkpoint` 为 `strict=False`：035 的 PT 加载后 `smpl` 编码器的 10 个键随机初始化，其余（g1、a3_fast、解码器、critic）沿用。4 次迭代冒烟（30 条真实配对片段，热启动 `035_step200000`）`exit=0`，三个编码器都参与采样，对齐损失有值。 |
+
+### 19.2 发现（按对训练的影响排序）
+
+**F1（用户选了 (b)，已处理，见 19.6 / 19.6 整库结果）：A3 库的左右不对称会被 SMPL 编码器当作目标学进去。** 每条动作 `X` 都有镜像孪生 `X_M`，对称的重定向应满足 `joint(X) = ±counterpart(X_M)`。在 250 对随机孪生上：
+
+| 关节 | A3 常数偏置（bias） | G1 |
+|---|---|---|
+| 腕 roll / pitch / yaw | −0.19 / −0.23 / −0.22 rad，**96–98% 的帧偏差 > 0.1 rad**，散度（std）只有 0.03–0.07 | ≈ 0.01 rad，0% |
+| 髋 yaw | −0.20 rad（两脚同向各约 −0.12 rad） | ≈ 0 |
+| 肩 pitch / roll / yaw | 偏置 0.02–0.05；样本 RMSE 0.13–0.19，但由约 1% 的离群片段（另一条 IK 分支）撑起：逐条中位数 0.029、p99 0.126（G1：0.047 / 0.171，离群 2%） | RMSE 0.045–0.09 |
+| 腿平均 RMSE | 0.066 | 0.005–0.007 |
+
+偏置是常数而不是噪声，说明是 IK 配置表里左右手/脚的 `rot_offset` 标定不对称（`gmr_ik_configs/bvh_nokov_to_a3.json`），不是数据随机性。SMPL 编码器的奖励是跟这个库跟踪的，所以它会学到“左腕比右腕多偏约 0.2 rad、两脚各偏一点 yaw”——正是你在 18.15 看到的“左右腕不对称”。这**不会让训练失败**，但会变成策略的固有偏置。选项：
+- (a) 不改库直接训练：快，但偏置进策略；
+- (b) 先重标定左右腕/髋 `rot_offset` 再整库重新重定向（约 110 分钟，见 17.4），然后再上传——推荐，因为你已经决定要用服务器长时间训练，偏置一旦训进去只能重训。
+
+**F2：腕关节输入在部署与训练时来自不同来源（部署侧问题，不影响要不要上传训练）。** 训练用库里的腕角（离线 IK），部署用 `A3SmplPoseAugmenter` 的实时 GMR。量到的差：RMSE 0.19–0.47 rad。同样地，G1 部署用 SMPL 关节旋转的解析公式（`pico_manager_thread_server.py` L1431–1470）对 G1 库的差也是 0.12–0.45 rad，所以这个量级 G1 本来就容忍（`randomize_wrist_poses`，默认关，两边配方都没开）。G1 公式直接套到 A3 库上：相关系数 0.72–0.91（120 条随机片段），做 `库 ≈ 增益 × 公式 + 偏移` 拟合后残差 RMSE 0.10–0.33（取决于关节；左 roll 最差）。（**更正**：这里我原先把“打开 `randomize_wrist_poses` 并加大 std”当作训练侧的低成本措施，这是错的——见 19.7。）可行的部署侧改法：用标定后的解析公式替换实时 GMR（不依赖训练），比较见 19.7。
+
+**F3（可选）：对齐损失没有 stop-gradient。** 与 G1 release 一致（都是普通 MSE，梯度双向）。热启动时 `smpl` 编码器是随机初始化的，前期对齐损失会同时拉动 g1 / a3_fast 编码器和解码器，可能让 035 已有的跟踪能力短暂下降。我没有测过（没有收敛训练）。建议上服务器后监控 a3_fast 模式（及 g1 模式）的跟踪指标；也可以一开始就冻结 g1 / a3_fast / 解码器、先只训练 `smpl`——训练器自带 `freeze` 配置开关，已冒烟验证（19.8）。
+
+**肩 roll 内侧限位只有 5°，约 9–11% 的参考帧落在 0.9 软限位之外（左 9.3%、右 11.9%；其他关节 ≤ 2.5%）。** 这正是你说的“人的肩转出机器人范围时网络少转一点肩”：跟踪奖励与 `joint_limit` 惩罚在这些帧冲突，策略学到折中。G1 同样有这个机制，只是 A3 的比例更高；这是预期行为，不是缺陷。
+
+### 19.3 没有验证的
+
+- 没有收敛训练，所以不知道 SMPL 编码器的跟踪误差、与 g1 的潜变量对齐程度。
+- 真头显的 SMPL 链路在真机/真头显上没有验证（只验证到 MuJoCo + 回放）。
+- 服务器上的显存/内存、12.9 万条动作的数据加载没有评估（只在本机 30 条子集上冒烟）。
+- aarch64 / Docker / MDU 不属于本次。
+
+### 19.4 上传清单与建议的服务器命令
+
+- 数据：`data/motion_lib_a3_29d/robot_filtered_v15_clean`（22 GB，**已是 19.6 左右对称修正后的新库**；`…_lrbias` / `…_yawnorm` 是旧版，不要传；**19.10 的肩+肘镜像修复版在 `…_armfix`，推荐传这一份、训练时 `MOTION_FILE` 指它**）、`data/smpl_filtered`（31 GB）、035 热启动权重 `checkpoints/035_step200000/model_step_200000.pt`；其余走代码仓库。
+- 到服务器后先把审计当闸门：
+  ```bash
+  python gear_sonic/data_process/check_smpl_pairing.py --robot data/motion_lib_a3_29d/robot_filtered_v15_clean --smpl data/smpl_filtered
+  python gear_sonic/data_process/audit_a3_smpl_training_data.py --a3 data/motion_lib_a3_29d/robot_filtered_v15_clean --smpl data/smpl_filtered --g1 <G1 库，可选>
+  ```
+- 训练（热启动，配方 `sonic_a3_ultra_smpl`）：
+  ```bash
+  EXP_CONFIG=manager/universal_token/all_modes/sonic_a3_ultra_smpl \
+  PROJECT_NAME=TRL_A3Ultra_SMPL \
+  MOTION_FILE=data/motion_lib_a3_29d/robot_filtered_v15_clean SMPL_MOTION_FILE=data/smpl_filtered \
+  ./train_a3_035_fromscratch.sh --checkpoint checkpoints/035_step200000/model_step_200000.pt
+  ```
+  （`--preflight` 只校验输入不建日志；`NUM_ENVS` 默认 4096。）
+
+### 19.5 本节新增 / 修改的文件
+
+- 新增 `gear_sonic/data_process/audit_a3_smpl_training_data.py`（四项检查：`root_ori`、`mirror`、`limits`、`wrist`，本机全库 120 条抽样 5 秒）和 `tests/test_audit_a3_smpl_training_data.py`（4 个测试）。
+- 没有改训练、观测、损失、配方、部署代码；没有提交。（19.6 之后：新增 `calibrate_a3_lr_symmetry.py` 与测试，`batch_retarget_bvh_soma_a3ultra.py` 加了 `--ik_config`，`gmr_ik_configs/bvh_nokov_to_a3.json` 改了 8 行，`audit_a3_smpl_training_data.py` 加了 `link_asym`，A3 库整体重生成。）
+
+### 19.6 F1（用户决定执行 (b)）：重标定左右 IK `rot_offset`，整库重新重定向（2026-10-16）
+
+**原因（读代码确认）**：`calibrate_soma_to_a3ultra.py` 用**一条 BVH 的第 0 帧**算 `rot_offset = q_soma⁻¹ · q_robot`，并假设表演者在那一帧是左右对称的站姿。实际不对称：腿（大腿、小腿、脚）和手的朝向在左右之间差一个常数旋转，被原样写进了表。IK 的目标是 `q_human · rot_offset`，所以库里每条动作都带着这个差。
+
+**怎么量**（`gear_sonic/data_process/calibrate_a3_lr_symmetry.py`）：每条动作 `X` 有一条精确镜像的孪生 `X_M`（G1 库的镜像误差只有 0.01 rad，说明数据本身是精确镜像的）。对右侧的一个连杆，“对称理想”= `X` 的左侧关节取镜像（符号由 MJCF 关节轴按赝矢量规则得到：绕 x、z 轴的关节取负号，绕 y 轴的取正号）；用 MuJoCo 正运动学求 `X_M` 右侧连杆的实际朝向相对理想朝向的旋转 `Δ`（在连杆自己的坐标系里）。如果误差只是 `rot_offset` 的常数误差，`Δ` 应该是常数加很小的散度。
+
+**这是机器人本来就不对称，还是有问题的不对称？（用户追问，2026-10-16）——是有问题的，不是机器人的。** 逐项排除：
+1. **机器人模型是左右对称的**：MJCF 里镜像关节的限位 / 阻尼 / 转子惯量 / 摩擦完全一致（肩 roll 限位一边 [−0.087, 2.618]、一边 [−2.618, 0.087]，正好互为镜像）；镜像质量最多差 1.5%（髋 roll 0.838 / 0.851 kg，其余 <0.2%）；整机在 100 个随机构型上按“镜像关节映射”做正运动学，对应连杆的朝向差 <0.001°、位置差 <2 mm（肘部有 0.5 mm 的几何偏差）（`tests/test_calibrate_a3_lr_symmetry.py::test_the_a3_model_is_left_right_symmetric_under_the_mirror_map`）。训练里的默认站姿也是镜像的（髋 yaw ∓0.0348、髋 roll ±0.0056、踝 roll ∓0.0078、肩 roll ±0.12，符号正好是镜像规则的 −1）。
+2. **人的动作不是原因**：量的是 `X` 的左侧对 `X_M` 的右侧，`X_M` 是 `X` 的精确镜像，表演者自己的左右习惯差在这个比较里抵消了；同一批数据重定向到 G1，腕偏置只有 0.01 rad、腿 RMSE 0.006。
+3. **差异的形状是常数偏移，不是随动作变的**：腕偏置约 0.2 rad、散度只有 0.03–0.07；连杆朝向 11–20° 的偏移，散度 0.7–2.4°。机器人真有一个固有的左右差，也该随构型变，不会是一个与动作无关的常数。
+4. **修正这个常数之后差异消失**：只改了表里 8 个 `rot_offset`，腕偏置 −0.19 / −0.23 / −0.22 → +0.016 / −0.032 / −0.016 rad，腿 RMSE 0.066 → 0.014。如果是机器人固有的，改 IK 表不会让它消失。
+所以它是 IK 表（从一条片段的第 0 帧标定、假设表演者对称）带来的错误，不是 A3 的特性。**仍然合理的“不对称”**只有两类：镜像约定本身带的符号（肩 roll 限位一正一负、默认站姿的 ± 号）；以及每条动作自己的左右差（右手挥手的片段，左手就不挥）——这些都不是偏置。**没法判断的**是共模误差（两边朝同一镜像方向偏），见下。
+
+**修法**：左右只有**差**是可观测的（共模误差，即两边朝同一个镜像方向偏，从库里看不出来），所以每侧各改一半：`rot_offset ← rot_offset · Δ^(-1/2)`（右乘，因为目标是 `q_human · rot_offset`）。推导：设两侧的实际误差为 `ε_L`、`ε_R`，则 `Δ_R = mirror(ε_L)ᵀ ε_R`，且 `Δ_L = mirror(Δ_Rᵀ)`；各自右乘 `Δ^(-1/2)` 后新的 `Δ_R′ = mirror(Δ_L^{1/2}) · Δ_R^{1/2} = Δ_R^{-1/2} Δ_R^{1/2} = I`。实测的 `Δ_L`、`Δ_R` 旋转向量恰好满足这个镜像关系。
+
+**测量结果（150 对镜像孪生，旧库）**
+
+| 连杆（左 = 右） | 偏移 | 散度（中位 / p90） | 处理 |
+|---|---|---|---|
+| 髋 yaw / 膝 / 踝 roll | 11.4° / 11.9° / 12.1°，绕竖直轴（连杆 z）约 −11.5° | 2.4 / 5.8、1.8 / 4.2、0.7 / 2.4 | 修正（整条腿同一个 yaw 偏差：表演者标定帧里左右脚的朝外角不同） |
+| 腕 yaw 连杆（手） | 19.7° | 1.6 / 3.5 | 修正 |
+| 肩 yaw / 肘 | 2.6° / 2.6° | 0.9–1.4 / 2.7–3.1 | 不动（在散度之内；阈值 `--min_deg 5`） |
+
+共修改 8 行 × 2 张表（`ik_match_table1`/`ik_match_table2`），每行改了约一半：腿 ≈ 5.8°、手 ≈ 9.8°。
+
+**在 46 对（92 条）上验证，没有先动整库**：
+- **对照**：旧表重跑得到的 `dof` 与现有库逐条 RMSE = 0.0000（流程、`--keep_heading`、数值都一致）。
+- **新表**（一轮就够，没有迭代）：髋 yaw / 膝 / 踝 偏移 11–12° → 0.9 / 1.1 / 0.9°，手 19.6° → 0.3°；关节空间的常数偏置：腕 roll −0.186 → **+0.016**、pitch −0.234 → **−0.032**、yaw −0.224 → **−0.016**（G1：−0.010 / +0.001 / +0.002），偏差 >0.1 rad 的帧 93–100% → **0%**；腿平均 RMSE 0.066 → **0.014**（G1 0.009）；肩/肘/腰不变。
+- **没有被改坏**：关节限位占比不变（右肩 roll 软限位外 11.1% → 10.8%，左 6.8% → 7.0%，腕仍是 0%）；与 SMPL 的配对 0 问题、朝向中位偏差 1.4°；相对根朝向统计几乎相同。
+- 拟合出来的腕公式增益/偏移（19.7）在新库上左右互为镜像（旧库上是 +0.20 / −0.40 这类不对称偏移）。
+
+**文件**：新增 `calibrate_a3_lr_symmetry.py`（测量 + 写表，`--check` 只测量）、`tests/test_calibrate_a3_lr_symmetry.py`（5）；`batch_retarget_bvh_soma_a3ultra.py` 新增 `--ik_config`（用候选表跑子集，默认不变）；`gmr_ik_configs/bvh_nokov_to_a3.json` 已替换为修正后的表（**修正前的表保留为同目录的 `bvh_nokov_to_a3_ultra.json`，两者现在只差这 8 行**）；`tests/test_a3_retarget_batch.py` 里“A3 表等于 Ultra 表”改成“除这 8 行外相同，且这 8 行的差在 3–15° 之内”，“A3 与 Ultra 管线结果一致”改成“腰/肩/肘一致（<0.02 rad），腿和腕差别在预期范围内”。**A3 Ultra 的表（GMR 检出目录里那份）和 A3 Ultra 的库没有动**，它们仍带着这个不对称。审计脚本 `audit_a3_smpl_training_data.py` 新增第五项 `link_asym`，同样的度量，可以直接当上传前的闸门。
+
+**不能解决的**：共模误差（两侧朝同一个镜像方向的偏差）从库里不可观测，所以没有处理——对称之后，左右腕的绝对零位是否正确，要看真机/仿真里手的朝向。肩 roll 内侧限位 5° 带来的 9–12% 软限位外帧不是 `rot_offset` 的问题，不在这里处理。
+
+**整库结果（2026-10-16 07:58 完成；`--robot a3 --keep_heading --only_from <旧库>`，16 进程 `nice 19`，111.3 分钟，129,116 条，0 失败，22 GB，无残留 `.tmp`）**
+
+| 检查 | 结果 |
+|---|---|
+| 格式（`convert_a3ultra_to_a3_29d.py --check`：键、形状、dtype、有限、A3 限位、帧数与 A3 Ultra 库逐条一致） | 0 个问题，没有遗漏的源文件 |
+| 与 SMPL 配对（`check_smpl_pairing.py`，全量） | 配对 129,109 条，帧数 / 帧率问题 0，朝向偏差 >20° 的 0.3%，中位 1.2°（修前 0.2–0.3%、中位 1.4°，没变坏） |
+| 帧数 | 与旧库逐条相同（129,116 / 129,116） |
+| 旧 → 新每条 `dof` 变化（RMSE，中位 / p99） | 腰 0.004 / 0.024；肩+肘 0.0025 / 0.021（0.19% 的条超过 0.2 rad，约 245 条，是 IK 对小扰动敏感换了分支）；**腕 0.103 / 0.117**（正是 0.2 rad 偏置的一半，所有条）；**腿 0.042 / 0.050**（髋 yaw 各移一半） |
+| 相邻帧最大关节步长（30 fps） | 中位 0.337 → 0.338，p99 1.009 → 1.011；>0.5 rad 的条 22,433 → 22,656，>1.0 的 1,345 → 1,369——没有变抖 |
+| **全部 64,350 对镜像孪生**：腕偏置（roll / pitch / yaw） | **−0.187 / −0.233 / −0.221 → +0.014 / −0.032 / −0.016 rad**；逐对 \|偏置\|>0.1 的 95.8 / 99.6 / 99.8% → **0.1 / 0.1 / 0.3%** |
+| 腿镜像 RMSE（中位 / p99） | 0.091 / 0.111 → **0.013 / 0.028**（G1 0.006） |
+| 肩+肘镜像 RMSE（中位 / p99 / >0.15 的条） | 0.029 / 0.549 / 1.77% → 0.027 / 0.511 / 1.69%：**没有变，是另一个问题**（约 1.7% 的孪生对肩+肘差 >0.15 rad，G1 同数据 2.0%；X 与 X_M 其中一条走了另一条 IK 分支，不知道哪一条错，这次没处理） |
+| 审计脚本五项（250 条抽样 + G1 基线） | `link_asym`：髋 yaw / 膝 / 踝 / 手 1.0° / 1.2° / 1.0° / 0.4°（修前 11.5 / 11.9 / 12.1 / 19.7°）；肩 roll 软限位外 10.8%（左）/ 11.8%（右），与修前相同；根相对朝向几何角中位 3.3° |
+| 回归 | `tests` + `gear_sonic/tests` 280 通过 / 5 跳过（isaaclab 环境）；gmr 环境重定向 / 校准 / 审计 / 配对 / 对比 / 朝向测试 29 通过；训练启动器 `--preflight`：`motion_files=129116` |
+
+**目录（已换名）**：`data/motion_lib_a3_29d/robot_filtered_v15_clean` 现在是**左右对称修正后的新库**（默认训练库，上传用这个）；**修正前的库改名为 `robot_filtered_v15_clean_lrbias`**（带 11–20° 的左右偏置，只作对照 / 备份，不要上传、不要训练），对应日志 `…_lrbias.retarget.log`；`…_yawnorm` 是更早的面朝 +X 版本（也是旧表的结果），同样只作备份。`…capture_heading.csv` 按文件名索引，对新旧库都适用。
+
+### 19.7 F2：部署侧腕输入，哪种办法更好（2026-10-16，用户追问）
+
+**先更正我在 19.2 里的建议**：“训练侧打开 `randomize_wrist_poses` 并加大 std”**不能用**。读代码（`motion_lib_base.py` L395–401、L2130–2138）发现：(1) 它的腕索引 `wrist_mujoco_dof_indices = [19, 20, 21, 26, 27, 28]` 是 **G1** 的腕关节列；在 A3 的 29 列库里 19–21 是左腿（髋 yaw、膝、踝 pitch）、26–28 是右腿（膝、踝 pitch、踝 roll），打开它会给腿加噪声；(2) 它改的是**机器人参考动作本身**的 `pose_aa`（再做 FK），所以 g1 / a3_fast 编码器的输入和跟踪目标都会跟着变，不是只扰动 SMPL 编码器的腕输入；(3) 是整条片段在加载时按概率 0.3 加一次，不是逐步噪声。所以它不是一个低成本的选项，两边（G1 / A3）现在都没开。
+
+**真正可选的做法**：(1) 部署侧用**标定后的解析公式**（G1 公式 + 每个关节的增益/偏移）代替实时 GMR；(2) 训练侧给 `smpl` 编码器的腕输入单独加噪声（要新写观测噪声代码，没做）；(3) 训练也用同一个公式从 SMPL 位姿算腕输入（训练/部署同源，要新写观测项和 torch 版公式，没做）。
+
+**对比实验（更正）**：我第一次在 24 条片段（8 条留出）上做，得到“公式+标定 RMSE 0.12、大偏差帧 3%”，样本太小，偏乐观。现在在新库的 **3,000 条上拟合增益 / 偏移（前 2,250 条），在后面 240 条留出片段（72,181 帧）上评估**（SMPL 是动捕数据，不是 Pico 流；脚本在会话临时目录，没有放进仓库）。指标是 6 个腕关节各自 RMSE 的均值：
+
+| 腕输入来源 | 均值 RMSE（L roll / pitch / yaw \| R roll / pitch / yaw） | 误差 >0.3 rad 的帧 | >0.6 rad |
+|---|---|---|---|
+| 实时 GMR（现在部署用的） | **0.483**（0.85 / 0.50 / 0.44 \| 0.51 / 0.30 / 0.30） | 31.1% | 6.0% |
+| G1 公式原样 | 0.321（0.45 / 0.26 / 0.34 \| 0.38 / 0.22 / 0.28） | 24.4% | 3.2% |
+| **G1 公式 + 每关节增益/偏移** | **0.214**（0.35 / 0.18 / 0.26 \| 0.23 / 0.10 / 0.18） | **6.6%** | **1.1%** |
+
+- 拟合常数（新库）：增益 L 0.82 / 0.65 / 0.55、R 0.78 / 0.61 / 0.52；偏移 L +0.300 / −0.157 / +0.044、R −0.289 / −0.139 / −0.033——**左右互为镜像**（roll、yaw 取负，pitch 同号）；旧库上同样的拟合是 L roll +0.19、R roll −0.39，不对称，这是 F1 的直接收益。整库 3,000 条的拟合表现与上面一致。
+- **实时 GMR 不只是噪声大，还有自己的偏置**：它的平均误差（对库）为 L roll −0.44、R roll +0.27；去掉偏置后 L roll 的 RMSE 仍有 1.03（roll 与前臂扭转有退化，IK 在两者之间来回分配）。它的腕角平均值 L roll −0.16 / R roll −0.02，不满足镜像（应互为相反数），说明实时 GMR 用的 SMPL→A3 IK 表（GMR 检出目录里的 `agibot_a3_ultra`）大概也有同类的左右偏置——**没有查原因**。
+- **平滑性**：公式的逐帧二阶差分 p99 = 0.132（GMR 0.108，库 0.054）：欧拉分解有尖峰。加因果 EMA 后：时间常数 4 帧（@50 Hz = 80 ms）→ p99 0.086 → 0.026（低于库的 0.054），RMSE 0.228 → 0.225（汇总口径，下同），>0.3 rad 的帧 6.6% → 7.0%；8 帧 → p99 0.014、>0.3 rad 的 7.6%。GMR 加 EMA 对误差无影响（0.651 → 0.651）。
+- 汇总口径（所有帧一起算 RMSE）：GMR 0.651（>0.3 rad 的帧 34.2%）、公式+标定 0.228（6.6%）——被 GMR 的 L roll 大误差拉高；上表是各关节 RMSE 的均值。
+
+**结论不变，幅度更保守**：部署侧“标定后的解析公式 + 轻度滤波（约 4 帧）”比实时 GMR 好——腕角误差约为 GMR 的一半以下（均值 0.21 vs 0.48）、>0.3 rad 的帧 6.6% vs 31%，且不依赖 IK 收敛、不带自己的左右偏置；剩余的 0.2 rad 左右（尤其 L roll 0.35、yaw 0.2–0.26）是公式本身与 IK 库之间固有的差，不是标定能再拿掉的。(2)(3)（训练侧噪声 / 训练用同一个公式）理论上能拿掉剩余的部分，但要改训练代码，建议先不做，等 SMPL 编码器有了收敛训练再看腕输入误差是否成为瓶颈。**局限**：动捕 SMPL，Pico 流噪声更大，没测；左 roll（0.35）比右 roll（0.23）差得多，公式左右不对称的原因没有查。**没有改部署代码**（等你确认；改动点是 `A3SmplPoseAugmenter` 里腕角的来源，常数用上面的镜像对称值）。
+
+### 19.8 F3：为什么随机初始化的 `smpl` 编码器会拉动 g1 / a3_fast 编码器和解码器（2026-10-16，用户追问；读 `universal_token_modules.py`、`token_losses.py`、`ppo_trainer*.py`、`commands.py`）
+
+先更正一点：19.2 说“与 G1 一致”是对的，但具体是这样——`universal_token_modules.py` 里确实有对 g1 潜变量的 `.detach()`（约 L1298、L1337、L1363），可是它们只给 compliance 版本的损失（`G1SmplComplianceLatentLoss`、`paired_g1_smpl_latents`）和 a3_fast 的循环项用；本配方实际启用的 `G1SmplLatentLoss`、`ReencodedSmplG1LatentLoss`、`A3FastG1LatentLoss` 直接用 `encoded_latents["g1"]`，**没有 detach**，梯度两边都走。
+
+机理，按发生顺序：
+1. **总损失**是 `ppo_loss + aux_loss_scale(默认 1.0) × Σ coef_i · aux_i`（`ppo_trainer_aux_loss.py`），同一个优化器、同一次 `backward`、同一个全局梯度范数裁剪（`max_grad_norm` 0.1）。热启动的 g1 / a3_fast 编码器和解码器已经在 PPO 损失的（局部）最优附近，PPO 梯度基本是噪声；而新加的对齐损失的梯度是非零的，会成为它们的主导方向。
+2. **对齐损失两边都有梯度**。`g1_smpl_latent = MSE(z_g1, z_smpl)`（系数 1.0）：对 `z_g1` 的梯度是 `2(z_g1 − z_smpl)/N`。此时 `z_smpl` 来自随机初始化的 smpl 编码器，几乎是和动作无关的“垃圾”，`z_g1` 就被拉向这个垃圾；`smpl` 编码器这边同时被拉向 `z_g1`，但它是从零开始的，要走一段才能追上。追上之前，g1 编码器的输出偏离了解码器训练时看到的分布。
+3. **循环项**（`reencode_smpl_g1_recon: true`，系数 1.0）：`z_smpl → g1_kin 解码器 → g1 编码器 → z′`，与 `z_g1` 比较。梯度会进入 `g1_kin` 解码器、**g1 编码器（既作为重新编码的网络，又作为目标）**。
+4. **smpl 原生的环境还会直接驱动策略**：每个环境在重置时按 `encoder_sample_probs`（g1:1 / a3_fast:1 / smpl:1，对有 SMPL 的动作约各 1/3）抽一个原生编码器；smpl 原生环境同时激活 g1（为了算对齐损失），但 token 装配时 smpl 的 token **覆盖** g1 的（`assemble_all_tokens` 按 `["g1","a3_fast","smpl"]` 的顺序写）。所以约 1/3 的环境是用随机的 SMPL token 经**共享的动力学解码器**出动作：一开始这些环境很快摔倒，它们的 PPO 梯度（策略梯度 + 优势）直接流进**共享解码器**，把原本给 g1 / a3_fast 调好的解码器往“能解释垃圾 token”的方向推。
+5. **a3_fast 是间接受影响**：a3_fast 与 g1 的对齐（系数 1.0，035 里已经收敛，所以本来≈0）会随着 g1 被拉动而变大，于是 a3_fast 编码器也被带着动。
+6. **自适应学习率**（`schedule: adaptive`，`desired_kl` 0.01，范围 1e-5…2e-4）按 KL 调：前期策略变化大，学习率会被降下来——这反过来也让 smpl 编码器追上 g1 更慢。
+
+**没有测的**：这些方向是读代码得到的，**量级没测**（4 次迭代的冒烟日志里没有辅助损失的数值，也没有收敛训练）。所以我没有证据说“035 的跟踪一定会明显下降”，只是说有这条路径；G1 官方是从零联合训练 g1 / smpl，没有“已经训好的 g1 + 新插入的随机 smpl”这种情形。
+
+**防它的办法：训练器本来就支持冻结，只是配置开关**（更正：我最初写的“训练器没有冻结选项”是错的——`universal_token_modules.py` 里每个编码器/解码器都有 `freeze`，注释写的就是“让蒸馏阶段保持预训练的解码器不动，同时梯度仍然穿过它们流到活跃的编码器”）。冒烟验证（热启动 `035_step200000`，30 条真实配对片段，16 个环境，4 次迭代，`callbacks.model_save.save_frequency=3`；日志里出现 `Froze encoder: g1 / a3_fast`、`Froze decoder: g1_dyn / g1_kin`）：
+```bash
+... ./train_a3_035_fromscratch.sh --checkpoint checkpoints/035_step200000/model_step_200000.pt \
+    algo.config.actor.backbone.encoders.g1.freeze=true  ++algo.config.actor.backbone.encoders.a3_fast.freeze=true \
+    algo.config.actor.backbone.decoders.g1_dyn.freeze=true  algo.config.actor.backbone.decoders.g1_kin.freeze=true
+```
+- 结果：`exit=0`；存出的检查点里 g1 / a3_fast 编码器和 g1_dyn / g1_kin 解码器相对 035 的**最大变化量为 0**（逐位不变）；优化器里只有 25 个参数在更新（smpl 编码器 10 个 + 动作 `std` 1 个 + critic 14 个），smpl 第一层权重（2048×840）的 Adam 一阶矩非零，即梯度确实穿过冻结的解码器和冻结的 g1 目标流到了 smpl 编码器。这是“g1 / a3_fast 当老师、只训练 smpl”的阶段一。
+- 冻结后：`g1_smpl_latent`、`reencoded_smpl_g1_latent` 只更新 smpl；smpl 原生环境的策略梯度只更新 smpl（解码器不动），上面第 2–5 条机理都不再作用于 g1 / a3_fast / 解码器。代价是阶段一里 g1 / a3_fast 模式不会继续变好。
+- 阶段二（smpl 追上之后）：去掉 `freeze` 覆盖，用阶段一的检查点再 `--checkpoint` 热启动一次，让所有部分联合微调。两阶段之间的切换时机（监控 `g1_smpl_latent` 降到多少）没有依据，需要看第一次训练的曲线。
+- 也可以不分阶段，只把对齐损失里的 g1 目标 `detach()` 掉（单向蒸馏，`Compliance` 版本损失就是这样做的）；这要改 `token_losses.py`，我没有做。
+- 无论哪种，上服务器后前几百次迭代都建议盯 `g1_smpl_latent`、`reencoded_smpl_g1_latent` 的数值和 a3_fast / g1 模式的跟踪指标（`Env/Metrics/motion/error_*`），这是判断“拉动”是否真的发生的唯一证据。
+
+### 19.9 要不要把 `G1SmplLatentLoss`、`ReencodedSmplG1LatentLoss` 针对 A3 差异化（用户追问，2026-10-16）
+
+**对象上不需要：这两项本来就是 A3 的，名字是遗留。** 看代码和合成后的配置：
+- A3 配方里的 `g1` 编码器输入是 `command_multi_future_nonflat`（参考关节位置 / 速度）和 `motion_anchor_ori_b_mf_nonflat`，来自 **A3 重定向库**，权重来自 035 的 A3 检查点；`g1_kin` 解码器重建的正是这两个量。也就是说“g1”在这里指“完整机器人参考”编码器，不是 G1 机器人。
+- `G1SmplLatentLoss`、`ReencodedSmplG1LatentLoss`（还有 `G1ReconLoss`）只是在 64 维潜变量 / 参考特征上做 MSE，函数里没有 G1 的骨架、关节顺序或自由度数；`reencode` 路径只是把 `g1_kin` 的输出按名字喂给 `g1` 编码器（两个键与编码器输入一致）。4 次迭代冒烟里这条路径是开着的（`reencode_smpl_g1_recon: true`），没有报错。
+- 真正残留的 G1 假设在别处，都没被这个配方用到：`lower_joint_indices_mujoco = range(12)`（teleop 编码器）、`wrist_mujoco_dof_indices`（腕噪声增强，默认关）、FK 版重建损失用的 G1 骨架。
+
+**值得差异化的是梯度方向，不是损失函数本身。** G1 官方是 g1 和 smpl 从零联合训练，所以双向对齐合理；A3 这里 g1 / a3_fast / 解码器是已经在真机上验证过的 035 权重，SMPL 只是新增的一个输入。更合适的语义是“g1 当固定的老师，smpl 学着对齐”。有两种做法：
+1. **冻结**（`freeze`，19.8，已验证，不改代码）：对齐、循环、策略梯度这三条路径都不再改动 g1 / a3_fast / 解码器。
+2. **只在这两项损失里对 g1 目标 `detach()`**（要改 `token_losses.py`）：只切断“损失 → g1 编码器”这一条。**它不够**：循环项 `E_g1(D_kin(z_smpl))` 的梯度仍会进入 `g1_kin` 解码器；smpl 原生环境的策略梯度仍会进入共享的动力学解码器 `g1_dyn`——这两条 `detach` 都管不到。
+
+所以建议用冻结，而不是去改这两项损失。冻结还有一个实际好处：冻结阶段 g1 / a3_fast 编码器和解码器**逐位等于 035**，导出的 `a3_fast` ONNX 与现在真机验证过的那个一样，SMPL 只是在同一个解码器上多接一个编码器，不会动已验证的行为。代价：阶段一里解码器不能为 SMPL 做调整；要不要阶段二联合微调，看阶段一结束时 `g1_smpl_latent` 和跟踪指标。
+
+**这两项对 A3 真正敏感的地方是“对齐的目标是什么”**：目标是库里 IK 解出来的参考的潜变量。库错的地方（F1 的左右偏置、约 1% 的另一条 IK 分支的离群片段）会被学进去；肩 roll 被限位压住的帧，目标就是压住后的参考，这正是“网络少转一点肩”，是预期的。系数（各 1.0）是 G1 从零训练时的取值，没有 A3 的依据；冻结阶段目标固定，较大的初始值只作用于 smpl，保持 1.0 即可，等看到曲线再调。冻结阶段 `a3_fast_g1_latent`（1.0）两边都冻结，没有梯度，只是占算力，可以把系数设成 0（没试）。
+
+**补充（用户追问：g1 和 a3_fast 是两个编码器，还是 a3_fast 带着 g1 的权重？为什么 g1 能当固定老师？）**
+
+读 035 检查点和配置的事实：
+- **是两个独立的编码器**。检查点里 `encoders.g1`、`encoders.a3_fast` 各有 10 个张量，结构相同（MLP 640→2048→1024→512→512→64），但权重各自独立，逐张量最大差值与该张量最大值同量级（相对差 0.2–1.9）。
+- “带 g1 的权重”只是**初始化**：`a3_fast` 配了 `init_from_encoder: {source: g1, policy: missing_only}`，只有检查点里**没有** a3_fast 权重时（从零训练或从只含 g1 的检查点起步）才把 g1 的权重复制过来当起点；035 里两者都有，这条被跳过。
+- **差别在输入窗口**：`g1` = 10 帧 × 0.1 s（前瞻 **1.0 s**，完整参考）；`a3_fast` = 10 帧 × 0.02 s（前瞻 **0.2 s**，实时遥操能给出的短窗口）；**`smpl` = 10 帧 × 0.02 s（0.2 s），和 a3_fast 同一种窗口**。
+- **为什么 g1 当老师**：这是 035 设计里的角色，不是我加的——`A3FastG1LatentLoss` 的文档就是“A3-fast **student** latents with matching G1 **teacher** latents”。g1 看到的未来最长、信息最多；解码器 `g1_kin` 重建的就是 g1 的 1 s 参考，所以这 64 维 token 空间本来就是“编码 1 s 参考”的空间，解码器 `g1_dyn` 也是在这个空间上训出来的。a3_fast 用 0.2 s 去逼近同一个 token，SMPL（也是 0.2 s）要做的是同一件事——所以 SMPL 与 a3_fast 是同级的学生，不能互相当老师。
+- **“固定”的依据**：035 已经收敛，g1 → 解码器这条路径是跟踪最好的模式；固定后目标空间不再移动，学生不会追着一个动的目标。**但要说清楚**：035 训练时 g1 与 a3_fast 的对齐是双向的（代码注释写明：从零训练时让两者一起成形，而不是对着一个被 detach 的、随机初始化的 g1 蒸馏），所以“老师/学生”是角色，不是梯度方向；现在把 g1 冻结，是因为它已经训好了。
+- **推论**：①短窗口学生的对齐损失有下限——g1 的潜变量包含 0.2 s 之后的信息，SMPL / a3_fast 只能从 0.2 s 里推断；这个下限可以用 035 里 a3_fast 与 g1 的对齐损失当参照（没测）。②冻结 g1 + 解码器就足以让老师固定；**冻结 a3_fast 不是为了当老师，而是为了让导出的 a3_fast ONNX 与已验证的逐位相同**——如果不在意这一点，a3_fast 可以不冻结（它会继续被它自己的环境的策略梯度和与 g1 的对齐更新）。
+
+### 19.10 肩+肘的镜像离群（19.6 里“没处理”的那一项）：诊断与修复（用户追问“如何解决”，2026-10-16）
+
+**诊断**（在新库的全部 64,350 对镜像孪生上；脚本在会话临时目录）
+- 按“任一帧肩+肘差 >0.3 rad”算，6,241 对（9.7%）有分歧段，共约 1.2 万段，核心长度中位 6 帧、39% ≥10 帧、36% ≤3 帧；整对 RMSE >0.15 的有 1,785 对（2.8%，比 19.6 里单臂口径的 1.7% 多，因为这里两只手臂一起算）。
+- 差在**肩 pitch 和 yaw**（离群对里平均 RMSE 0.7–1.0 rad），肘几乎不差（0.1），roll 居中。高发动作：body_stretch（26% 的对）、dance_*（7–15%）、idle_crawl、exercise_1 等举臂 / 大幅度动作。
+- **不是同一个姿态的两种欧拉写法**：差异帧里两条孪生的肩朝向中位差 26°（p90 61°），只有 12.9% 的帧朝向差 <5°（欧拉双覆盖）。
+- **多数帧里一条跟人跟得明显更好**（用 SMPL 的上臂 / 前臂方向对比机器人 FK，正常对的基线是中位 13.4°、>30° 只有 0.5%）：差异帧里较好的一条中位 11.2°，较差的一条 21.4° 且 20.6% 的帧 >30°；56% 的差异帧只有一条在 15° 以内，19% 两条都在 15° 以内（两个都可接受的解），24.6% 两条都不好（多半是够不着）。哪一条差没有偏向 X 或 X_M。
+- 结论：多数是**其中一条的 IK 掉进了局部极小**。G1 同数据也是这样（2.0%），所以 G1 官方库里同样存在。
+
+**为什么影响 SMPL 编码器**：孪生的 SMPL 输入互为精确镜像，目标（关节角）却差 0.7–1 rad，等于同一个输入对应两个目标；网络只会学到折中，而折中的肩 pitch / yaw 不是一个有效姿态。
+
+**修法**（`gear_sonic/data_process/repair_a3_arm_mirror.py`，不重跑 IK）：孪生是精确镜像，所以较好那条的手臂取镜像就是较差那条的正确解。
+1. 孪生的肩 pitch / roll / yaw / 肘任一关节差 >0.3 rad 的帧开一个分歧段（前后各补 8 帧，间隔 ≤16 帧的合并）；
+2. 段内比较两条手臂对 SMPL 人的上臂 / 前臂方向偏差（段内平均，平手取 X），偏差小的当来源；
+3. 另一条的**整只手臂 7 个关节**换成来源的镜像，在补出来的 8 帧里用 6 帧线性渐入渐出（那里两个解本来就一致，不产生关节跳变）；
+4. 只改一条孪生的手臂列，腿、腰、根和另一条孪生都不动，`pose_aa` 按改动的关节重建；长度差 1 帧的孪生（1,663 对）按公共前缀比较、最后一帧原样保留；不变的片段硬链接到新目录（不占额外磁盘）。
+
+**结果**（输出 `data/motion_lib_a3_29d/robot_filtered_v15_clean_armfix`，15 秒，改了 8,530 条片段 / 6,241 对 / 12,393 段，硬链接 120,586 条）
+| 检查 | 结果 |
+|---|---|
+| 格式检查（`convert_a3ultra_to_a3_29d.py --check`） | 0 个问题 |
+| 全部 64,350 对：肩+肘镜像 RMSE >0.15 的对 | **1,785 → 0**；有任一帧差 >0.3 rad 的对 6,241 → 0；中位 RMSE 0.0275 → 0.0274（没变） |
+| 审计脚本（250 抽样）：肩 pitch / roll / yaw 镜像 RMSE | 0.203 / 0.134 / 0.213 → **0.022 / 0.024 / 0.047**；逐条片段 p99 0.158 → **0.059**（G1 0.229）；>0.15 的片段 1.6% → 0.0% |
+| 被替换的帧（2,500 条片段、111,879 个手臂帧）：与人的方向偏差 | 中位 18.7° → 18.5°，p90 33.8° → 31.0°，**>30° 的帧 16.3% → 11.1%**，>45° 2.4% → 1.9%；17% 的帧好了 >10°，**10.5% 的帧差了 >10°**，72.6% 在 ±10° 内 |
+| 改动片段的手臂最大相邻帧关节步长 | 中位 0.485 → 0.474；>1.0 rad 的片段 122 → 114；>2.0 rad 7 → 6——没有新增跳变 |
+| 限位 / 腿 / 腕 / link_asym / 腕公式拟合 | 与修前相同（肩 roll 软限位外 10.2% / 11.6%；link_asym 髋 1.0° / 手 0.4°） |
+| 回归 | 全套 285 通过 / 5 跳过（新增 `tests/test_repair_a3_arm_mirror.py` 5 个） |
+
+**说清楚它做到了什么、没做到什么**
+- 做到的是**一致性**：同一个（镜像的）输入不再对应两个差 0.7–1 rad 的目标。对人的保真度中位数没变，大偏差（>30°）的帧少了约 5 个百分点；不是每一帧都更贴近人——段内按平均偏差选来源，所以有 10.5% 的被替换帧变差了 >10°。
+- 两个解都可接受（19%）或都不好（24.6%）的段，也被统一成了其中一个；统一后不再自相矛盾，但不代表它更对。
+- **没处理**：不在分歧段里的片段内部关节跳变（相邻帧 >1.0 rad 的约 1,370 条，和镜像孪生无关）；没有孪生或没有 SMPL 的 7 条片段；阈值 0.3 rad 和渐变帧数是我选的，没有调。
+- **对训练的实际效果没测**（没有收敛训练）。
+
+**目录**：这次**没有换名**。`data/motion_lib_a3_29d/robot_filtered_v15_clean` 仍是 19.6 的版本；修复版在 `…_armfix`（用 `MOTION_FILE=data/motion_lib_a3_29d/robot_filtered_v15_clean_armfix` 训练；配方默认路径不变，所以要显式传）。硬链接只影响本机磁盘，`scp` / `rsync` / `tar` 传的是完整内容；本机上改写文件的工具都是写临时文件再改名，不会通过硬链接改到另一个目录。用法：`python gear_sonic/data_process/repair_a3_arm_mirror.py --lib <库> --smpl data/smpl_filtered --output <新目录>`（`--dry_run` 只分析，`--threshold`、`--ramp` 可调）。
+
+### 19.11 19.10 里“没处理 / 没调 / 没测”的几项：怎么处理（用户追问，2026-10-16；用户已决定上传 `…_armfix`）
+
+**1. 没有孪生的 416 条和没有 SMPL 的 7 条：不需要处理。** 没有孪生的 416 条（`small_heavy`、`outside_door`、`medium_heavy` 等）对 SMPL 人的手臂方向偏差中位 13.5°，与有孪生的片段（13.9°）一样，超过 10% 的帧 >30° 的片段 2.6%（有孪生的 4.8%）——只是没法做镜像检查和修复，质量没有特别差。没有 SMPL 的 7 条（`kneeling_loop_002__A098_M` 和 6 条 `neutral_button press_*`）只是不能被 `smpl` 编码器采样（`motion_has_smpl` 会屏蔽），g1 / a3_fast 照常用。
+
+**2. 阈值 0.3 rad 和 6 帧渐变：做了敏感性分析（全库重跑修复，每组 30–60 秒）**
+
+| 阈值 / 渐变帧 | 改动的片段 | 改动的对 | 修后仍 RMSE >0.15 的对 | 修后仍有任一帧差 >0.3 的对 | 改动片段平均 \|Δq\|（rad） |
+|---|---|---|---|---|---|
+| 0.2 / 6 | 12,136 | 8,310 | 0 | 0 | 0.019 |
+| **0.3 / 6（采用）** | **8,530** | **6,241** | **0** | **0** | **0.026** |
+| 0.5 / 6 | 5,223 | 4,232 | 7 | 4,623 | 0.040 |
+| 0.8 / 6 | 3,376 | 2,916 | 65 | 5,599 | 0.059 |
+| 0.3 / 3 | 8,569 | 6,241 | 0 | 0 | 0.026 |
+| 0.3 / 12 | 8,474 | 6,241 | 0 | 0 | 0.027 |
+
+结论：渐变帧数（3 / 6 / 12）几乎没有影响，所有设置都没有新增 >1 rad 的手臂跳变（改动片段里的跳变数还少了约 105 条）；阈值 0.5 以上会留下 7–65 个仍然离群的对和 4,600 多个仍有 >0.3 rad 分歧的对；0.2 与 0.3 在一致性上没有区别、却多改 3,600 条片段。所以 **0.3 / 6 是合理的，不用再调**。
+
+**3. 片段内部的关节跳变（相邻帧 >1.0 rad，@30 fps）：数据、为什么没法在关节空间里修、怎么办**
+- `…_armfix` 里 1,265 条片段（0.98%）有 2,732 次，几乎全在手臂和腕（左右臂各约 1,000 次、两个腕共约 720 次、腿 10 次、腰 0 次）；32% 是尖峰（3 帧内回去），68% 是持续的台阶；幅度中位 1.19 rad、最大 3.06 rad。高发动作是 dance_hiphop / vouge、body_stretch、mohak_*。**G1 官方库里是 4,091 条（2.88%）、9,570 次——是我们的 3 倍，而且 92% 是持续台阶**。也就是说 G1 官方训练就是带着这类数据训的，我们已经比它干净。
+- 它们是真的姿态跳变，不是欧拉重写：跳变那一帧肩连杆朝向中位变 77°（0% 小于 10°）、肘连杆 77°，但手腕位置只动 61 mm（中位）——是绕上臂的扭转在一帧里翻转。
+- **在关节空间里平滑它们不行**：我试了对每个跳变窗口（前后各 8 帧）做余弦插值，再拿 SMPL 人检查——窗口内手臂方向偏差从 14.6° 涨到 32.4°，60% 的窗口变差 >10°，按“不变差超过 3 / 5 / 10°”的标准只有 25% / 30% / 37% 的窗口能接受。（肘弯着时线性改变肩 yaw 会让前臂摆到别处。）所以我**没有**做这个修复。
+- 合理的做法有两个：①**保持现状**（比 G1 官方基线干净 3 倍）；②**对 SMPL 训练做质量闸门，排除这 1,265 条（占 0.98%）**。可能有害的机制是：自适应采样偏向失败多的片段（`adp_samp`），参考里有 30–40 rad/s 的关节台阶，机器人跟不上，会一直失败、一直被重采样。这个机制我没有验证。名单：`data/motion_lib_a3_29d/robot_filtered_v15_clean_armfix.jump_clips.txt`；上传时用 rsync 排除，不用再复制一份库：`rsync -a --exclude-from=data/motion_lib_a3_29d/robot_filtered_v15_clean_armfix.jump_clips.rsync_exclude <库>/ <服务器>:<路径>/`。根治要在重定向 IK 里加“扭转连续性”约束并重跑，不在这次范围。
+
+**4. “对训练的实际效果没测”：不能用离线代理测出来，但可以做两件事。**
+- 上一轮说 F3“量级没测”，其实冻结冒烟的 TensorBoard 日志里就有真实数值（`Loss/aux_*_avg`）：随机初始化的 `smpl` 编码器的 `g1_smpl_latent` = 0.479、`reencoded_smpl_g1_latent` = 0.494，冻结 g1 / a3_fast / 解码器、16 个环境、4 次迭代后降到 0.148 / 0.146；035 里 `a3_fast_g1_latent` 的残差只有 0.0005–0.002（同样 0.2 s 窗口，可当参照）。也就是说如果梯度进了 g1（不冻结），起始的拉力是 035 对齐残差的约 240 倍。
+- 在本机用真实配方做了一个 A/B（见 19.12）：同一批 1,800 条片段（600 对修复过的 + 300 对没修的），只在“修复前 / 修复后”的库之间对比冻结阶段一的对齐损失。
+
+### 19.12 本机 A/B：修复前后的库在冻结阶段一里的对齐损失（2026-10-16，回答 19.11 第 4 点）
+
+**做法**：同一批 1,800 条片段（600 对 `…_armfix` 改过的 + 300 对没改的，按文件名取）建两个只有符号链接的目录：修复前（19.6 的库）和修复后（`…_armfix`）。真实配方 `sonic_a3_ultra_smpl`，热启动 `035_step200000`，冻结 g1 / a3_fast 编码器和 `g1_dyn` / `g1_kin` 解码器（19.8），2048 个环境，每次 400 次迭代（约 2000 万步，约 25 分钟），每个库跑两个种子（0、1）。指标取 TensorBoard 里最后 100 次迭代的均值。脚本在会话临时目录，没有放进仓库。
+
+| 运行 | `g1_smpl_latent` | `reencoded_smpl_g1_latent` | `a3_fast_g1_latent` | 关节位置误差 | 平均奖励 |
+|---|---|---|---|---|---|
+| 修复前 种子 0 | 0.1493 | 0.1485 | 0.0040 | 0.265 | 6.68 |
+| 修复前 种子 1 | 0.1630 | 0.1609 | 0.0044 | 0.256 | 7.57 |
+| 修复后 种子 0 | 0.1482 | 0.1472 | 0.0038 | 0.258 | 7.26 |
+| 修复后 种子 1 | 0.1438 | 0.1426 | 0.0042 | 0.251 | 7.91 |
+| **修复前 均值 → 修复后 均值** | **0.1562 → 0.1460（−6.5%）** | 0.1547 → 0.1449（−6.3%） | 0.0042 → 0.0040 | 0.2607 → 0.2541（−2.5%） | 7.12 → 7.59（+6.5%） |
+
+**读法（要保守）**
+- 四个指标方向全部偏向修复后，没有任何一项变差；但**幅度在种子噪声之内**：同一个库的两个种子之间差 9%（修复前 0.1493 / 0.1630）、3%（修复后），而库之间的差只有 6.5%；每组只有两次，没法做显著性检验。**所以我不能说“修复让训练更好”，只能说“没有发现变差，方向一致偏好”。**
+- 这个 A/B 本来就只能测到一致性的影响：两个库只在被改的手臂分歧段上不同（本子集里 600 对中被改的部分，约占总帧数的几个百分点）。
+- **绝对水平比预期差得多**：冻结阶段一里 400 次迭代后 `g1_smpl_latent` 只从约 0.37 降到约 0.15，而 035 里同样 0.2 s 窗口的 a3_fast 对齐残差是 0.004，差 35 倍。曲线在第 100–200 次后基本平了（0.18 → 0.15 → 0.15）。可能原因：①**自适应学习率一直压在下限**——`desired_kl` 0.01，而 PPO 的 KL 在 0.01–0.02，学习率被压到 1e-5（下限）上下，只有偶尔涨到 2e-5；SMPL 编码器是新增的、需要学得快，却被 PPO 的 KL 限速了；②SMPL 输入（人体关节）到 g1 潜变量（含 1 s 前瞻的机器人参考）的映射本来就比 a3_fast 难，下限可能高于 0.004；③子集只有 1,800 条。①可以检验，所以又排了两组固定学习率（`desired_kl=null`，学习率 1e-4 和 3e-4，400 次迭代，修复后库、种子 0），结果出来后补在这里。
+- 其他：`a3_fast_g1_latent` 在冻结下保持在 0.004 左右不变（符合预期：两边都冻结）；`Terminations`、`adaptive sampling` 的集中度在两个库之间的差异比种子之间的小，没看出区别。
+
+**服务器上该盯的指标（参照上面的数字）**：`Loss/aux_g1_smpl_latent_avg`、`Loss/aux_reencoded_smpl_g1_latent_avg`（起点约 0.35–0.5；冻结阶段应单调下降，不下降说明数据或配置有问题）；`Loss/aux_a3_fast_g1_latent_avg` 在冻结阶段应恒定在 0.002–0.004（变了说明 a3_fast 没冻住）；`Train/lr`（卡在 1e-5 说明被 KL 限速）；`Env/Metrics/motion/error_joint_pos`、`Terminations/*`、`AdaptiveSampling/num_concentrated_bins`。
+
+### 19.13 阶段一的学习率：自适应学习率确实在限速，但固定高学习率的代价是 PPO 部分变差（2026-10-16，接 19.12）
+
+同样的设置（修复后的库、冻结阶段一、2048 环境、400 次迭代、种子 0），只改学习率：`desired_kl=null` 关掉按 KL 调节，学习率固定。每组只有一次，没有重复。
+
+| | `g1_smpl_latent`（最后 100 次均值） | 400 次时 | `reencoded` | 平均奖励 | 关节位置误差 | PPO 的 KL（均值 / 最大） | 动作噪声 std |
+|---|---|---|---|---|---|---|---|
+| 自适应（默认，种子 0 / 1） | 0.148 / 0.144 | 0.147 / 0.127 | 0.147 / 0.143 | 7.26 / 7.91 | 0.258 / 0.251 | 0.014 / 0.027 | 0.43 |
+| 固定 1e-4 | **0.085** | 0.078 | 0.087 | 5.91 | 0.259 | 0.048 / 0.26 | 0.49 |
+| 固定 3e-4 | **0.067** | 0.062 | 0.070 | 5.24 | 0.266 | 0.166 / 1.17 | 0.50 |
+
+- **学习率这个猜测对了一半**：自适应学习率因为 PPO 的 KL（0.014）超过目标（0.01）而一直停在 1e-5 到 2e-5；固定 1e-4 / 3e-4 把对齐损失降到 0.085 / 0.067（比自适应低 42% / 54%），而且 400 次时还在降（0.078 / 0.062）。`a3_fast_g1_latent` 仍然是 0.004，冻结没有被破坏。
+- **但 PPO 部分变差了**：平均奖励从 7.3–7.9 降到 5.9 / 5.2（g1、a3_fast 的环境在冻结下不变，所以掉的是 smpl 环境的奖励）；PPO 的 KL 涨到 0.05 / 0.17，最大 0.26 / 1.17（目标是 0.01，clip 比例 0.076 / 0.091 vs 0.044）；动作噪声 std 从 0.43 涨到 0.49–0.50；终止率和关节 / 身体位置误差没有改善（0.259 / 0.266 vs 0.258）。也就是说对齐损失更低了，跟踪却没有更好——高学习率下 PPO 的梯度噪声在破坏编码器。
+- **所以不能直接建议“用固定 1e-4 或 3e-4”**：它加快了对齐，同时让 RL 部分更不稳。自适应默认值是稳妥但慢的那端。**折中办法没有验证**：①固定 1e-4 的同时把 `ppo_loss_coef` 降到 0.1（让对齐损失压过 PPO 梯度）；②仍用自适应，但把 `desired_kl` 放宽到 0.05，让学习率能涨到 KL 约 0.025–0.1 的位置。这两组已经排上（结果补在下面）。
+- 读法的限制：一次一个设置，种子噪声约 ±5–9%（19.12），上面 42% / 54% 的差远大于它，所以“固定学习率降得更低”是可信的；“奖励变差”同样是 20–30% 的差，也大于噪声；但两者的因果解释（PPO 梯度噪声）是推测。
+
+### 19.12b 早期读数（2026-10-16 17:50，当时还有两组没跑完；**已被上面的 19.12 / 19.13 取代，数字以后者为准**：两组折中的结果已经在 19.13 末尾）
+
+设置：热启动 `035_step200000`，冻结 g1 / a3_fast 编码器和两个解码器（19.8），2048 个环境，每组 400 次迭代；子集 1,800 条（600 对被 19.10 修过的 + 300 对没修的）；指标取最后 50 次迭代的均值（TensorBoard 的 `Loss/aux_*_avg`、`Objective/rewards`）。这是**短程、小子集**的读数，不是收敛，LR 对照只有 1 个种子。
+
+| 运行 | `g1_smpl_latent` 起点 → 第 50 / 100 / 200 次 → 末 50 次 | `reencoded_smpl_g1_latent` | 关节位置误差 | 平均 reward |
+|---|---|---|---|---|
+| 修复前库，种子 0 / 1（默认自适应 LR） | 0.396 → 0.208 / 0.183 / 0.153 → **0.148**；种子 1：**0.159** | 0.147 / 0.157 | 0.267 / 0.258 | 6.86 / 7.25 |
+| `_armfix`，种子 0 / 1（默认自适应 LR） | 0.394 → 0.208 / 0.153 / 0.154 → **0.147**；种子 1：**0.139** | 0.146 / 0.138 | 0.260 / 0.252 | 6.95 / 7.71 |
+| 固定 LR 1e-4（`desired_kl=null`），`_armfix` | → 0.147 / 0.126 / 0.109 → **0.082** | 0.084 | 0.263 | 5.57 |
+| 固定 LR 3e-4，`_armfix` | → 0.151 / 0.120 / 0.083 → **0.064** | 0.067 | 0.267 | 4.85 |
+| 固定 LR 1e-4 + `ppo_loss_coef=0.1`（PPO 损失缩小 10 倍），`_armfix`，**只跑了 176 / 400 次** | → 0.104 / 0.103 / 0.070 → 0.081（截至第 176 次） | 0.083 | 0.250 | 8.33（`ep_len` 103，其余 83–92） |
+
+**读数**
+- **`_armfix` vs 修复前**：对齐损失末值 0.143 vs 0.153（−6.5%），同种子配对都更低（0.1471 vs 0.1476；0.1387 vs 0.1591），但小于同一设置两个种子之间的差（0.011）——**两个种子分不出来，没有变坏**；这个子集里被改的只是部分片段内的部分帧，所以也不该指望差很多。
+- **默认自适应学习率在阶段一几乎不学习**：`Train/lr` 从 2e-5 很快掉到下限 1e-5 并一直待在那里（KL 起始 0.016–0.023，超过 `2×desired_kl = 0.02` 就除以 1.5；之后 KL 落在 0.011–0.015，不够低、LR 升不回去）。阶段一只训练 smpl 编码器（10 个张量）、动作 `std` 和 critic，所以对齐损失 400 次只从 0.39 降到 0.15。服务器上 4096 个环境同样的调度，预计同样慢。
+- **固定 LR 学得快得多**：1e-4 → 对齐损失 0.082（−44%），3e-4 → 0.064（−56%）；**代价**是平均 reward 从 6.9–7.7 降到 5.6 / 4.9。我没法判断这是暂时的还是真的有害——阶段一里 g1 / a3_fast 编码器和解码器冻结，变化的只有 smpl 编码器（经 smpl 原生环境，约 1/3）、`std` 和 critic，没有 KL 约束时 PPO 的更新幅度更大。
+- **`ppo_loss_coef=0.1`（让对齐损失占主导）**目前最好：对齐损失到 0.08 的同时 reward 8.3、回合长度 103（其他组 83–92）——但只跑了 176 / 400 次、1 个种子，**别当结论**；还有一组自适应 LR 加 `desired_kl=0.05` 排在它后面，没跑。
+- 所有组里 `a3_fast_g1_latent` 都是 0.004 左右、与 035 的残差同量级（冻结，没有梯度）；`reencoded_smpl_g1_latent` 与 `g1_smpl_latent` 几乎相等。
+
+**这对服务器训练意味着什么（建议，不是结论）**：用默认配置跑阶段一会很慢；想让 smpl 编码器在阶段一快点对齐，可以试 `algo.config.desired_kl=null algo.config.actor_learning_rate=1e-4`，并盯 reward；`ppo_loss_coef=0.1` 的那组结果出来后再看要不要加。我没有在服务器规模（4096 环境、12.9 万条）上试过，所以这些数字只能当方向参考。
+
+
+**折中两组的结果（同样的设置，种子 0，400 次迭代，各一次）**
+
+| | `g1_smpl_latent`（最后 100 次均值） | 400 次时 | 平均奖励 | PPO 的 KL（均值 / 最大） | 学习率 | 动作噪声 std |
+|---|---|---|---|---|---|---|
+| 自适应（默认，2 个种子） | 0.148 / 0.144 | 0.147 / 0.127 | 7.26 / 7.91 | 0.014 / 0.03 | 1e-5 ~ 5e-5 | 0.43 |
+| 固定 1e-4 | 0.085 | 0.078 | 5.91 | 0.047 / 0.26 | 1e-4 | 0.49 |
+| 固定 3e-4 | 0.067 | 0.062 | 5.24 | 0.166 / 1.17 | 3e-4 | 0.50 |
+| **固定 1e-4 + `ppo_loss_coef` 0.1** | **0.052** | **0.050** | 5.95 | 0.107 / 0.81 | 1e-4 | 0.49 |
+| 自适应 + `desired_kl` 0.05 | 0.100 | 0.090 | 5.78 | 0.063 / 0.30 | 1.5e-5 ~ 2e-4（自己在调） | 0.49 |
+
+- **对齐最快的是“固定 1e-4 + `ppo_loss_coef` 0.1”**：0.052（比自适应默认低约 65%），400 次时还在降（0.081 → 0.059 → 0.050）。其次是自适应放宽到 `desired_kl` 0.05（0.100，低约 32%，学习率自己在 1.5e-5 到 2e-4 之间摆动）。
+- **更正我在上面的解释**：我说过奖励下降是“PPO 梯度噪声在破坏编码器”。`ppo_loss_coef` 降到 0.1 后 PPO 的梯度占比小了，但奖励还是 5.95、KL 反而更大（0.107），所以不是 PPO 噪声——更像是对齐损失在高学习率下推着 smpl 编码器快速变化，每次更新策略分布变化大（KL 大、clip 比例 0.10），而且 `std`（动作噪声，所有环境共用的可训练参数）涨到了 0.49。
+- **分项奖励显示奖励下降主要不是跟踪变差**：对比自适应 → 高学习率的几组，`action_rate_l2` 惩罚从 −0.21 变成 −0.26 ~ −0.28、`feet_acc` 从 −0.027 变成 −0.042 ~ −0.044（噪声变大后动作更抖），`tracking_body_angvel` 从 0.103 掉到 0.07 ~ 0.08，但 `tracking_relative_body_pos` 0.167 vs 0.153 ~ 0.168（“+ ppo_loss_coef 0.1”那组是 0.168，一样）、`tracking_anchor_pos` 0.058 vs 0.051 ~ 0.057、关节 / 身体位置误差 0.258 vs 0.259 ~ 0.266 基本没变。所以**位置 / 朝向跟踪基本持平，变差的是速度跟踪和动作平滑性**，而且这是带噪声的训练奖励，不是确定性评估——**确定性评估我没做**，所以不能说 smpl 模式的实际表现更好或更差。
+- **对服务器上阶段一的建议（有依据但证据薄）**：目标是蒸馏（对齐），不是 PPO 本身，所以阶段一可以用 `algo.config.desired_kl=null algo.config.actor_learning_rate=1e-4 ++algo.config.ppo_loss_coef=0.1`（对齐损失最低）；稳妥的备选是只放宽 `algo.config.desired_kl=0.05`。阶段二（解冻后联合微调）要换回默认的自适应学习率和 `ppo_loss_coef` 1.0。**限制**：每个设置只跑一次、400 次迭代、1,800 条片段；更长时间下高学习率是否振荡、是否过拟合这 1,800 条，不知道。上服务器后第一次就要盯：`Loss/aux_g1_smpl_latent_avg` 是否继续下降（我这里 400 次时还在降）、`Policy/approxkl_avg`（我这里 0.1 左右）、`Policy/mean_noise_std`（是否持续涨）。

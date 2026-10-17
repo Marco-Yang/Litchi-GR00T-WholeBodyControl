@@ -29,12 +29,28 @@ def _tables(path: Path) -> dict:
     return {**cfg["ik_match_table1"], **cfg["ik_match_table2"]}
 
 
-def test_a3_ik_table_is_the_calibrated_ultra_table():
-    """Same table; the two robots share every IK link frame at qpos0 (checked in the next test)."""
+SYMMETRIZED = {f"{s}_{v}" for s in ("left", "right") for v in ("hip_yaw_Link", "knee_Link", "ankle_roll_Link", "wrist_yaw_Link")}
+
+
+def test_a3_ik_table_is_the_calibrated_ultra_table_with_the_left_right_symmetry_correction():
+    """Same table as the Ultra's, except the rot_offset of the feet / legs / hands that ``calibrate_a3_lr_symmetry.py`` corrected.
+
+    The Ultra copy is the table as calibrated from frame 0 of one clip (the performer's legs and wrists are not symmetric there);
+    the A3 table has the constant left/right difference measured on the library's mirror twins taken out (plan 19.6).
+    """
     a3 = json.loads((IK_DIR / "bvh_nokov_to_a3.json").read_text())
     ultra = json.loads((IK_DIR / "bvh_nokov_to_a3_ultra.json").read_text())
-    assert a3 == ultra
     assert a3["robot_root_name"] == "pelvis_link" and a3["human_root_name"] == "Hips"
+    for key in ("ik_match_table1", "ik_match_table2"):
+        assert set(a3[key]) == set(ultra[key])
+        for link, row in a3[key].items():
+            if link not in SYMMETRIZED:
+                assert row == ultra[key][link], link
+                continue
+            assert row[:4] == ultra[key][link][:4], link  # same SOMA body, weights and position offset
+            corr = Rotation.from_quat(ultra[key][link][4], scalar_first=True).inv() * Rotation.from_quat(row[4], scalar_first=True)
+            assert 3.0 < np.degrees(corr.magnitude()) < 15.0, (link, np.degrees(corr.magnitude()))  # half of the 12 / 20 degree asymmetry
+    assert {k: v for k, v in a3.items() if not k.startswith("ik_match_table")} == {k: v for k, v in ultra.items() if not k.startswith("ik_match_table")}
 
 
 def test_ik_link_frames_at_qpos0_are_identical_on_a3_and_a3_ultra():
@@ -120,5 +136,10 @@ def test_one_real_bvh_retargets_onto_the_a3_and_matches_the_ultra_pipeline(tmp_p
     (_, u), = joblib.load(out_ultra).items()
     assert check_a3_29d_entry("clip", a, build_conversion(), u["dof"].shape[0]) == []
     cols = [i for i in range(31) if i not in (3, 4)]  # drop the head columns of the Ultra's 31-column dof
-    assert np.sqrt(np.mean((a["dof"] - u["dof"][:, cols]) ** 2)) < 0.01  # same method, same human, same joint angles
+    d = a["dof"] - u["dof"][:, cols]
+    rms = lambda idx: float(np.sqrt(np.mean(d[:, idx] ** 2)))  # noqa: E731
+    # same method, same human: the joints the left/right symmetry correction does not move agree with the Ultra's solution ...
+    assert rms([0, 1, 2, 3, 4, 5, 6, 10, 11, 12, 13]) < 0.02  # waist, shoulders, elbows
+    # ... and the corrected feet / legs / wrists differ by about half of the measured left/right asymmetry (0.1-0.2 rad), not more
+    assert 0.03 < rms([7, 8, 9, 14, 15, 16]) < 0.4 and rms(list(range(17, 29))) < 0.4
     assert abs(float(np.mean(a["root_trans_offset"][:, 2] - u["root_trans_offset"][:, 2])) + 0.0045) < 0.003  # sole height

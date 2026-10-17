@@ -276,11 +276,11 @@ python gear_sonic/scripts/run_sim_loop.py --robot a3_ultra
 cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl/gear_sonic_deploy"
 scripts/a3_relay_sim.sh --bind 127.0.0.1
 
-# 终端 3 — 部署程序（比第 2 节多 --teleop-input zmq --robot-link zmq --relay-host 127.0.0.1）
+# 终端 3 — 部署程序（比第 2 节多 --teleop-input zmq --telecom zmq --relay-host 127.0.0.1；旧写法 --robot-link zmq 仍可用）
 cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl/gear_sonic_deploy"
 source scripts/setup_env.sh
 ./deploy.sh --robot a3_ultra --input-type zmq_manager sim --encoder a3-fast \
-    --teleop-input zmq --robot-link zmq --relay-host 127.0.0.1
+    --teleop-input zmq --telecom zmq --relay-host 127.0.0.1
 
 # 终端 4 — Pico 数据流（真头显）或模拟器（二选一，不能同时开）
 cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
@@ -306,6 +306,194 @@ python gear_sonic/scripts/pico_manager_thread_server.py --robot a3_ultra --manag
 - Ctrl-C 中继：它先阻尼 2 秒再退出；第二次 Ctrl-C 立即退出。
 
 ---
+
+## 5c. 腿 / 脚的跟踪：`track` 模式下录一段真人数据，离线调参（2026-10-17）
+
+> **录制 / 回放的完整流程现在单独写在 [mujoco_pico_record_replay.md](mujoco_pico_record_replay.md)（以那份为准，包含更正过的回放步骤）；本节保留当时的背景和结果。**
+
+**背景。** `--lower-body track`（默认）让腿跟随操作者。实时重定向（GMR 的 `smplx_to_a3_ultra` 表）没有约束脚的朝向：一个**完全静止**的站立者，踝 roll 在约 3 s 内就漂到关节极限（±0.349 rad）；离线对比 8 / 24 段行走片段，踝关节与离线参考几乎不相关（相关系数 −0.25…+0.29），踝 roll 在 10–13% 的帧里贴着极限。给脚加一个旋转权重（`A3_FOOT_ROT_WEIGHT`，**现在默认 8**，`0` = 原表）后：24 段片段上踝 RMSE 0.207 → 0.124 rad，平均相关 0.65 → 0.88，踝 roll 贴极限 9.9% → 6.5%；静止站立不再漂移（长时间 −0.03 / +0.05 rad）。权重 ≥ 20 会让部分片段发散（腿 RMSE 0.43+），所以取 8（5–12 等效）。MuJoCo 里同一段 SMPL 行走片段、同样的流程，原表 vs 权重 8：踝 roll 参考贴极限 26% → 4% 的帧，髋 yaw 相关 0.69 / 0.71 → 0.85 / 0.85，膝 0.51 / 0.62 → 0.65 / 0.70，脚在任务空间里“参考 → 实际执行”的残差 13.5 / 10.5 → 10.9 / 8.7 cm；两者都走了约 30 m 不摔。**没有改善的：** 策略执行的抬脚高度只有参考的 50–75%（参考 24 cm，执行 12–19 cm），延迟约 40 ms——这是策略的限制，不是重定向。
+
+**为什么要录你自己的数据。** 上面都是动捕 SMPL；你的 Pico（头显 + 脚踝追踪器）的数据和它不一样。录下原始的 `pose` / `command` 流以后，同一段动作可以离线用不同设置反复打分，也可以不用你再次示范就重放进仿真闭环。
+
+### 终端（5 个，顺序固定）
+
+先在仓库根目录生成这次运行专用的 dump 配置（只改 `dump_ticks` / `dump_path`，包里的配置不动；每次运行用不同的名字，**不要重复执行旧的命令**）：
+
+```bash
+cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+ls pico_leg1.pkl dump_sim_leg1.bin sim_leg1.csv 2>&1 | head -3        # 应当都是“没有那个文件”；有的话把 leg1 换成 leg2
+.venv_teleop/bin/python gear_sonic_deploy/scripts/a3_make_dump_cfg.py --dump "$PWD/dump_sim_leg1.bin"
+```
+
+```bash
+# 终端 1 — MuJoCo（窗口里 9 放到地面）
+cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+source .venv_teleop/bin/activate
+A3_SIM_LOG_CSV="$PWD/sim_leg1.csv" python gear_sonic/scripts/run_sim_loop.py --robot a3_ultra
+
+# 终端 2 — 策略 + 重定向链（等终端 1 就绪；默认 track，脚旋转权重 8）
+cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl/gear_sonic_deploy"
+source scripts/setup_env.sh
+A3_RUNTIME_CFG="$PWD/dist/a3_deploy_x86_64/config/a3_runtime_config.dump.yaml" ./deploy.sh --robot a3_ultra --input-type zmq_manager sim --encoder a3-fast
+
+# 终端 3 — 录制器（只订阅，不影响别的；必须在终端 4 之前开）
+cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+.venv_teleop/bin/python gear_sonic_deploy/scripts/a3_pose_recorder.py --out pico_leg1.pkl --seconds 900
+
+# 终端 4 — Pico 数据流
+cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/pico_manager_thread_server.py --robot a3_ultra --manager --num_frames_to_send 10
+```
+终端 3 每 2 s 打印一行 `pose windows … (~50/s)`，约 50/s 才说明头显和追踪器在发。
+
+### 严格示范（你的动作；总共约 4 分钟）
+
+**站姿：** 双脚平行、与髋同宽（脚间约 15 cm）、脚尖朝前、膝盖微松；上臂贴身，前臂向前，肘约 60–75°，手掌向内。**全程视线向前，头不要转，上半身不要主动摆。** 追踪器按平时的流程校准好。
+
+0. 终端 1 的窗口按 **9**（放到地面），等机器人站稳。手柄 **A+B+X+Y**（PD 站立）→ 等终端 2 打印 `Init Done`，再站稳 5 s。
+1. 手柄 **A+X**（进跟随）。**一动不动站 15 s**。
+2. **重心转移（脚不离地）：** 把全部重量压到左脚，保持 2 s，再压到右脚，保持 2 s；共 5 个来回（20 s）。
+3. **抬左脚：** 左脚垂直向上抬约 15 cm（脚底与地面平行，脚尖不要下垂），停 1 s，放下；每次共 4 s，做 5 次；然后站定 5 s。
+4. **抬右脚：** 同上，右脚 5 次；站定 5 s。
+5. **原地踏步：** 左右脚交替，每步 1 s，脚抬高约 15 cm，共 20 步（20 s）；站定 5 s。
+6. **前后迈步：** 左脚向前迈约 30 cm，停 1 s，收回；做 3 次；右脚同样 3 次；每次 5 s；站定 5 s。
+7. **原地走：** 自然步速，原地走 20 步；站定 10 s。
+8. 手柄 **A+B+X+Y**（失能）。
+
+**每一步开始前先喊出编号**（例如对着麦克风 / 看着表默念），并**把你实际做的和上面不一样的地方记下来**（比如“第 6 步右脚只迈了一半”）。机器人在仿真里摔倒不要紧：窗口会自己复位（按 9 重新放下），继续做下一步，但**把摔倒发生在哪一步记下来**。
+
+### 收尾和分析（按顺序）
+
+```bash
+# 先停录制器（Ctrl-C 会保存），再停终端 4、2、1
+cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+ls -l --time-style=full-iso pico_leg1.pkl dump_sim_leg1.bin sim_leg1.csv       # 三个文件的时间应当都是刚才
+
+# 1) 录下的真人数据：原表 vs 脚权重 8（同一段动作；约 1 分钟一次，要 gmr 环境）
+PYTHONPATH=. ~/miniconda3/envs/gmr/bin/python gear_sonic_deploy/scripts/a3_eval_pose_recording.py pico_leg1.pkl --foot-rot-weight 0 | tee eval_leg1_stock.txt
+PYTHONPATH=. ~/miniconda3/envs/gmr/bin/python gear_sonic_deploy/scripts/a3_eval_pose_recording.py pico_leg1.pkl --foot-rot-weight 8 | tee eval_leg1_w8.txt
+
+# 2) 仿真闭环（这次实际执行的）：参考腿 vs 实测腿，和任务空间里脚的执行误差
+.venv_teleop/bin/python gear_sonic_deploy/scripts/a3_analyze_teleop_run.py dump_sim_leg1.bin | tee analysis_sim_leg1.txt
+```
+把 `eval_leg1_stock.txt`、`eval_leg1_w8.txt`、`analysis_sim_leg1.txt` 和你记下的“哪里和示范不一样 / 哪一步摔倒”发给我。`eval_*` 里看这几项：**STILL** 行（静止时踝 roll 应接近 0，不贴 ±0.349）、**ALL frames** 行（贴极限的帧占比）、**foot while moving** 行（人脚 → 机器人脚的残差 cm 和 R²，R² 越接近 1 越好）。
+
+### 之后不需要你再示范就能做的事
+
+录好的 `pico_leg1.pkl` 可以重放进仿真，换任意设置做闭环对比（`a3_pose_replay_raw.py` 代替终端 4，**两者不能同时开**）：
+
+```bash
+# 终端 4 换成：
+.venv_teleop/bin/python gear_sonic_deploy/scripts/a3_pose_replay_raw.py pico_leg1.pkl            # 默认连 command 一起重放（A+B+X+Y / A+X 在原来的时刻）
+# 终端 2 换设置：A3_FOOT_ROT_WEIGHT=0（原表）/ 8 / 12 …  ./deploy.sh …
+```
+
+### 第一次录制（`pico_leg1`）的结果和三个现象（2026-10-18）
+
+- **文件：** 录制器当时没有过滤话题，`manager_status`（管理脚本每秒发几万条、每条 1.3 KB 的状态流）把 139 s 的会话录成了 7.8 GB；真正有用的只有 6953 个 `pose` 窗口（82 MB）。已改成只保存 `pose` / `command` / `planner`（`--all` 才保存全部），并把这次的录制瘦身成 `pico_leg1_slim.pkl`（同样的数据，82 MB）。7.8 GB 的 `pico_leg1.pkl` 确认 slim 文件在以后可以自己删。**第二次运行复用了 `leg1` 这个名字，把第一次运行的 `dump_sim_leg1.bin` 和 `sim_leg1.csv`（机器人执行数据）覆盖了**，Pico 录制没有被覆盖，所以执行数据可以用重放补回（下面）。每次运行换一个名字（`leg2`、`leg3` …）。
+- **录制里没有 A+B+X+Y / A+X 的 `command` 消息**（只有开头一条空消息和结尾两条停止消息）：第一次是用部署终端的键盘 `S` / `T` 进的跟随。重放时用 `a3_pose_replay_raw.py` 的 `--command-fifo` 发 `y` / `x`。
+- **真实 Pico + 脚踝追踪器数据上的打分（离线，无机器人）：** 静止时踝 roll：原表 +0.252 / −0.113 rad，**40% 的静止帧贴着极限**，所有帧里 44.5% 贴极限；**脚权重 8：0% 贴极限**（静止均值 −0.043 / +0.192）。人脚 → 机器人脚（参考，FK）：残差 3.9 / 3.7 cm，R² 0.91 / 0.92，延迟 0 ms（原表和权重 8 一样：脚的**位置**一直跟得很好，坏的是脚的**朝向**）。髋 yaw 范围 −0.36…+0.33 rad（正常）。
+- **现象 1，左脚抬一会机器人就收回：** 参考没有收回。你每次抬左脚，人脚保持的时间和参考保持的时间几乎相同（第一次长抬 7.36 s vs 6.84 s；1.80 vs 1.74；1.34 vs 1.28；1.40 vs 1.38 …），峰值高度参考略低（33 → 30 cm）。所以收脚发生在**策略执行**这一层（策略站不住单脚就把脚放下），不是重定向。要靠重放得到执行数据才能确认和量化。
+- **现象 2，向正前方迈左脚 40 cm 却向左前方：** 脚权重对步的方向**没有影响**（权重 0 / 2 / 5 / 8 / 12 的结果一样）。录制里 40 cm 的大步，左脚：人的方向 +11° / +6°（人脚本身已经偏左 7.8 / 4.7 cm），参考 +13° / **+21°**（第二步侧向 17.3 cm，人只有 4.7 cm）；右脚：人 +25…+28°（跨向左边 18–23 cm），参考只有 +6…+8°（侧向被压缩，横向增益约 0.5 / 0.73）。这些大步里参考的脚还比人脚高 12–15 cm（人 2.6–5.7 cm，参考 15.8–17.9 cm）：重定向把骨盆固定在恒定高度，长步幅时人的骨盆会下降，机器人的 IK 只好把脚抬高并向外摆。**试过降低骨盆位置权重（100 → 30 / 10 / 3）：与离线参考的腿误差从 0.145 反而升到 0.164 / 0.173 / 0.182，所以不是修法，已撤销。**
+- **现象 3，向前走时脚底打滑：** 仿真的摩擦系数不低（脚的碰撞体 1.5，地面默认 1，接触取较大者）。打分表里的 p90（这次重放 `rb0` 是 24.7 cm）把“脚一直没离地”的十几秒粘成一次站立：短于 1 秒的单脚支撑，滑动中位数 1.0 cm、p90 2.3 cm；长于 4 秒的那些占了总滑动路程的 77%。真正看得见的是 36 个 1 秒窗口，脚离地不到 2 cm、水平净位移 ≥ 8 cm。其中 8 次是另一只人脚抬着（支撑脚不该动）：支撑脚平均滑 15.5 cm，参考脚在同一秒也移了 15.2 cm，参考离地只有 0.8 cm，方向主要向后。另外 21 次两只人脚的高度差不到 4 cm（录制 90–120 s 的走路，人脚自己几乎没有离地）：脚在地上挪 8–51 cm，参考脚挪得一样多甚至更多，参考离地平均 4.6 cm。所以长尾是参考把步子贴在地面上发出去，策略跟着滑，不是摩擦没托住一只本来该钉住的脚。
+
+### 仿真里“静止时躯干一直左右轻微晃”（2026-10-18，用户报告）
+
+用用户自己那次回放的仿真日志（`sim_leg1r.csv`，664 s）逐 10 s 窗口测的骨盆 / 躯干（FK）左右倾角：
+
+| 阶段 | 骨盆 roll 标准差 | 躯干 roll 标准差 / 峰峰 | 腰 roll 关节标准差 | 0.5–2.5 Hz 占方差 |
+|---|---|---|---|---|
+| PD 站立（无策略，t 40–400 s） | 0.000–0.003° | 0.000–0.003° / 0.01° | 0.000° | — |
+| 策略站立，参考恒定（t 450–660 s，手臂几乎不动 <0.03 rad） | **0.06–0.08°** | **0.53–0.60° / 约 2°** | **0.52–0.57°** | **0.92–0.99** |
+
+- **PD 站立纹丝不动，策略一接管就开始晃，而且是单一频率（约 1.1 Hz）、幅度稳定、持续 200 s 以上。** 晃的是**腰 roll 关节本身**（骨盆几乎不动），所以看起来是“躯干左右摇”。
+- 此时参考是恒定的（腰 roll 参考标准差 0.000°），策略输出的腰 roll 指令却在 ±5°（标准差 2.9°，峰峰 11°）、1.04–1.16 Hz 摆动，腰关节只跟出 ±1°（腰 roll Kp 50 / Kd 2 / 动作尺度 0.23，摩擦损耗 0.69 N·m）。→ **策略自己的闭环极限环**，不是参考噪声、不是重定向、不是脚。
+- 真机上同一件事也在：腰 pitch 指令标准差 2.3° 在 1.05 Hz，实测只有 0.39°；原始动作的主频也是 1.05 Hz（`real_run1`）。仿真和真机一致，说明不是仿真的问题。
+- **可以做但没做的（都需要改部署、重编译）：** ① 对腰 roll（和 pitch）指令做低通（约 0.5 Hz 截止，会给操作者的躯干倾斜带来约 0.3 s 的滞后）；② 腰 roll 的 Kd 加倍（偏离训练的增益）；③ 训练侧加动作变化率惩罚（根治，在训练你的 SMPL 编码器时一起做）。幅度只有约 ±1°，也可以接受不处理。
+
+**是不是训练 / 部署的 Kp、Kd 不一致？（2026-10-18）** 不是：
+
+- 部署策略路径的增益 = 训练增益。`a3_policy_parameters.hpp` 的 `a3_024_kps/kds`（腰 85/50/50 Kp、3/2/2 Kd，踝 60/1.2，其余同 `a3.py`）= Litchi 的 `a3.py`；发布的 035 checkpoint 的 `config.yaml` 写 `robot: type: a3_024`。`docs/robot_parameters/A3_Ultra` 的厂家表是另一张表（髋 200/7、膝 360/13、踝 80/3、腰 roll/pitch 80/3、腰 yaw 200/7、肩 90/4…，比训练表高 1.3–2.5 倍），部署没有用它。
+- PD 站立（`y`）用的是**另一张**更硬的表（`a3_pd_stand_kps/kds`，腰 400/500/500、Kd 4，腿 1500/400/300/2000/500/500），不是策略增益。PD 站立纹丝不动、策略接管才晃，所以问题出在策略阶段，不是这张表。
+- 动作尺度 `0.25 × effort / Kp` 是策略合同的一部分：把增益换成另一张表而不重训，等于同一个动作输出换了 1.3–2.5 倍的力矩幅度。
+
+仿真里把“换表”做成实验（`A3_SIM_GAINS_JSON`，只替换策略阶段的增益，动作尺度不变；静止、策略站立、51 s 窗口；单次运行，重复一次的差别约 10%）：
+
+| 情形 | 躯干 roll 标准差 / 峰峰 | 躯干 pitch 标准差 | 腰 roll 指令标准差 |
+|---|---|---|---|
+| 基线（训练增益） | 0.245° / 1.22° | 0.456° | 0.89° |
+| 对照：覆盖成同样的训练增益（证明开关本身是空操作） | 0.270° / 1.15° | 0.485° | 0.96° |
+| 厂家表，全部关节 | **0.120° / 0.45°** | 0.317° | 0.42° |
+| 厂家表，只换腰 | 0.172° / 0.66° | 0.526°（没变） | 0.45° |
+| 关节摩擦损耗 ×0.2（`A3_SIM_FRICTION_SCALE`） | 0.062° / 0.31° | 0.095° | 0.33° |
+| 关节摩擦损耗 ×0 | 0.071° / 0.25° | 0.019° | — |
+
+- 换成厂家表后站立是稳的，躯干 roll 幅度约减半；摩擦调小效果更大。两条线指向同一个机制：幅度大致由“关节摩擦 / Kp”决定的粘滑极限环（**这是和数据吻合的解释，没有单独证实**）。
+- **不建议因此改真机增益：** ① 只测了静止站立，走路 / 抬脚没测；② 增益高 1.3–2.5 倍而策略和动作尺度不变，真机上没有验证过；③ 改它要改 `a3_024_kps/kds` 并重编译，PD 站立的表不动。要验证应先在仿真里用同样的开关放一遍重放的走路动作，看跟踪和摔倒。
+- 仿真关节摩擦 `frictionloss`（N·m，腰 roll 0.69、踝 pitch 1.4、膝 2.43）和训练里 PhysX 的摩擦系数（无量纲，随机化 ×[1,3]）单位不同，不能直接比大小；所以“仿真摩擦偏大”只是怀疑，没有量。
+- **一个我自己犯的错：** 第一次做这个实验时，覆盖把 PD 站立阶段的增益也替换了（腰 400/500/500 → 厂家 200/80/80，或训练的 85/50/50），机器人在松开吊带后几秒内摔倒，我据此以为“厂家表会让机器人站不住”。用“覆盖成训练增益”做对照时同样摔倒，才发现是 PD 站立被改弱了。现在的开关只替换 Kp 等于该关节策略 Kp 的指令（JSON 第三个数字），对照实验与基线一致，才有上面的表。
+
+仿真里的实验开关（默认全关，只在 `a3_sim.py` 里生效）：
+
+| 环境变量 | 作用 |
+|---|---|
+| `A3_SIM_FRICTION_SCALE=0.2` | 所有受驱动关节的 `frictionloss` 乘该系数 |
+| `A3_SIM_DAMPING_SCALE=…` | 同上，对 `damping` |
+| `A3_SIM_GAINS_JSON=文件` | `{"waist_roll_joint": [kp, kd, 策略kp]}`：替换部署发来的 Kp / Kd；第三个数字存在时只替换 Kp 等于它的指令（即只改策略阶段，不碰 PD 站立） |
+
+### 换增益对“走路”有没有用？整段重放 `pico_leg1_slim.pkl`（2026-10-18）
+
+同一段录制（136 s 跟随，按帧编号重放，见 `mujoco_pico_record_replay.md` 5b），只改仿真里策略阶段的增益（`A3_SIM_GAINS_JSON`，动作尺度不变）。7 次运行都没有摔倒（最低骨盆高度 0.98–1.02 m）：
+
+| 设置 | 脚位置残差 L / R | 躯干 roll 标准差 | 基座角速度峰值 | 打滑 p90 / 打滑 >3 cm 的占比 |
+|---|---|---|---|---|
+| 训练增益（`rb0`、`rb1`、`rb2`，三次） | 6.7/6.8、6.5/6.7、6.5/6.7 cm | 3.55°、3.56°、3.54° | 2.08、1.95、2.02 rad/s | 18.6、12.9、25.6 cm / 33、28、32% |
+| 腿增益 ×0.8（Kp、Kd 同乘） | 7.3 / 6.9 | **2.97°** | 1.76 | 34.2 cm / 45% |
+| 腿增益 ×1.25 | 6.6 / 6.9 | 4.22° | 2.91 | 12.1 cm / 33% |
+| 厂家表，只换腿 | 7.7 / 7.0 | 4.42° | 3.62 | 20.4 cm / 45% |
+| 厂家表，全部关节 | 7.9 / 7.5 | 4.94° | 3.29 | 12.2 cm / 31% |
+
+- **没有任何一组增益比训练增益跟得更好。** 腿更硬 → 躯干 roll 摆动和基座角速度峰值单调变大（噪声只有 0.01°，所以这个趋势是真的），脚的残差没变好；更软 → roll 摆动小一点（2.97°），但脚残差略差。打滑 p90 在三次相同设置的重复里就有 12.9–25.6 cm 的散布，所以 ×0.8 的 34.2 cm 看不出和基线的区别；打滑 >3 cm 的占比（基线 28–33%，×0.8 和厂家只换腿 45%）有一点偏多的迹象，证据弱。→ **训练增益已经是这个策略的合适点，不建议改增益。** 静止站立时厂家表能把摆动减半（上一节），走路时反而更差，两件事不能互相代替。
+- **现象 1（抬着的脚被收回）不是增益问题，而是策略的行为：** 整段里有 20 次持续 ≥ 1 s 的抬脚；其中两次长时间保持（右脚 35.2 s 起 7.6 s，左脚 18.0 s 起 7.7 s）。右脚那次，参考抬高 21 cm 然后慢慢降到 10–14 cm，**策略在参考抬高还有约 14 cm 时（39.5 s）自己把脚放下**，之后 3 s 里参考一直在 10–12 cm 它也不再抬（髋 / 膝的指令直接跳到接近站立值）。左脚那次保持到参考降到约 10–14 cm 才落下。七种设置下这次保持的执行高度都是 9.6–11.8 cm（参考 15.1 cm，43–51% 的时间达到参考的一半以上），落脚时刻和高度几乎一样，说明它与增益无关。推测：训练数据里“低抬脚”是几百毫秒的迈步，持续几秒的 10–14 cm 抬脚在分布之外，策略把它当作“该落地了”（**只是推测，没有对照实验**）。
+- **我试过的一个解释被证伪了：** “参考的重心不在支撑脚上方，所以策略放脚”。我在“骨盆直立”的假设下算了参考的重心到支撑脚的距离：失败的右脚抬起时是 11–15 cm，但成功保持了 6 s 的左脚抬起时反而是 19–25 cm。身体侧倾的整体姿态下“骨盆直立”的假设不成立，这个量没有信息。
+- **抬脚高度 ×1.3 试过了，不采用。** 重定向新增 `A3_FOOT_LIFT_SCALE`（默认 1，只放大离地那只脚高出支撑脚的部分）。同一段录制重放（`lift13`，没摔倒，骨盆最低 1.00 m）：脚残差 6.9 / 6.9 cm（基线三次 6.5–6.8），躯干 roll 标准差仍是 3.58°。右脚那次 7.6 s 保持，参考峰值 21.7 → 28.8 cm，执行峰值 22 → 33 cm，脚确实抬得更高；但放下的时刻只晚了约 1 s。基线在参考降到 13.8 cm 时执行已经是 4.7 cm；×1.3 在参考 18.4 cm 时执行还有 15.9 cm，参考降到 16.0 cm 时执行落到 6.3 cm。放下点大约是**这一次抬脚峰值的 60%**，不是一条固定的 14 cm 线，所以把整段抬脚放大并不能让后半段留在阈值上面。默认仍是 1。
+- **`leg2`（2026-10-17，另一次真人录制，不是上面那段）：** 摆臂时腿不动、肘相关 0.98；向前约 3.4 m 再走回，航向和路线一致，短支撑脚滑动中位数约 1 cm；五次抬脚（参考 22–36 cm）执行到 20–31 cm 并保持 1.3–1.9 s；下蹲两次，骨盆降到 0.74 m / 0.72 m 后站回。没有改默认值。
+
+### 用重放把这三个现象在仿真里复现（不需要你再做动作）
+
+先关掉旧的终端（你上一次的部署终端还开着，占着 5560 端口），然后：
+
+```bash
+cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+ls dump_sim_leg1r.bin sim_leg1r.csv leg1r_cmd leg1r_go 2>&1 | head -4          # 都应当是“没有那个文件”
+.venv_teleop/bin/python gear_sonic_deploy/scripts/a3_make_dump_cfg.py --dump "$PWD/dump_sim_leg1r.bin"
+
+# 终端 1 — MuJoCo
+source .venv_teleop/bin/activate
+A3_SIM_LOG_CSV="$PWD/sim_leg1r.csv" python gear_sonic/scripts/run_sim_loop.py --robot a3_ultra
+
+# 终端 2 — 部署（等终端 1 就绪）
+cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl/gear_sonic_deploy"
+source scripts/setup_env.sh
+A3_RUNTIME_CFG="$PWD/dist/a3_deploy_x86_64/config/a3_runtime_config.dump.yaml" ./deploy.sh --robot a3_ultra --input-type zmq_manager sim --encoder a3-fast
+
+# 终端 3 — 重放（先等待，不发姿态）
+cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+.venv_teleop/bin/python gear_sonic_deploy/scripts/a3_pose_replay_raw.py pico_leg1_slim.pkl --no-commands --command-fifo "$PWD/leg1r_cmd" --wait-for "$PWD/leg1r_go"
+```
+然后在**终端 4**（或任何一个终端）按顺序：
+```bash
+cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+echo y > leg1r_cmd        # PD 站立；等终端 2 打印 Init Done，立刻在终端 1 的窗口按 9，再等 5 秒
+echo x > leg1r_cmd        # 进跟随（此时还没有姿态流，部署用站立参考）
+touch leg1r_go            # 开始重放你的 140 s 动作；之后什么都不用做
+```
+140 s 后依次 Ctrl-C 终端 3、2、1。分析：
+```bash
+.venv_teleop/bin/python gear_sonic_deploy/scripts/a3_analyze_teleop_run.py dump_sim_leg1r.bin | tee analysis_sim_leg1r.txt
+```
+把 `analysis_sim_leg1r.txt` 发给我，`dump_sim_leg1r.bin` 和 `sim_leg1r.csv` 我会直接读（对到每一次抬脚、每一步）。
 
 ## 6. 常见问题
 
@@ -358,7 +546,7 @@ python gear_sonic/scripts/pico_manager_thread_server.py --robot a3_ultra --manag
 - 真机和仿真的 Pico 流程一样：部署程序以 **IDLE** 启动、不发指令，A+B+X+Y 让机器人硬起来。只有不带 `--input-type zmq_manager` 的脚本化仿真运行才会自动 PD 站立（`--auto-pd-stand`）。
 - 机器人侧要用 `--zmq-host <操作端PC的IP>`，否则收不到手柄的 A+B+X+Y。
 - 仿真里松绳是在 MuJoCo 窗口按 `9`；真机是缓慢放下吊带。
-- **部署进程放在本机、机器人上只跑中继**的路线见 [pico_real_teleop.md](pico_real_teleop.md) 第 4.6 节；MDU 上要用的 aarch64 包需要 Docker 交叉编译，sysroot 和 aarch64 ONNX Runtime 已下载，Docker 还没装（0.2 节有命令）。厂商还没同意在机器人上运行会发布关节指令的程序（见 `real_mdu_body_drive.md`），在那之前中继只用于仿真。
+- **部署进程放在本机、机器人上只跑中继**的路线见 [pico_real_teleop.md](pico_real_teleop.md) 第 4.6 节；MDU 上要用的 aarch64 包已构建在 `gear_sonic_deploy/dist/a3_deploy_rockchip/`（见 0.2 节），没有在 MDU 上运行过。厂商还没同意在机器人上运行会发布关节指令的程序（见 `real_mdu_body_drive.md`），在那之前中继只用于仿真。
 
 ---
 

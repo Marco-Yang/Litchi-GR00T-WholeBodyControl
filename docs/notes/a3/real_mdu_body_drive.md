@@ -4,6 +4,10 @@
 
 **厂商已经回了一句（2026-10-16）：有一部分指令可以带 Kp/Kd，写进版本 3.3。** 这是软件版本，不是本文的某一节。当前公开接口文档是 v3.2，机器人上还没有这份更新。其余问题没回。在 3.3 的话题名、消息字段和升级方式写清楚之前，不要改机器人上的配置，也不要启动会发布关节指令的程序。
 
+**厂商第二次回复（2026-10-16，用户转述）：开放 `body_drive` 的前置条件是关闭他们的运控（运控指部署 policy，就是开源项目 `Litchi_sonic_for_a3` 的部署）；带 PD 入参的接口下周更新，但建立在运控之上。** 我们的解读：运控开着时不能写 `/body_drive`（本文 6.3 本来就是这么要求的）；这个 PD 入参接口是给运行中的运控传 PD 参数的入口，不是绕开运控写关节的通道，它能不能送「外部目标 + Kp/Kd」还不知道；怎么关、怎么恢复、开放是 iceoryx 还是 ROS 2、要不要重启主站、超时后的行为，仍没回答。依据和还要问的四条见 `docs/workflow/a3_integration_plan.md` 第 18.17 节。机器人上仍然什么都没动。
+
+**厂商第三次回复（2026-10-16，售后）和官方 `joint_demo`：**运控的模型**不可以替换**；`body_drive` 有两种访问方式——iceoryx 直接读写，或改为 ros2；官方关闭 / 重启运控的命令是 `curl -X POST http://127.0.0.1:50080/json/stop_app -d '{"app_name": "mc"}'`（重启把 `stop_app` 换成 `start_app`）；带 Kp/Kd 的手臂入口是 `/motion/control/pnc/arm_joint_command`（`joint_msgs::msg::JointCommand`，Kp 放 `stiffness`、Kd 放 `damping`，只有手臂，是给运行中的运控的）。随附的 `docs/robot_parameters/A3_Ultra/joint_demo.zip`（readme + 腿的收发例程 + 预编译 `joint_msgs`）说明**客户自己**在 MDU 的 `hal_ethercat` 配置里给话题添加 ros2 通信形式，再关 `mc`、用 `JointCommand`（best_effort、50 Hz）收发；它的 `joint_msgs` 与我们的逐字节相同。两处还对不上：关 `mc` 的地址售后写 `127.0.0.1:50080`、readme 写 `10.42.10.10:50080`；`hal_ethercat` 指令超时后的行为和“改完配置怎么生效”没有回答。机器人上仍然什么都没动。详见 `docs/workflow/a3_integration_plan.md` 第 18.18 节。
+
 真机操作步骤（吊带、急停、启动命令）见 [pico_real_teleop.md](pico_real_teleop.md)。仿真见 [mujoco_pico_sim_teleop.md](mujoco_pico_sim_teleop.md)。
 
 ---
@@ -257,6 +261,8 @@ Litchi 真机流程用 `taskset` 把策略绑到指定核，就是为了在这�
 
 **机器人链路**是部署程序和 `/body_drive/*` 之间的连接。现在有三条，都还没在这台真机上跑过。路线 C（ZMQ 中继）是 2026-10-16 加的，不依赖厂商改配置。
 
+**一个开关选路线（2026-10-16）**：`deploy.sh … --telecom iceoryx|ros2|zmq` 对应下面的 A / B / C（`deploy_a3.sh` 里解析，旧的 `--remote` = `ros2`、`--robot-link zmq` = `zmq` 仍可用）；B 和 C 用同一个部署二进制，只是机器人后端不同，所以可以都保留、到时候再选。选哪条的比较见 `docs/workflow/a3_integration_plan.md` 18.18，命令见 [pico_real_teleop.md](pico_real_teleop.md) 4.4。
+
 ### 路线 A：部署程序放在 MDU 上，继续用 iceoryx
 
 部署程序和 `hal_ethercat` 在同一块内存里，不需要厂商打开 ROS 2，也不需要改 `hal_ethercat`。需要的是一块 aarch64 包（Docker、Rockchip sysroot、aarch64 ONNX Runtime、RKNN 模型），以及按厂商认可的步骤关掉 `mc`。MDU 上没有仓库和 `deploy.sh`，只有包里的 `run_a3.sh`。
@@ -275,7 +281,7 @@ Litchi 真机流程用 `taskset` 把策略绑到指定核，就是为了在这�
 
 中继把「失联以后怎么办」放在机器人这一侧：本机进程退出、网线断或卡住时，中继在 60 ms 后重发最后一条指令，再 150 ms 后用 300 ms 过渡到纯阻尼并锁存，之后要重启部署进程才能重新接管（这是用户选定的「短时保持姿态再阻尼」）。中继还校验每一帧指令（有限数、增益上限、离实测姿态的距离、帧间步长、序号、单一会话），第一帧必须离实测姿态很近才放行。这回答了 3.4 里第 3 件事里「我们这一侧能做什么」的部分；`hal_ethercat` 自己在指令中断后的行为仍然要厂商回答。
 
-代价：机器人上多一个我们写的进程（登录 MDU、aarch64 包、Docker，这三件和路线 A 一样要做）；MDU 负载已经 10.4/8，中继不做推理，开销远小于完整部署，但没有实测过；它没有在真机上跑过，只在 MuJoCo 里验证。厂商 3.3 版若提供一条能带 Kp/Kd 的官方 ROS 2 指令入口，并且 SONIC 能用，它可以代替这个中继。
+代价：机器人上多一个我们写的进程（要登录 MDU、拷 aarch64 包；包和 Docker 已有，见 pico_real_teleop.md 0.2，还没在 MDU 上跑过）；MDU 负载已经 10.4/8，中继不做推理，开销远小于完整部署，但没有实测过；它没有在真机上跑过，只在 MuJoCo 里验证。厂商 3.3 版若提供一条能带 Kp/Kd 的官方 ROS 2 指令入口，并且 SONIC 能用，它可以代替这个中继。
 
 用法和限制见 [pico_real_teleop.md](pico_real_teleop.md) 第 4.6 节，设计和验证记录见 `docs/workflow/a3_integration_plan.md` 第 18.13 节。**中继也是会发布关节指令的程序，同样受 6.1 的「厂商答复前不启动」限制；`--listen-only` 不创建指令发布者，只转发状态，用来先确认链路。**
 
@@ -302,6 +308,8 @@ Litchi 真机流程用 `taskset` 把策略绑到指定核，就是为了在这�
 | 版本 3.3 提供一部分可带 Kp/Kd 的指令（2026-10-16 已如此回复，话题名未给） | 等 3.3 的接口说明或升级包。用他们写明的话题和字段。不在 v3.2 的机器上猜话题，也不自行打开 `enable_backends` |
 | 必须重启 `aimrt_main_hal`，或配置掉电不保留 | 重启只在悬空和厂商步骤下做。若掉电不保留，把「如何做成持久配置」问清楚再改，避免重启后主站回到旧配置、而开发机仍按新话题在发 |
 | 域 232 里谁都能发，或失联行为是保持最后一帧 / 直接掉使能 | 把这个行为写进操作步骤。物理急停仍然是第一手段。`mc` 未确认关掉之前不发指令 |
+| 厂商 2026-10-16 第三次回复（售后）+ `joint_demo`：官方关运控 / 重启命令（HTTP `stop_app` / `start_app`，`app_name: mc`）；客户自己给 `hal_ethercat` 配置加 ros2 通信形式；运控模型不可替换；`/motion/control/pnc/arm_joint_command` 只管手臂 | 路线 B 有了官方做法，但要你或智元的人在悬空 + 物理急停下改动力级配置；改完怎么生效、超时行为、`50080` 在哪台机器上仍未答复，这三件有答案之前不动。见 plan 18.18 |
+| 厂商 2026-10-16 第二次回复：开放 `body_drive` 的前提是关运控；PD 入参接口下周更新、建立在运控之上 | 前半是「必须先关运控」的确认；官方关法 / 恢复步骤仍没有。等下周的接口说明，不预先猜话题、不预先改 `sm_config`。见 plan 18.17 |
 | 关 `mc` 的步骤与 Litchi 一致，或他们给出了别的步骤 | 只按厂商确认的步骤做。做完用 `ps` 确认没有 `motion_control` / `mc`，再允许 SONIC 写 `/body_drive` |
 | 多一路 ROS 2 状态超出 MDU 预算 | 停止路线 B。若仍要上真机，回到路线 A：在 MDU 上跑 aarch64 包，走 iceoryx，并重新评估 10.4/8 的负载 |
 

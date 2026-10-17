@@ -236,6 +236,30 @@ class A3Simulator:
         for n, val in (config.get("JOINT_ARMATURE_IF_MISSING") or {}).items():
             if n in self.vadr and self.model.dof_armature[self.vadr[n]] == 0.0:
                 self.model.dof_armature[self.vadr[n]] = float(val)
+        # Plant study knobs (off by default): A3_SIM_FRICTION_SCALE / A3_SIM_DAMPING_SCALE scale the joint friction loss / viscous damping of every driven
+        # joint.  The vendor's T3D0 MJCF has several times the joint friction of the model the 035 policy was trained on (training: 0.10-0.25 N*m per joint;
+        # MJCF: waist roll 0.69, ankle pitch 1.4, hips 1.2, knee 2.4), which makes a low-gain joint hunt around its target (friction / Kp of a rad).
+        import os as _os
+
+        for _env, _arr in (("A3_SIM_FRICTION_SCALE", self.model.dof_frictionloss), ("A3_SIM_DAMPING_SCALE", self.model.dof_damping)):
+            _val = _os.environ.get(_env)
+            if _val:
+                for _n in self.vadr:
+                    _arr[self.vadr[_n]] *= float(_val)
+                print(f"[a3-sim] {_env}={_val}: joint {'friction loss' if 'FRICTION' in _env else 'damping'} of the {len(self.vadr)} driven joints scaled", flush=True)
+        # A3_SIM_GAINS_JSON=<file>: {"waist_roll_joint": [kp, kd, kp_policy], ...} replaces the Kp / Kd the deploy sends for those joints (the action scale of
+        # the policy is NOT changed): the exact experiment "what if the deploy used another gain table with the same policy". The optional third number
+        # limits the replacement to commands whose Kp equals it (the policy's Kp of that joint): the PD stand sends its own, much stiffer table, which
+        # must stay untouched or the robot cannot even stand (a replacement without it also replaces the PD stand gains).
+        self._gain_override: Dict[str, tuple] = {}
+        _gj = _os.environ.get("A3_SIM_GAINS_JSON")
+        if _gj:
+            import json as _json
+
+            for _n, _g in _json.load(open(_gj)).items():
+                if _n in self.actid:
+                    self._gain_override[_n] = (float(_g[0]), float(_g[1]), float(_g[2]) if len(_g) > 2 else None)
+            print(f"[a3-sim] A3_SIM_GAINS_JSON={_gj}: Kp/Kd overridden for {len(self._gain_override)} joints", flush=True)
         # Everything else that is actuated (fingers: position actuators) just holds its keyframe value.
         driven = set(self.actid.values())
         self.hold_act = [i for i in range(self.model.nu) if i not in driven]
@@ -334,6 +358,9 @@ class A3Simulator:
                 self.data.ctrl[aid] = 0.0
                 continue
             qd, dqd, tau_ff, kp, kd = c
+            ov = self._gain_override.get(n)
+            if ov is not None and (ov[2] is None or abs(kp - ov[2]) < 1e-3):  # A3_SIM_GAINS_JSON: replace the deploy's Kp / Kd of this joint (experiments only)
+                kp, kd = ov[0], ov[1]
             tau = tau_ff + kp * (qd - self.data.qpos[self.qadr[n]]) + kd * (
                 dqd - self.data.qvel[self.vadr[n]]
             )

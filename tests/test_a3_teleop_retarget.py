@@ -13,10 +13,14 @@ from gear_sonic.scripts import pico_pose_zmq_minimal as pm  # noqa: E402
 from gear_sonic.scripts.pico_pose_zmq_replay import frame_from_pose_aa, synthetic_clip  # noqa: E402
 from gear_sonic.utils.teleop.a3.frames import MJ29_JOINT_NAMES, pack_frame, unpack_frame  # noqa: E402
 from gear_sonic.utils.teleop.a3.retarget import (  # noqa: E402
+    LOWER_BODY_SLICE,
+    STAND_LOWER_BODY_Q,
     A3RealtimeRetargeter,
     A3RefStream,
     A3SmplPoseAugmenter,
+    pico_frame_to_human_data,
     pose_window_catch_up,
+    scale_foot_lift,
     unpack_pose_message,
 )
 
@@ -260,3 +264,76 @@ def test_smpl_pose_augmenter_restarts_after_a_very_short_session_too(fk):
     again = aug.augment(_window_msg(pose, fk, 0, index_start=0))  # re-enters: 0..4 again, arm down
     assert aug.catch_ups == 1
     assert abs(again["joint_pos"][-1][16] - first["joint_pos"][-1][16]) > 0.5  # not the cached (stale) solution
+
+
+def test_lower_body_stand_pins_only_the_legs_to_the_policy_stand_reference(fk):
+    pose, _ = synthetic_clip("wave", 30.0, seconds=2.0)
+    track = _solve(A3RealtimeRetargeter(lower_body="track"), pose[40], fk)
+    stand = _solve(A3RealtimeRetargeter(lower_body="stand"), pose[40], fk)
+    assert np.allclose(stand.q_mj29[LOWER_BODY_SLICE], STAND_LOWER_BODY_Q)
+    assert np.all(stand.dq_mj29[LOWER_BODY_SLICE] == 0.0)
+    # arms and waist are still the operator's (same IK, same input)
+    assert np.allclose(stand.q_mj29[:17], track.q_mj29[:17], atol=1e-6)
+    # the tracked legs of a plainly standing person are NOT the stand reference (the ankle rolls sit at the limit: see a3_ref_monitor)
+    assert np.max(np.abs(track.q_mj29[LOWER_BODY_SLICE] - STAND_LOWER_BODY_Q)) > 0.2
+
+
+def test_lower_body_rejects_an_unknown_mode():
+    with pytest.raises(ValueError):
+        A3RealtimeRetargeter(lower_body="walk")
+
+
+def test_foot_lift_scale_raises_only_the_lifted_foot():
+    def hd(zl, zr):
+        quat = np.array([1.0, 0.0, 0.0, 0.0])
+        return {
+            "pelvis": (np.array([0.0, 0.0, 0.9]), quat.copy()),
+            "left_foot": (np.array([0.1, 0.1, zl]), quat.copy()),
+            "right_foot": (np.array([0.1, -0.1, zr]), quat.copy()),
+        }
+
+    planted = scale_foot_lift(hd(0.05, 0.05), 1.3)
+    assert planted["left_foot"][0][2] == pytest.approx(0.05)
+    assert planted["right_foot"][0][2] == pytest.approx(0.05)
+    lifted = scale_foot_lift(hd(0.05, 0.20), 1.3)
+    assert lifted["left_foot"][0][2] == pytest.approx(0.05)
+    assert lifted["right_foot"][0][2] == pytest.approx(0.05 + 1.3 * 0.15)
+    assert np.allclose(lifted["right_foot"][0][:2], [0.1, -0.1])
+    assert scale_foot_lift(hd(0.05, 0.20), 1.0)["right_foot"][0][2] == pytest.approx(0.20)
+    with pytest.raises(ValueError):
+        scale_foot_lift(hd(0.05, 0.20), 0.0)
+
+
+def _ankle_z_above_pelvis(retargeter, frame):
+    import mujoco as mj
+
+    model = retargeter.gmr.model
+    data = mj.MjData(model)
+    data.qpos[:] = model.qpos0
+    data.qpos[retargeter._qpos_adr] = frame.q_mj29
+    mj.mj_kinematics(model, data)
+    ids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, n) for n in ("pelvis_link", "left_ankle_roll_Link", "right_ankle_roll_Link")]
+    z = data.xpos[ids, 2]
+    return float(z[1] - z[0]), float(z[2] - z[0])
+
+
+def test_foot_lift_scale_reaches_the_robot_foot(fk):
+    """A 1.3 scale on a raised human foot must raise the robot foot target, and leave the planted foot put."""
+    pose, _ = synthetic_clip("stand", 30.0, seconds=1.0)
+    sp, sj, bq = frame_from_pose_aa(pose[0], fk)
+    human = pico_frame_to_human_data(sp, bq, sj)
+    raised = human["right_foot"][0] + np.array([0.0, 0.0, 0.12])
+    human["right_foot"] = (raised, human["right_foot"][1])
+
+    def height(scale):
+        rt = A3RealtimeRetargeter(foot_lift_scale=scale, foot_rot_weight=8)
+        frame = None
+        for i in range(12):
+            copied = {k: (np.array(v[0], copy=True), np.array(v[1], copy=True)) for k, v in human.items()}
+            frame = rt.retarget_human_data(copied, i / 50.0, i)
+        return _ankle_z_above_pelvis(rt, frame)
+
+    left1, right1 = height(1.0)
+    left13, right13 = height(1.3)
+    assert right13 > right1 + 0.02
+    assert abs(left13 - left1) < 0.03

@@ -74,7 +74,8 @@ def _register_robot(robot: str) -> str:
     if "mjcf" in spec:
         from general_motion_retargeting import params
         params.ROBOT_XML_DICT[spec["gmr"]] = spec["mjcf"]
-        params.IK_CONFIG_DICT["bvh_nokov"][spec["gmr"]] = spec["ik_config"]
+        # A3_RETARGET_IK_CONFIG (set by --ik_config, inherited by the workers) replaces the IK table of the A3
+        params.IK_CONFIG_DICT["bvh_nokov"][spec["gmr"]] = Path(os.environ.get("A3_RETARGET_IK_CONFIG") or spec["ik_config"])
         params.ROBOT_BASE_DICT[spec["gmr"]] = "pelvis_link"
         params.VIEWER_CAM_DISTANCE_DICT[spec["gmr"]] = 2.5
     return spec["gmr"]
@@ -687,6 +688,9 @@ def main():
     parser.add_argument("--keep_heading", action="store_true",
                         help="turn each clip back to its original capture heading after the IK (the frame of the SMPL "
                              "data and of the G1 library); default: every clip faces +X at frame 0")
+    parser.add_argument("--ik_config", default=None,
+                        help="IK table (GMR bvh_nokov json) to use instead of gmr_ik_configs/bvh_nokov_to_a3.json; --robot a3 only "
+                             "(e.g. a candidate from calibrate_a3_lr_symmetry.py while it is validated on a subset)")
     parser.add_argument("--fps", type=int, default=30, help="Target FPS (default 30)")
     parser.add_argument("--no_skip", action="store_true",
                         help="Re-convert clips whose output pkl already exists")
@@ -694,6 +698,10 @@ def main():
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 4),
                         help="Parallel worker processes (default: CPU count - 4)")
     args = parser.parse_args()
+    if args.ik_config:
+        if "ik_config" not in ROBOTS[args.robot]:
+            parser.error("--ik_config applies to --robot a3 only (a3_ultra uses the table in the GMR checkout)")
+        os.environ["A3_RETARGET_IK_CONFIG"] = str(Path(args.ik_config).resolve())
 
     skip = not args.no_skip
     out_dir = Path(args.output)

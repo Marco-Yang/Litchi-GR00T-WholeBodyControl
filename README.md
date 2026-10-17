@@ -404,7 +404,7 @@ gear_sonic_deploy/deploy.sh --robot a3_ultra sim             # terminal 2: uncha
 ```
 
 For the real robot see `docs/notes/a3/pico_real_teleop.md` (IDLE start, two machines, preflight / probe, emergency stop; not yet run on hardware).
-To run SONIC on the operator PC instead of the MDU (no ROS 2 on the robot link): `./deploy.sh … real --teleop-input zmq --robot-link zmq --relay-host <MDU>` talks to `a3_zmq_relay` on the MDU (guard + hold-then-damp failsafe; guide section 4.6; verified in MuJoCo only).
+To run SONIC on the operator PC instead of the MDU (no ROS 2 on the robot link): `./deploy.sh … real --teleop-input zmq --telecom zmq --relay-host <MDU>` talks to `a3_zmq_relay` on the MDU (guard + hold-then-damp failsafe; guide section 4.6; verified in MuJoCo only). One switch picks how the deploy reaches the robot: `--telecom iceoryx` (on the MDU), `ros2` (this PC over ROS 2, needs the robot's body-drive ROS 2 backend), `zmq` (this PC through the relay); `--remote` / `--robot-link zmq` remain as older spellings (guide section 4.4).
 See `docs/notes/a3/mujoco_pico_sim_teleop.md` for the full A3 / A3 Ultra MuJoCo + Pico tutorial (three terminals; `docs/notes/g1/mujoco_pico_sim_teleop.md` section 8 is the short version) and
 `docs/workflow/a3_integration_plan.md` section 14 for what was and was not verified on A3 Ultra.
 

@@ -94,6 +94,15 @@ def main() -> None:
     ap.add_argument("--dq-lowpass", type=float, default=0.5)
     ap.add_argument("--pelvis-rot-weight", type=float, default=50.0,
                     help="IK pelvis orientation cost (GMR stock 10/5 tilts the pelvis ~40 deg); <=0 keeps GMR stock")
+    ap.add_argument("--lower-body", choices=["track", "stand"], default="track",
+                    help="track: legs follow the operator (default); stand: legs fixed to the policy-stand reference "
+                         "(no leg jump on the A+X switch, arms/waist still follow the operator)")
+    ap.add_argument("--foot-rot-weight", type=float, default=None,
+                    help="IK rotation weight of the ankle-roll links (the foot orientation); default: GMR's table value (0 = unconstrained)")
+    ap.add_argument("--ankle-knee-rot-weight", type=float, default=None,
+                    help="IK rotation weight of the ankle-pitch links, which the stock table ties to the human KNEE orientation (10 / 5); 0 switches it off")
+    ap.add_argument("--foot-lift-scale", type=float, default=1.0,
+                    help="multiply each foot's height above the lower foot before IK (1 = unchanged)")
     ap.add_argument("--report-interval", type=float, default=5.0)
     ap.add_argument("--track-head", action="store_true",
                     help="also send the IK's head joint angles (default: off -- the head stays at its default pose)")
@@ -108,6 +117,10 @@ def main() -> None:
         dq_lowpass=args.dq_lowpass,
         pelvis_rot_weight=args.pelvis_rot_weight if args.pelvis_rot_weight > 0 else None,
         track_head=args.track_head,
+        lower_body=args.lower_body,
+        foot_rot_weight=args.foot_rot_weight,
+        ankle_knee_rot_weight=args.ankle_knee_rot_weight,
+        foot_lift_scale=args.foot_lift_scale,
     )
     ctx = zmq.Context()
     sub = ctx.socket(zmq.SUB)

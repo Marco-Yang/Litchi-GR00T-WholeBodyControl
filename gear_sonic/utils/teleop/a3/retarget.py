@@ -66,6 +66,44 @@ NUM_BODY_JOINTS = len(SMPL_BODY_JOINT_NAMES)
 DEFAULT_HUMAN_HEIGHT_M = 2.18
 DEFAULT_PELVIS_HEIGHT_M = 0.9
 
+# Lower-body joints in the mj29 order (left leg 17..22, right leg 23..28).
+LOWER_BODY_SLICE = slice(17, 29)
+# Leg angles of the deploy's "policy stand" reference: the mean of teleop_motions/BMD_0319_a3_filtered_20260319_164305__stand_Skeleton0.csv
+# (rad, left hip pitch/roll/yaw, knee, ankle pitch/roll, then right).  ``lower_body="stand"`` sends exactly these for the legs, so that
+# following the operator and the policy stand (second A+X) use the same lower-body reference and the A+X switch has no leg jump.
+# Why: the realtime GMR table (smplx_to_a3_ultra.json) gives the feet rotation weight 0, so a plainly standing person comes out with
+# the ankle rolls at the joint limit (+0.348 / -0.347 rad) where the stand reference has +0.007 / -0.054 (2026-10-17, a3_ref_monitor.py).
+STAND_LOWER_BODY_Q = np.array(
+    [-0.0311, -0.0066, 0.0557, 0.1446, -0.0925, 0.0066, -0.0331, 0.0420, -0.1751, 0.1192, -0.0760, -0.0543],
+    dtype=np.float64,
+)
+LOWER_BODY_MODES = ("track", "stand")
+# SMPL bodies whose position is the IK target of the robot foot (smplx_to_a3_ultra.json, weight 100).
+_FOOT_BODIES = ("left_foot", "right_foot")
+
+
+def scale_foot_lift(human_data: dict, scale: float) -> dict:
+    """Multiply each foot's height above the lower foot by ``scale``.
+
+    ``1`` leaves the targets unchanged.  Only the vertical part above the lower foot moves, so a two-footed stance
+    stays put and the foot's horizontal target does not.  The pelvis and the knees are not moved: the foot position
+    weight (100) is what sets the reference lift the policy is asked to track.
+    """
+    if scale == 1.0:
+        return human_data
+    if scale <= 0.0:
+        raise ValueError(f"foot_lift_scale must be positive, got {scale}")
+    if any(name not in human_data for name in _FOOT_BODIES):
+        return human_data
+    ground = min(float(human_data[name][0][2]) for name in _FOOT_BODIES)
+    out = {}
+    for name, (pos, quat) in human_data.items():
+        pos = np.array(pos, dtype=np.float64, copy=True)
+        if name in _FOOT_BODIES:
+            pos[2] = ground + scale * (float(pos[2]) - ground)
+        out[name] = (pos, quat)
+    return out
+
 
 def pico_frame_to_human_data(
     smpl_pose: np.ndarray,
@@ -114,7 +152,17 @@ class A3RealtimeRetargeter:
         verbose: bool = False,
         pelvis_rot_weight: float | None = 50.0,
         track_head: bool = False,
+        lower_body: str = "track",
+        foot_rot_weight: float | None = None,
+        ankle_knee_rot_weight: float | None = None,
+        foot_lift_scale: float = 1.0,
     ) -> None:
+        if lower_body not in LOWER_BODY_MODES:
+            raise ValueError(f"lower_body must be one of {LOWER_BODY_MODES}, got {lower_body!r}")
+        if foot_lift_scale <= 0.0:
+            raise ValueError(f"foot_lift_scale must be positive, got {foot_lift_scale}")
+        self.lower_body = lower_body
+        self.foot_lift_scale = float(foot_lift_scale)
         import mujoco as mj
         from general_motion_retargeting import GeneralMotionRetargeting as GMR
 
@@ -137,6 +185,18 @@ class A3RealtimeRetargeter:
                 for task in tasks:
                     if task.frame_name == "pelvis_link":
                         task.cost[3:] = float(pelvis_rot_weight)
+
+        # Foot rotation: the stock smplx->A3 Ultra table gives the ankle-roll links position weight 100 and rotation weight 0, so nothing
+        # constrains the foot orientation; the ankle pitch links instead follow the human KNEE orientation (weight 10 / 5).  A standing person
+        # then comes out with the ankle roll at its limit (+0.348 / -0.347 rad).  ``foot_rot_weight`` gives the ankle-roll links a rotation
+        # weight (they follow the human foot orientation), ``ankle_knee_rot_weight`` overrides the ankle-pitch-vs-knee rotation weight
+        # (0 switches it off).  None keeps the stock value.
+        for tasks in (self.gmr.tasks1, self.gmr.tasks2):
+            for task in tasks:
+                if foot_rot_weight is not None and task.frame_name in ("left_ankle_roll_Link", "right_ankle_roll_Link"):
+                    task.cost[3:] = float(foot_rot_weight)
+                if ankle_knee_rot_weight is not None and task.frame_name in ("left_ankle_pitch_Link", "right_ankle_pitch_Link"):
+                    task.cost[3:] = float(ankle_knee_rot_weight)
 
         model = self.gmr.model
         self._qpos_adr = np.array(
@@ -167,10 +227,13 @@ class A3RealtimeRetargeter:
 
     def retarget_human_data(self, human_data, t_seconds: float, stamp_ns: int) -> A3TeleopFrame:
         t0 = time.perf_counter()
-        qpos = self.gmr.retarget(human_data)
+        qpos = self.gmr.retarget(scale_foot_lift(human_data, self.foot_lift_scale))
         self.last_solve_ms = (time.perf_counter() - t0) * 1e3
 
         q = np.asarray(qpos[self._qpos_adr], dtype=np.float64)
+        if self.lower_body == "stand":
+            q = q.copy()
+            q[LOWER_BODY_SLICE] = STAND_LOWER_BODY_Q
         if self._q_alpha > 0.0 and self._prev_q is not None:
             q = self._q_alpha * self._prev_q + (1.0 - self._q_alpha) * q
         if self._prev_q is not None and self._prev_t is not None and t_seconds > self._prev_t:

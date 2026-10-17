@@ -20,6 +20,10 @@
 #          ROS_LOCALHOST_ONLY is not 1, because /ta/whole_body_command must reach the robot's AimRT.  Nothing else may publish that
 #          topic meanwhile (the vendor's own TA / teleop stack).  deploy.sh passes it for `real`.
 # Environment: A3_RETARGET_PYTHON (python with mujoco + mink + GMR + pyzmq, default: conda env gmr).
+#   A3_FOOT_ROT_WEIGHT=<w> (default 8; 0 = GMR's stock table) / A3_ANKLE_KNEE_ROT_WEIGHT=<w> (unset = stock): IK rotation weights of the foot / ankle-pitch links.
+#     The stock table leaves the foot orientation unconstrained, so the ankle roll of a plainly standing person drifts to its joint limit within ~3 s (2026-10-17).
+#   A3_LOWER_BODY=stand|track (default track): stand fixes the legs of the a3_ref stream to the policy-stand reference (a3-fast / g1).
+#   A3_FOOT_LIFT_SCALE=<s> (default 1): multiply each foot's height above the lower foot before IK.  Unset leaves the targets unchanged.
 #   a3-fast / g1 additionally need the ROS2 environment of the robot's network, because a3_ta_bridge publishes
 #   /ta/whole_body_command over ROS2: set ROS_DOMAIN_ID (and ROS_LOCALHOST_ONLY=0 across machines) like the robot, and
 #   either source ROS2 or point A3_ROS_PREFIX at a prefix whose lib/ has the ROS2 libraries (default: conda env
@@ -49,6 +53,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 case "${ENCODER}" in a3-fast|a3_fast|g1|smpl) ;; *) echo "--encoder must be a3-fast, g1 or smpl" >&2; exit 2 ;; esac
+FOOT_ROT_WEIGHT="${A3_FOOT_ROT_WEIGHT-8}"   # unset -> 8; set to empty or 0 to keep GMR's stock table (an empty value passes no option)
 
 if [[ "${REAL}" == "1" && "${ENCODER}" != "smpl" && "${NO_BRIDGE}" != "1" ]]; then
   if [[ -z "${ROS_DOMAIN_ID:-}" || "${ROS_DOMAIN_ID}" == "0" ]]; then
@@ -90,8 +95,11 @@ if [[ "${ENCODER}" == "smpl" ]]; then
   CHILDREN+=("$!")
 else
   echo "[a3-chain] encoder=${ENCODER}: Pico tcp://${PICO_HOST}:${PICO_PORT} 'pose'  ->  A3 joint references :5560  ->  a3_ta_bridge  ->  /ta/whole_body_command"
+  # A3_LOWER_BODY=stand: legs fixed to the policy-stand reference (default track = legs follow the operator)
   PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" "${RETARGET_PY}" "${NODE}" --mode a3-ref \
-      --pico-host "${PICO_HOST}" --pico-port "${PICO_PORT}" --out-port 5560 </dev/null &
+      --pico-host "${PICO_HOST}" --pico-port "${PICO_PORT}" --out-port 5560 --lower-body "${A3_LOWER_BODY:-track}" \
+      ${FOOT_ROT_WEIGHT:+--foot-rot-weight "${FOOT_ROT_WEIGHT}"} ${A3_ANKLE_KNEE_ROT_WEIGHT:+--ankle-knee-rot-weight "${A3_ANKLE_KNEE_ROT_WEIGHT}"} \
+      ${A3_FOOT_LIFT_SCALE:+--foot-lift-scale "${A3_FOOT_LIFT_SCALE}"} </dev/null &
   CHILDREN+=("$!")
   sleep 1
   if [[ "${NO_BRIDGE}" == "1" ]]; then

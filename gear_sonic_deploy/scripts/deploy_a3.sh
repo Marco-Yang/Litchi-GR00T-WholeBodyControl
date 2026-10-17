@@ -4,13 +4,19 @@
 #
 #   scripts/deploy_a3.sh [--robot a3|a3_ultra] [sim|real] [--encoder a3-fast|smpl|g1] [--smpl-model PATH|stub]
 #                        [--input-type zmq_manager] [--zmq-host HOST] [--no-chain]
-#                        [--teleop-input ta|zmq] [--remote [--ros-iface-ip IP]] [--robot-link zmq --relay-host HOST [--relay-state-port N] [--relay-command-port N]]
+#                        [--teleop-input ta|zmq] [--telecom iceoryx|ros2|zmq] [--ros-iface-ip IP] [--relay-host HOST [--relay-state-port N] [--relay-command-port N]]
 #                        [--build-only] [--no-build] [--yes] [-- <a3_deploy_onnx_ref args>]
 #
 # 1. Makes sure the 035 ONNX/RKNN weights are present (download_from_hf.py --robot a3).
 # 2. Makes sure the deploy package dist/a3_deploy_<arch>/ exists (build_a3_deploy_pkg.sh).
 # 3. Runs the package launcher run_a3.sh  (AimRT: A3_TRANSPORT=iceoryx|ros2).
 #
+# --telecom iceoryx|ros2|zmq : HOW THE DEPLOY REACHES THE ROBOT'S body-drive (one switch for the three routes of docs/notes/a3/real_mdu_body_drive.md):
+#          iceoryx : route A - this process runs ON the MDU next to body-drive (the aarch64 package; real default, A3_TRANSPORT decides).
+#          ros2    : route B - this process runs on THIS PC and talks to body-drive over ROS 2 (needs the robot's body-drive ROS 2 backend and
+#                    the stock motion control stopped, see below; for 'sim' it is the MuJoCo simulator's transport and the default).
+#          zmq     : route C - this process runs on THIS PC and talks to a3_zmq_relay on the MDU (needs --relay-host; the relay owns the failsafe).
+#        Legacy spellings still work: --remote = --telecom ros2 (real), --robot-link zmq = --telecom zmq, --robot-link aimrt = the default.
 # --encoder  which encoder drives TELEOP (default a3-fast).  The deploy starts with that source selected and LOCKED
 #        (keys 1/2/3 cannot switch it), a source that is not available is a startup error, and the matching
 #        operator-side chain is started (scripts/a3_operator_chain.sh):
@@ -74,6 +80,7 @@ NO_CHAIN=0
 REMOTE=0
 ROS_IFACE_IP="${A3_ROS_IFACE_IP:-}"
 ROBOT_LINK="aimrt"
+TELECOM=""
 RELAY_HOST=""
 RELAY_STATE_PORT=""
 RELAY_COMMAND_PORT=""
@@ -100,6 +107,8 @@ while [[ $# -gt 0 ]]; do
     --no-chain)   NO_CHAIN=1; shift ;;
     --yes)        ASSUME_YES=1; shift ;;
     --remote)     REMOTE=1; shift ;;
+    --telecom)    TELECOM="$2"; shift 2 ;;
+    --telecom=*)  TELECOM="${1#--telecom=}"; shift ;;
     --ros-iface-ip) ROS_IFACE_IP="$2"; shift 2 ;;
     --robot-link) ROBOT_LINK="$2"; shift 2 ;;
     --robot-link=*) ROBOT_LINK="${1#--robot-link=}"; shift ;;
@@ -153,14 +162,35 @@ if [[ "${BUILD_ONLY}" == "1" ]]; then
   exit 0
 fi
 
-# --- 2b. encoder -------------------------------------------------------------
+# --- 2b. telecom: how the robot is reached ---------------------------------------
+# --telecom is the single switch; --remote and --robot-link zmq are its older spellings.  Below it is resolved into the two variables the rest
+# of the script (and the deploy binary) uses: ROBOT_LINK (aimrt | zmq) and REMOTE (1 = ROS 2 against the real robot).
 case "${ROBOT_LINK}" in aimrt|zmq) ;; *) echo "[a3] --robot-link must be aimrt or zmq (got '${ROBOT_LINK}')" >&2; exit 2 ;; esac
+case "${TELECOM}" in ""|iceoryx|ros2|zmq) ;; *) echo "[a3] --telecom must be iceoryx, ros2 or zmq (got '${TELECOM}')" >&2; exit 2 ;; esac
+LEGACY_TELECOM=""
+if [[ "${REMOTE}" == "1" ]]; then LEGACY_TELECOM="ros2"; fi
 if [[ "${ROBOT_LINK}" == "zmq" ]]; then
-  [[ -n "${RELAY_HOST}" ]] || { echo "[a3] --robot-link zmq needs --relay-host HOST (where a3_zmq_relay is bound, e.g. 10.42.10.12)" >&2; exit 2; }
-  [[ "${REMOTE}" != "1" ]] || { echo "[a3] --robot-link zmq and --remote (ROS 2) are two different ways to reach the robot; pick one" >&2; exit 2; }
+  [[ -z "${LEGACY_TELECOM}" ]] || { echo "[a3] --robot-link zmq and --remote (ROS 2) are two different ways to reach the robot; pick one (--telecom ros2|zmq)" >&2; exit 2; }
+  LEGACY_TELECOM="zmq"
 fi
 if [[ "${REMOTE}" == "1" && "${TARGET}" != "real" ]]; then
   echo "[a3] --remote is for the real robot ('real'); the simulator is already a remote ROS 2 peer" >&2; exit 2
+fi
+if [[ -n "${TELECOM}" && -n "${LEGACY_TELECOM}" && "${TELECOM}" != "${LEGACY_TELECOM}" ]]; then
+  echo "[a3] --telecom ${TELECOM} contradicts --$([[ "${LEGACY_TELECOM}" == "ros2" ]] && echo remote || echo "robot-link zmq"); use one of them" >&2; exit 2
+fi
+TELECOM="${TELECOM:-${LEGACY_TELECOM}}"
+if [[ -z "${TELECOM}" && "${TARGET}" == "sim" ]]; then TELECOM="ros2"; fi   # the MuJoCo simulator is a ROS 2 peer
+case "${TELECOM}" in
+  zmq)     ROBOT_LINK="zmq"; REMOTE=0 ;;
+  ros2)    [[ "${TARGET}" == "sim" || "${TARGET}" == "real" ]] || { echo "[a3] --telecom ros2 needs a target: sim or real" >&2; exit 2; }
+           ROBOT_LINK="aimrt"; if [[ "${TARGET}" == "real" ]]; then REMOTE=1; else REMOTE=0; fi ;;
+  iceoryx) [[ "${TARGET}" != "sim" ]] || { echo "[a3] --telecom iceoryx cannot reach the MuJoCo simulator (it speaks ROS 2): use --telecom ros2 (the default for sim) or zmq" >&2; exit 2; }
+           ROBOT_LINK="aimrt"; REMOTE=0; export A3_TRANSPORT=iceoryx ;;
+  "")      ;;   # real, no flag: this process is next to body-drive, A3_TRANSPORT (default iceoryx) decides, as before
+esac
+if [[ "${ROBOT_LINK}" == "zmq" ]]; then
+  [[ -n "${RELAY_HOST}" ]] || { echo "[a3] --telecom zmq (--robot-link zmq) needs --relay-host HOST (where a3_zmq_relay is bound, e.g. 10.42.10.12)" >&2; exit 2; }
 fi
 case "${ENCODER}" in
   a3-fast|a3_fast|a3fast) ENCODER="a3-fast"; SOURCE="a3_fast" ;;
@@ -243,15 +273,20 @@ fi
 # the real robot the deploy starts IDLE and sends nothing until the operator hardens the robot: A+B+X+Y (or S) - the G1 operator flow
 # (vendor procedure: docs/a3_training2sim2deploy.md section 6.1).
 if [[ "${TARGET}" == "sim" && "${INPUT_TYPE}" != "zmq_manager" ]]; then PASS+=(--auto-pd-stand); fi
-echo "[a3] encoder=${ENCODER} (TELEOP source '${SOURCE}' preselected and locked in the deploy)"
+echo "[a3] encoder=${ENCODER} (TELEOP source '${SOURCE}' preselected and locked in the deploy)  telecom=${TELECOM:-site default}"
 
 # --- 3. run ------------------------------------------------------------------
-if [[ "${TARGET}" == "sim" && "${ROBOT_LINK}" == "zmq" ]]; then
-  # The simulator is reached through the relay (scripts/a3_relay_sim.sh runs it on the simulator's ROS 2 domain); this process
-  # only needs the shared libraries of the package, no ROS domain.
+if [[ "${ROBOT_LINK}" == "zmq" ]]; then
+  # The robot (or the simulator) is reached through the relay: this process needs no ROS domain, but the x86 binary is still linked against
+  # the ROS 2 message libraries (typesupport), which come from the conda env (sim AND real: the real-robot case used to miss this and the
+  # binary failed with "libsensor_msgs__rosidl_typesupport_cpp.so: cannot open shared object file").
   A3_ROS_PREFIX="${A3_ROS_PREFIX:-${CONDA_PREFIX:-$HOME/miniconda3}/envs/a3_deploy_verify}"
   [[ -d "${A3_ROS_PREFIX}/lib" ]] && export LD_LIBRARY_PATH="${A3_ROS_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
-  echo "[a3] sim target through the ZMQ relay at ${RELAY_HOST}: start the simulator and scripts/a3_relay_sim.sh first"
+  if [[ "${TARGET}" == "sim" ]]; then
+    echo "[a3] sim target through the ZMQ relay at ${RELAY_HOST}: start the simulator and scripts/a3_relay_sim.sh first"
+  else
+    echo "[a3] real target through the ZMQ relay at ${RELAY_HOST}: the relay must already be running on the MDU (ROS libs from ${A3_ROS_PREFIX}/lib)"
+  fi
 elif [[ "${TARGET}" == "sim" ]]; then
   # The MuJoCo A3 simulator (a3_sim.py) publishes the robot-side topics on ROS2 only.
   export A3_TRANSPORT=ros2
@@ -299,7 +334,7 @@ fi
 
 if [[ "${TARGET}" == "real" ]]; then
   echo "[a3] ============================== REAL ROBOT =============================="
-  echo "[a3]  transport=${A3_TRANSPORT:-iceoryx}  ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-unset}  ROS_LOCALHOST_ONLY=${ROS_LOCALHOST_ONLY:-unset}  robot=${ROBOT}"
+  echo "[a3]  telecom=${TELECOM:-site default}  transport=${A3_TRANSPORT:-iceoryx}  ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-unset}  ROS_LOCALHOST_ONLY=${ROS_LOCALHOST_ONLY:-unset}  robot=${ROBOT}"
   echo "[a3]  Before you go on: gantry / sling attached, physical emergency stop in reach, a supervisor next to the robot,"
   echo "[a3]  the stock motion_control NOT running, MuJoCo validation done, scripts/a3_real_preflight.sh clean."
   if [[ "${ROBOT_LINK}" == "zmq" ]]; then
@@ -330,8 +365,9 @@ if [[ "${REMOTE}" == "1" ]]; then
   printf '%s\n' "${PROBE_OUT}" | tail -14
   if [[ "${PROBE_RC}" != "0" ]]; then
     echo "[a3] gate FAILED (exit ${PROBE_RC}): the robot does not offer the body-drive topics SONIC needs on ROS 2, so the deploy is NOT started." >&2
-    echo "[a3]   Nothing was published.  Options: have body-drive's ROS 2 backend enabled on the MDU, or deploy the aarch64 package on the MDU" >&2
-    echo "[a3]   (docs/notes/a3/pico_real_teleop.md, plan 18.8)." >&2
+    echo "[a3]   Nothing was published.  Options: have body-drive's ROS 2 backend enabled on the MDU (the vendor's joint_demo readme: add the ros2" >&2
+    echo "[a3]   communication form to the topics in hal_ethercat_<model>_cfg.yaml, then stop mc - plan 18.18), use --telecom zmq (the relay on the MDU)," >&2
+    echo "[a3]   or deploy the aarch64 package on the MDU (docs/notes/a3/pico_real_teleop.md, plan 18.8)." >&2
     exit 66
   fi
 fi

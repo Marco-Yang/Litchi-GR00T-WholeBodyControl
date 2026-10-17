@@ -71,7 +71,7 @@ def _fake_tree(tmp_path: Path) -> Path:
     pkg = root / "dist" / f"a3_deploy_{arch}"
     pkg.mkdir(parents=True)
     run = pkg / "run_a3.sh"
-    run.write_text('#!/usr/bin/env bash\necho "ARGS: $* TRANSPORT=${A3_TRANSPORT:-} DOMAIN=${ROS_DOMAIN_ID:-}" > "${A3_TEST_OUT}"\n')
+    run.write_text('#!/usr/bin/env bash\necho "ARGS: $* TRANSPORT=${A3_TRANSPORT:-} DOMAIN=${ROS_DOMAIN_ID:-} LDLP=${LD_LIBRARY_PATH:-}" > "${A3_TEST_OUT}"\n')
     run.chmod(0o755)
     models = root / "assets/a3_runtime/models/035_step200000"
     models.mkdir(parents=True)
@@ -79,9 +79,9 @@ def _fake_tree(tmp_path: Path) -> Path:
     return root
 
 
-def _launch(root: Path, args: list[str], tmp_path: Path):
+def _launch(root: Path, args: list[str], tmp_path: Path, env_extra: dict | None = None):
     out = tmp_path / "args.txt"
-    env = {**os.environ, "A3_TEST_OUT": str(out)}
+    env = {**os.environ, "A3_TEST_OUT": str(out), **(env_extra or {})}
     env.pop("A3_ASSUME_YES", None)
     for var in ("ROS_DOMAIN_ID", "ROS_LOCALHOST_ONLY"):
         env.pop(var, None)
@@ -126,3 +126,202 @@ def test_real_robot_start_over_the_relay_still_needs_a_confirmation_and_says_who
     assert "damping" in done.stdout and "Wi-Fi is not acceptable" in done.stdout
     done, args = _launch(root, [*base, "--yes"], tmp_path)
     assert done.returncode == 0 and "--auto-pd-stand" not in args and "--robot-link zmq --relay-host 10.42.10.12" in args
+
+
+# ---- --telecom: one switch for the three routes ------------------------------------------------------------------------------
+@pytestmark_bash
+def test_telecom_zmq_is_the_same_route_as_robot_link_zmq(tmp_path):
+    root = _fake_tree(tmp_path)
+    legacy, a_legacy = _launch(root, ["--robot", "a3_ultra", "sim", "--teleop-input", "zmq", "--robot-link", "zmq", "--relay-host", "127.0.0.1"], tmp_path)
+    new, a_new = _launch(root, ["--robot", "a3_ultra", "sim", "--teleop-input", "zmq", "--telecom", "zmq", "--relay-host", "127.0.0.1"], tmp_path)
+    assert legacy.returncode == 0 and new.returncode == 0, new.stderr
+    assert a_new == a_legacy and "--robot-link zmq --relay-host 127.0.0.1" in a_new and "TRANSPORT= DOMAIN=" in a_new
+    assert "telecom=zmq" in new.stdout
+    new, a_new = _launch(root, ["--robot", "a3_ultra", "sim", "--teleop-input", "zmq", "--telecom=zmq", "--relay-host", "127.0.0.1",
+                                "--relay-state-port", "6570", "--relay-command-port", "6571"], tmp_path)
+    assert new.returncode == 0 and "--relay-state-port 6570 --relay-command-port 6571" in a_new
+
+
+@pytestmark_bash
+def test_telecom_ros2_is_the_simulators_transport_and_the_default_for_sim(tmp_path):
+    root = _fake_tree(tmp_path)
+    done, args = _launch(root, ["--robot", "a3_ultra", "sim", "--telecom", "ros2"], tmp_path)
+    default, a_default = _launch(root, ["--robot", "a3_ultra", "sim"], tmp_path)
+    assert done.returncode == 0 and default.returncode == 0
+    assert args == a_default and "TRANSPORT=ros2" in args and "DOMAIN=87" in args and "--robot-link" not in args
+    assert "telecom=ros2" in done.stdout and "telecom=ros2" in default.stdout
+
+
+@pytestmark_bash
+def test_telecom_iceoryx_is_the_on_robot_route_and_cannot_reach_the_simulator(tmp_path):
+    root = _fake_tree(tmp_path)
+    done, args = _launch(root, ["--robot", "a3_ultra", "sim", "--telecom", "iceoryx"], tmp_path)
+    assert done.returncode == 2 and args == "" and "speaks ROS 2" in done.stderr
+    done, args = _launch(root, ["--robot", "a3_ultra", "real", "--telecom", "iceoryx", "--yes"], tmp_path)
+    assert done.returncode == 0 and "TRANSPORT=iceoryx" in args and "--robot-link" not in args and "telecom=iceoryx" in done.stdout
+    done, args = _launch(root, ["--robot", "a3_ultra", "real", "--yes"], tmp_path)  # no flag on 'real': the site's A3_TRANSPORT decides, as before
+    assert done.returncode == 0 and "telecom=site default" in done.stdout
+
+
+@pytestmark_bash
+def test_telecom_is_validated_and_must_agree_with_the_older_flags(tmp_path):
+    root = _fake_tree(tmp_path)
+    done, args = _launch(root, ["--robot", "a3_ultra", "sim", "--telecom", "udp"], tmp_path)
+    assert done.returncode == 2 and args == "" and "--telecom must be iceoryx, ros2 or zmq" in done.stderr
+    done, args = _launch(root, ["--robot", "a3_ultra", "sim", "--teleop-input", "zmq", "--telecom", "zmq"], tmp_path)  # no relay host
+    assert done.returncode == 2 and args == "" and "--relay-host" in done.stderr
+    done, args = _launch(root, ["--robot", "a3_ultra", "sim", "--telecom", "zmq", "--relay-host", "127.0.0.1"], tmp_path)  # --teleop-input ta
+    assert done.returncode == 2 and args == "" and "--teleop-input zmq" in done.stderr
+    done, args = _launch(root, ["--robot", "a3_ultra", "real", "--telecom", "ros2", "--robot-link", "zmq", "--relay-host", "10.1.1.1", "--yes"], tmp_path)
+    assert done.returncode == 2 and args == "" and "contradicts --robot-link zmq" in done.stderr
+    done, args = _launch(root, ["--robot", "a3_ultra", "real", "--telecom", "zmq", "--remote", "--relay-host", "10.1.1.1", "--yes"], tmp_path)
+    assert done.returncode == 2 and args == "" and "contradicts --remote" in done.stderr
+    done, args = _launch(root, ["--robot", "a3_ultra", "--telecom", "ros2"], tmp_path)  # neither sim nor real
+    assert done.returncode == 2 and "needs a target" in done.stderr
+
+
+def test_snapshot_reports_every_slot_at_full_precision_from_a_live_stream(capsys):
+    zmq = pytest.importorskip("zmq")
+    import threading
+    import time
+
+    tool = _tool()
+    ctx = zmq.Context()
+    pub = ctx.socket(zmq.PUB)
+    port = pub.bind_to_random_port("tcp://127.0.0.1")
+    stop = threading.Event()
+
+    def publish():
+        seq = 0
+        while not stop.is_set():
+            q = [0.02 * i + 1e-4 * (seq % 3) for i in range(tool.DOF)]  # a tiny wobble: std must be > 0 and not rounded away
+            pub.send(tool.pack_state(0xAB, seq, 0, 0, 0b11, 0, 0, 0, 0, 1_500_000, 1_000_000, 0, q, [0.0] * tool.DOF, [0.5] * tool.DOF,
+                                     [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.81], [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.81]))
+            seq += 1
+            time.sleep(0.005)
+
+    t = threading.Thread(target=publish, daemon=True)
+    t.start()
+    try:
+        time.sleep(0.2)
+        rc = tool.main(["snapshot", "--host", "127.0.0.1", "--state-port", str(port), "--seconds", "0.6"])
+    finally:
+        stop.set()
+        t.join(timeout=2)
+        pub.close(0)
+        ctx.term()
+    out = capsys.readouterr().out
+    assert rc == 0 and "seq gaps" in out and "waist_yaw" in out and "R_ankle_r" in out and "pelvis" in out and "|accel| 9.810" in out
+    assert out.count("\n") >= tool.DOF + 4
+    assert "mode(s)=['DISARMED']" in out and "valid=" in out
+
+
+def test_listen_output_is_visible_live_through_a_pipe(tmp_path):
+    """`listen | tee file`: stdout is a pipe, which Python block-buffers by default; the tool must flush line by line (an empty tee file and a
+    silent terminal made a real 90 s recording look hung and got it interrupted)."""
+    zmq = pytest.importorskip("zmq")
+    import sys
+    import threading
+    import time
+
+    tool = _tool()
+    ctx = zmq.Context()
+    pub = ctx.socket(zmq.PUB)
+    port = pub.bind_to_random_port("tcp://127.0.0.1")
+    stop = threading.Event()
+
+    def publish():
+        seq = 0
+        while not stop.is_set():
+            q = [0.01 * i for i in range(tool.DOF)]
+            pub.send(tool.pack_state(0xAB, seq, 0, 0, 0b11, 0, 0, 0, 0, 1_500_000, 1_000_000, 0, q, [0.0] * tool.DOF, [0.0] * tool.DOF,
+                                     [1.0] + [0.0] * 8 + [9.81], [1.0] + [0.0] * 8 + [9.81]))
+            seq += 1
+            time.sleep(0.005)
+
+    t = threading.Thread(target=publish, daemon=True)
+    t.start()
+    proc = subprocess.Popen([sys.executable, str(DEPLOY / "scripts/a3_relay_tool.py"), "listen", "--host", "127.0.0.1", "--state-port", str(port),
+                             "--seconds", "20"], stdout=subprocess.PIPE, text=True)
+    try:
+        import select
+
+        ready, _, _ = select.select([proc.stdout], [], [], 6.0)
+        assert ready, "no output within 6 s although the tool runs for 20 s: stdout is block-buffered"
+        assert "mode=DISARMED" in proc.stdout.readline()
+        assert proc.poll() is None  # still running when the first line arrived
+    finally:
+        proc.kill()
+        proc.wait()
+        stop.set()
+        t.join(timeout=2)
+        pub.close(0)
+        ctx.term()
+
+
+@pytestmark_bash
+def test_zmq_link_gives_the_binary_its_ros_message_libraries_on_the_real_robot_too(tmp_path):
+    """The x86 deploy binary is linked against ROS 2 typesupport libraries even over ZMQ; ``--telecom zmq real`` once started it without them
+    ("libsensor_msgs__rosidl_typesupport_cpp.so: cannot open shared object file") because only the sim branch set the library path."""
+    root = _fake_tree(tmp_path)
+    prefix = tmp_path / "rosenv"
+    (prefix / "lib").mkdir(parents=True)
+    for target in ("real", "sim"):
+        done, args = _launch(root, ["--robot", "a3_ultra", target, "--teleop-input", "zmq", "--telecom", "zmq", "--relay-host", "10.42.10.12", "--yes"],
+                             tmp_path, {"A3_ROS_PREFIX": str(prefix)})
+        assert done.returncode == 0, done.stderr
+        assert f"LDLP={prefix}/lib" in args, (target, args)
+        assert "TRANSPORT= DOMAIN=" in args  # still no ROS transport / domain forced
+    # an absent prefix must not break the launch (the binary then reports the missing library itself)
+    done, args = _launch(root, ["--robot", "a3_ultra", "real", "--teleop-input", "zmq", "--telecom", "zmq", "--relay-host", "10.42.10.12", "--yes"],
+                         tmp_path, {"A3_ROS_PREFIX": str(tmp_path / "nowhere")})
+    assert done.returncode == 0 and "LDLP=" in args and "nowhere" not in args
+
+
+def test_record_saves_every_state_frame_and_keeps_the_data_on_ctrl_c(tmp_path):
+    """`record` (full-rate, read-only) is how a real teleop run is analysed afterwards; Ctrl-C must keep what was recorded."""
+    zmq = pytest.importorskip("zmq")
+    np = pytest.importorskip("numpy")
+    import signal
+    import sys
+    import threading
+    import time
+
+    tool = _tool()
+    ctx = zmq.Context()
+    pub = ctx.socket(zmq.PUB)
+    port = pub.bind_to_random_port("tcp://127.0.0.1")
+    stop = threading.Event()
+
+    def publish():
+        seq = 0
+        while not stop.is_set():
+            q = [0.001 * seq + 0.01 * i for i in range(tool.DOF)]
+            pub.send(tool.pack_state(0xAB, seq, 1, 1, 0b111, 0x1234, seq, 0, seq // 10, 1_500_000, 1_000_000, 0, q, [0.0] * tool.DOF, [0.5] * tool.DOF,
+                                     [1.0] + [0.0] * 8 + [9.81], [1.0] + [0.0] * 8 + [9.81]))
+            seq += 1
+            time.sleep(0.005)
+
+    t = threading.Thread(target=publish, daemon=True)
+    t.start()
+    out = tmp_path / "run.npz"
+    proc = subprocess.Popen([sys.executable, str(DEPLOY / "scripts/a3_relay_tool.py"), "record", "--host", "127.0.0.1", "--state-port", str(port),
+                             "--seconds", "60", "--out", str(out)], stdout=subprocess.PIPE, text=True)
+    try:
+        time.sleep(2.0)
+        proc.send_signal(signal.SIGINT)
+        text, _ = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        stop.set()
+        t.join(timeout=2)
+        pub.close(0)
+        ctx.term()
+    assert "saved" in text and out.exists(), text
+    d = np.load(out)
+    n = len(d["seq"])
+    assert 100 < n < 600, n  # ~2 s at 200 Hz
+    assert d["q"].shape == (n, tool.DOF) and d["tau"].shape == (n, tool.DOF) and d["pelvis"].shape == (n, 10)
+    assert np.all(np.diff(d["t_wall"]) >= 0) and np.all(d["mode"] == 1) and np.all(d["owner"] == 0x1234)
+    assert d["tau"][0, 0] == 0.5 and list(d["slot_names"][:3]) == ["waist_yaw", "waist_roll", "waist_pitch"]

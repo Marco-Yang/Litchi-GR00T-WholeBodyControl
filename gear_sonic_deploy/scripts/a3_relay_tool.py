@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 # ruff: noqa: T201
-"""Python side of the A3 ZMQ relay wire format (include/a3_relay/a3_relay_wire.hpp) plus two small tools.
+"""Python side of the A3 ZMQ relay wire format (include/a3_relay/a3_relay_wire.hpp) plus three small tools.
 
     a3_relay_tool.py listen  --host 10.42.10.12 [--state-port 5570] [--seconds 10]
         Prints the relay's state frames (mode, ages, owner, counters, a few joints).  Sends nothing: use it for the first contact with a
         relay, also one started with --listen-only.
+
+    a3_relay_tool.py snapshot --host 10.42.10.12 [--seconds 10]
+        Read-only statistics of the state stream at full precision: per slot name, mean / std / min / max of q, mean dq and tau, and both
+        IMUs.  Use it to check that the numbers are alive, the slot order and the pose before any command is armed.
+
+    a3_relay_tool.py record --host 10.42.10.12 --seconds 400 --out run.npz
+        Read-only full-rate recorder (every state frame, 200 Hz) for diagnosing a real run: wall-clock time of arrival, relay mode / owner /
+        accepted+rejected counters, q / dq / tau of all 31 slots and both IMUs.  Saved to --out (.npz) every 30 s and on Ctrl-C, so
+        closing the run with Ctrl-C (or the --seconds timeout) keeps everything.  Analyse together with the deploy's per-tick dump:
+        gear_sonic_deploy/scripts/a3_analyze_teleop_run.py.
 
     a3_relay_tool.py fake-pc --host 127.0.0.1 [--hold-s 3] [--then silence|garbage] ...
         A stand-in for the deploy process, to exercise the relay's guard without the deploy: waits for a state frame, then holds the
@@ -120,7 +130,8 @@ def cmd_listen(a):
     import zmq
     ctx = zmq.Context()
     sock = _sub_socket(ctx, a.host, a.state_port)
-    t_end = time.time() + a.seconds
+    t_start = time.time()
+    t_end = t_start + a.seconds
     last_print, n, bad = 0.0, 0, 0
     while time.time() < t_end:
         if not sock.poll(200):
@@ -134,7 +145,8 @@ def cmd_listen(a):
         n += 1
         if time.time() - last_print >= 0.5:
             last_print = time.time()
-            print(f"[{n:6d}] seq={s['seq']:8d} {_fmt_state(s)}")
+            # [n] is the number of state frames received so far (200 Hz), NOT milliseconds; t is wall-clock seconds since the start
+            print(f"[{n:6d}] t={last_print - t_start:6.1f}s seq={s['seq']:8d} {_fmt_state(s)}")
     print(f"done: {n} state frames, {bad} bad")
     return 0 if n else 1
 
@@ -204,16 +216,118 @@ def cmd_write_golden(a):
     return 0
 
 
+# SDK slot order of the 31-DOF state frame (include/robot_io/a3_layout_extra.hpp)
+SLOT_NAMES = (["waist_yaw", "waist_roll", "waist_pitch", "neck_yaw", "neck_pitch"]
+              + [f"{side}_{j}" for side in ("L", "R") for j in ("shoulder_p", "shoulder_r", "shoulder_y", "elbow", "wrist_r", "wrist_p", "wrist_y")]
+              + [f"{side}_{j}" for side in ("L", "R") for j in ("hip_p", "hip_r", "hip_y", "knee", "ankle_p", "ankle_r")])
+
+
+def cmd_snapshot(a):
+    """Full-precision statistics of the state stream over --seconds: per slot mean / std / min / max of q, mean dq and tau, and the IMUs.
+
+    Read-only (a SUB socket).  Use it to check that the numbers are alive (std > 0 for a robot that is not perfectly rigid), that the slot order
+    is what the layout says, and what pose the robot is in before any command is armed."""
+    import zmq
+    ctx = zmq.Context()
+    sock = _sub_socket(ctx, a.host, a.state_port)
+    rows, t_end = [], time.time() + a.seconds
+    while time.time() < t_end:
+        if not sock.poll(200):
+            continue
+        try:
+            rows.append(unpack_state(sock.recv(zmq.NOBLOCK)))
+        except ValueError:
+            pass
+    if not rows:
+        print("no state frames")
+        return 1
+    n = len(rows)
+    seqs = [r["seq"] for r in rows]
+    gaps = sum(1 for x, y in zip(seqs, seqs[1:]) if y != x + 1)
+    mean = lambda xs: sum(xs) / len(xs)
+    std = lambda xs: (sum((x - mean(xs)) ** 2 for x in xs) / len(xs)) ** 0.5
+    print(f"{n} frames in {a.seconds:.0f} s ({n / a.seconds:.0f} Hz), seq gaps {gaps}, valid={sum(r['flags'] & 1 for r in rows)}/{n}, "
+          f"mode(s)={sorted({MODES.get(r['mode'], r['mode']) for r in rows})}, state_age mean {mean([r['state_age_ns'] for r in rows]) / 1e6:.2f} ms max "
+          f"{max(r['state_age_ns'] for r in rows) / 1e6:.2f} ms")
+    print(f"{'slot':>3s} {'name':12s} {'q mean':>10s} {'q std':>10s} {'q min':>10s} {'q max':>10s} {'dq mean':>9s} {'tau mean':>9s}")
+    for j in range(DOF):
+        q = [r["q"][j] for r in rows]
+        print(f"{j:3d} {SLOT_NAMES[j]:12s} {mean(q):10.5f} {std(q):10.2e} {min(q):10.5f} {max(q):10.5f} {mean([r['dq'][j] for r in rows]):9.4f} "
+              f"{mean([r['tau'][j] for r in rows]):9.3f}")
+    for name in ("pelvis", "torso"):
+        v = [mean([r[name][k] for r in rows]) for k in range(10)]
+        norm = sum(x * x for x in v[7:10]) ** 0.5
+        print(f"{name:7s} quat wxyz {[round(x, 4) for x in v[:4]]} gyro {[round(x, 4) for x in v[4:7]]} accel {[round(x, 3) for x in v[7:10]]} |accel| {norm:.3f}")
+    return 0
+
+
+def cmd_record(a):
+    """Full-rate, read-only recording of the relay's state stream into a .npz (see the module docstring)."""
+    import numpy as np
+    import zmq
+
+    ctx = zmq.Context()
+    sock = _sub_socket(ctx, a.host, a.state_port)
+    cols = {k: [] for k in ("t_wall", "seq", "mode", "flags", "owner", "accepted", "rejected", "state_age_ns", "q", "dq", "tau", "pelvis", "torso")}
+
+    def save():
+        n = len(cols["seq"])
+        if not n:
+            return 0
+        tmp = a.out + ".tmp.npz"
+        np.savez(tmp, owner=np.array(cols["owner"], dtype=np.uint64), slot_names=np.array(SLOT_NAMES),
+                 **{k: np.array(v) for k, v in cols.items() if k != "owner"})
+        os.replace(tmp, a.out)
+        return n
+
+    t0 = time.time()
+    t_end = t0 + a.seconds
+    last_save = last_print = t0
+    bad = 0
+    try:
+        while time.time() < t_end:
+            if not sock.poll(200):
+                continue
+            try:
+                s = unpack_state(sock.recv(zmq.NOBLOCK))
+            except ValueError:
+                bad += 1
+                continue
+            cols["t_wall"].append(time.time())
+            for k, key in (("seq", "seq"), ("mode", "mode"), ("flags", "flags"), ("owner", "owner_session"), ("accepted", "accepted_total"),
+                           ("rejected", "rejected_total"), ("state_age_ns", "state_age_ns"), ("q", "q"), ("dq", "dq"), ("tau", "tau"),
+                           ("pelvis", "pelvis"), ("torso", "torso")):
+                cols[k].append(s[key])
+            now = time.time()
+            if now - last_print >= 5.0:
+                last_print = now
+                print(f"t={now - t0:6.1f}s frames={len(cols['seq'])} {_fmt_state(s)}")
+            if now - last_save >= 30.0:
+                last_save = now
+                save()
+    except KeyboardInterrupt:
+        pass
+    n = save()
+    print(f"saved {n} frames ({bad} bad) to {a.out}" if n else "no state frames received: nothing saved")
+    return 0 if n else 1
+
+
 def main(argv=None):
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # `listen | tee file`: a pipe is block-buffered by default and Ctrl-C would lose everything
+    except (AttributeError, ValueError):
+        pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("listen", "fake-pc"):
+    for name in ("listen", "snapshot", "record", "fake-pc"):
         p = sub.add_parser(name)
         p.add_argument("--host", required=True)
         p.add_argument("--state-port", type=int, default=5570)
         p.add_argument("--command-port", type=int, default=5571)
-        if name == "listen":
-            p.add_argument("--seconds", type=float, default=10.0)
+        if name in ("listen", "snapshot", "record"):
+            p.add_argument("--seconds", type=float, default=400.0 if name == "record" else 10.0)
+        if name == "record":
+            p.add_argument("--out", required=True, help="output .npz")
         else:
             p.add_argument("--rate", type=float, default=50.0)
             p.add_argument("--hold-s", type=float, default=3.0)
@@ -224,7 +338,7 @@ def main(argv=None):
     g = sub.add_parser("write-golden")
     g.add_argument("dir")
     a = ap.parse_args(argv)
-    return {"listen": cmd_listen, "fake-pc": cmd_fake_pc, "write-golden": cmd_write_golden}[a.cmd](a)
+    return {"listen": cmd_listen, "snapshot": cmd_snapshot, "record": cmd_record, "fake-pc": cmd_fake_pc, "write-golden": cmd_write_golden}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -252,3 +252,176 @@ def test_sonic_gate_checks_types_publishers_and_qos():
     assert any("torso_imu" in p and "instead of" in p for p in problems)
     assert any("neck_joint_command" in p and "nobody subscribes" in p for p in problems)
     assert any("pelvis_imu" in p and "nobody publishes" in p for p in problems)
+
+
+def test_telecom_ros2_on_the_real_robot_is_the_remote_route_with_its_gate_and_ros_checks(tmp_path):
+    """``--telecom ros2 real`` == ``--remote``: same ROS domain checks, same read-only gate, same Cyclone / memory-cap setup."""
+    root = _fake_tree(tmp_path)
+    out = tmp_path / "args.txt"
+    clean = {k: v for k, v in os.environ.items() if k not in ("ROS_DOMAIN_ID", "ROS_LOCALHOST_ONLY")}
+    base = {**clean, "A3_TEST_OUT": str(out), "A3_MEMCAP": "off", "A3_GRAPH_PROBE_CMD": "echo 'SONIC ros2 gate: PASS'"}
+    cmd = ["bash", str(root / "scripts/deploy_a3.sh"), "--robot", "a3_ultra", "real", "--telecom", "ros2", "--yes"]
+
+    def run(env_extra, command=cmd):
+        return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, env={**base, **env_extra}, timeout=60)
+
+    assert run({}).returncode == 66 and not out.exists()                       # no ROS_DOMAIN_ID
+    assert run({"ROS_DOMAIN_ID": "232", "ROS_LOCALHOST_ONLY": "1"}).returncode == 66
+    failing = run({"ROS_DOMAIN_ID": "232", "ROS_LOCALHOST_ONLY": "0", "A3_GRAPH_PROBE_CMD": "echo 'SONIC ros2 gate: FAIL'; exit 3"})
+    assert failing.returncode == 66 and "gate FAILED" in failing.stderr and "--telecom zmq" in failing.stderr and not out.exists()
+    done = run({"ROS_DOMAIN_ID": "232", "ROS_LOCALHOST_ONLY": "0"})
+    assert done.returncode == 0, done.stderr
+    args = out.read_text()
+    assert "TRANSPORT=ros2" in args and "RMW=rmw_cyclonedds_cpp" in args and "--auto-pd-stand" not in args and "--robot-link" not in args
+    assert "telecom=ros2" in done.stdout and "REMOTE" in done.stdout
+    out.unlink()
+    legacy = [*cmd[:-3], "--remote", "--yes"]                                  # the older spelling reaches the same route
+    done = run({"ROS_DOMAIN_ID": "232", "ROS_LOCALHOST_ONLY": "0"}, legacy)
+    assert done.returncode == 0 and out.read_text() == args and "telecom=ros2" in done.stdout
+
+
+def test_preflight_reports_missing_shared_libraries_of_the_robot_binaries(tmp_path):
+    """The aarch64 package does not bundle libzmq.so.5 (plan 18.20): the preflight must say so before the first start, and stay read-only."""
+    pkg = tmp_path / "pkg"
+    (pkg / "config").mkdir(parents=True)
+    for name in ("a3_deploy_onnx_ref", "a3_zmq_relay"):
+        f = pkg / name
+        f.write_text("#!/bin/sh\n")
+        f.chmod(0o755)
+    shutil.copy(DEPLOY / "scripts/a3_real_preflight.sh", pkg / "a3_real_preflight.sh")
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    ldd = fake / "ldd"
+
+    def run(ldd_body):
+        ldd.write_text("#!/bin/sh\n" + ldd_body)
+        ldd.chmod(0o755)
+        snapshot = sorted(p.name for p in tmp_path.rglob("*"))
+        env = {**os.environ, "PATH": f"{fake}:{os.environ['PATH']}"}
+        done = subprocess.run(["bash", str(pkg / "a3_real_preflight.sh")], capture_output=True, text=True, env=env, timeout=60)
+        assert sorted(p.name for p in tmp_path.rglob("*")) == snapshot  # read-only: nothing created
+        return done
+
+    done = run('echo "\tlibzmq.so.5 => not found"; echo "\tlibc.so.6 => /lib/libc.so.6 (0x1)"\n')
+    assert "[FAIL] a3_deploy_onnx_ref: missing shared libraries: libzmq.so.5" in done.stdout
+    assert "[FAIL] a3_zmq_relay: missing shared libraries: libzmq.so.5" in done.stdout and "does not bundle it" in done.stdout
+    assert done.returncode == 1
+    ok = run('echo "\tlibc.so.6 => /lib/libc.so.6 (0x1)"\n')
+    assert "[PASS] a3_zmq_relay: all shared libraries resolve" in ok.stdout and "missing shared libraries" not in ok.stdout
+    foreign = run('echo "\tnot a dynamic executable"; exit 1\n')
+    assert "ldd cannot inspect it" in foreign.stdout and "missing shared libraries" not in foreign.stdout
+
+
+# ---- route C, robot side: preflight --relay + the relay bundle --------------------------------------------------------------
+def _relay_bundle(tmp_path: Path) -> Path:
+    pkg = tmp_path / "a3_relay_test"
+    (pkg / "config").mkdir(parents=True)
+    for name in ("a3_zmq_relay", "run_a3.sh", "run_a3_relay.sh", "libaimrt_iceoryx_plugin.so"):
+        f = pkg / name
+        f.write_text("#!/bin/sh\n")
+        f.chmod(0o755)
+    (pkg / "config/a3_aimrt_config.iceoryx.yaml").write_text("plugins:\n  - path: libaimrt_net_plugin.so\n")
+    shutil.copy(DEPLOY / "scripts/a3_real_preflight.sh", pkg / "a3_real_preflight.sh")
+    return pkg
+
+
+def _preflight_relay(pkg: Path, tmp_path: Path, args: list[str], ldd_body: str = 'echo "\\tlibc.so.6 => /lib/libc.so.6 (0x1)"\n'):
+    fake = tmp_path / "bin"
+    fake.mkdir(exist_ok=True)
+    (fake / "ldd").write_text("#!/bin/sh\n" + ldd_body)
+    (fake / "ldd").chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake}:{os.environ['PATH']}"}
+    return subprocess.run(["bash", str(pkg / "a3_real_preflight.sh"), "--relay", *args], capture_output=True, text=True, env=env, timeout=60)
+
+
+def test_preflight_relay_mode_checks_the_relay_bundle_not_the_full_deploy(tmp_path):
+    pkg = _relay_bundle(tmp_path)
+    before = sorted(p.name for p in tmp_path.rglob("*"))
+    done = _preflight_relay(pkg, tmp_path, ["--bind-ip", "127.0.0.1"])
+    out = done.stdout
+    assert "(relay side)" in out and "[PASS] a3_zmq_relay present" in out and "[PASS] config/a3_aimrt_config.iceoryx.yaml" in out
+    assert "a3_deploy_onnx_ref present" not in out and "models/" not in out  # none of the full-deploy package checks
+    assert "[PASS] a3_zmq_relay: all shared libraries resolve" in out and "[PASS] 127.0.0.1 is an address of this machine" in out
+    assert "net_plugin" in out  # the stock config's side effects are announced
+    missing = _preflight_relay(pkg, tmp_path, ["--bind-ip", "127.0.0.1"], 'echo "\\tlibzmq.so.5 => not found"\n')
+    assert "[FAIL] a3_zmq_relay: missing shared libraries: libzmq.so.5" in missing.stdout and "does not carry it" in missing.stdout and missing.returncode == 1
+    wrong_ip = _preflight_relay(pkg, tmp_path, ["--bind-ip", "203.0.113.9"])
+    assert "[FAIL] 203.0.113.9 is not an address of this machine" in wrong_ip.stdout
+    assert sorted(p.name for p in tmp_path.rglob("*")) == sorted(before + ["ldd", "bin"]) or "bin" in before  # read-only (only the fake ldd was added)
+
+
+def test_preflight_sees_processes_whose_names_the_kernel_truncates(tmp_path):
+    """pgrep -x cannot match names over 15 characters (a3_deploy_onnx_ref, RoboticsServiceProcess): the preflight matches the command line."""
+    pkg = _relay_bundle(tmp_path)
+    sleeper = shutil.which("sleep")
+    host_has_deploy = subprocess.run(["pgrep", "-f", "(^|/)a3_deploy_onnx_ref( |$)"], capture_output=True).returncode == 0  # e.g. a live session
+    host_has_mc = subprocess.run(["pgrep", "-f", "(^|/)(motion_control|mc)( |$)"], capture_output=True).returncode == 0
+    procs = []
+    try:
+        for name in ("a3_deploy_onnx_ref", "mc"):
+            exe = tmp_path / "run" / name
+            exe.parent.mkdir(exist_ok=True)
+            shutil.copy(sleeper, exe)
+            procs.append(subprocess.Popen([str(exe), "30"]))
+        import time
+
+        time.sleep(0.3)
+        done = _preflight_relay(pkg, tmp_path, [])
+        assert "[FAIL] a full a3_deploy_onnx_ref is running on this machine" in done.stdout
+        assert "[FAIL] the stock motion_control (mc) is running" in done.stdout
+        listen = _preflight_relay(pkg, tmp_path, ["--listen-only"])
+        assert "[WARN] the stock motion_control (mc) is running: fine for --listen-only" in listen.stdout
+    finally:
+        for p in procs:
+            p.kill()
+            p.wait()
+    quiet = _preflight_relay(pkg, tmp_path, [])  # the fake processes are gone: the checks go back to PASS unless the host has real ones
+    if not host_has_deploy:
+        assert "[PASS] no a3_deploy_onnx_ref on this machine" in quiet.stdout
+    if not host_has_mc:
+        assert "[PASS] motion_control (mc) is not running" in quiet.stdout
+
+
+def test_relay_bundle_contains_exactly_what_the_relay_needs(tmp_path):
+    spec = importlib.util.spec_from_file_location("a3_make_relay_bundle", DEPLOY / "scripts/a3_make_relay_bundle.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    pkg = DEPLOY / "dist/a3_deploy_x86_64"
+    if not (pkg / "a3_zmq_relay").exists() or shutil.which("readelf") is None:
+        pytest.skip("needs the built x86 package and readelf")
+    out = tmp_path / "bundle.tar.gz"
+    members, external = mod.build(pkg, out, "a3_relay_x86_64")
+    names = {p.name for p in members}
+    assert {"a3_zmq_relay", "run_a3_relay.sh", "a3_real_preflight.sh", "libaimrt_iceoryx_plugin.so", "libaimrt_ros2_plugin.so"} <= names
+    assert not any(n.startswith(("libonnxruntime", "librknnrt", "a3_deploy_onnx_ref", "model_")) for n in names)  # no policy runtime, no models
+    assert "libzmq.so.5" in external and "libc.so.6" in external  # system libraries are reported, not bundled
+    import tarfile
+
+    with tarfile.open(out) as tf:
+        listing = tf.getnames()
+    assert "a3_relay_x86_64/MANIFEST.sha256" in listing and "a3_relay_x86_64/a3_zmq_relay" in listing
+    assert (tmp_path / "bundle.tar.gz.sha256").read_text().split()[0] == mod.sha256(out)
+
+
+def test_operator_preflight_for_route_c_skips_ros_and_checks_that_the_relay_answers(tmp_path):
+    import socket
+
+    root = tmp_path / "gear_sonic_deploy"
+    (root / "scripts").mkdir(parents=True)
+    shutil.copy(DEPLOY / "scripts/a3_real_preflight.sh", root / "scripts/a3_real_preflight.sh")
+    env = {k: v for k, v in os.environ.items() if k not in ("ROS_DOMAIN_ID", "ROS_LOCALHOST_ONLY")}
+
+    def run(*args):
+        return subprocess.run(["bash", str(root / "scripts/a3_real_preflight.sh"), "--operator", *args], capture_output=True, text=True, env=env, timeout=60)
+
+    ros = run()  # the ROS 2 route still demands the robot's domain
+    assert "[FAIL] ROS_DOMAIN_ID is unset/0" in ros.stdout
+    with socket.socket() as srv:
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        up = run("--relay-host", "127.0.0.1", "--relay-state-port", str(port))
+    assert "ROS_DOMAIN_ID" not in up.stdout and "route C" in up.stdout
+    assert f"[PASS] something accepts connections on 127.0.0.1:{port}" in up.stdout
+    down = run("--relay-host", "127.0.0.1", "--relay-state-port", str(port))  # the socket is closed now
+    assert f"[WARN] nothing accepts connections on 127.0.0.1:{port}: the relay is not running yet" in down.stdout
