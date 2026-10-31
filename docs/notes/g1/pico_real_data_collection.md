@@ -1,59 +1,78 @@
-# G1 真机遥操数采（SONIC v1.1 + 双 RealSense RGB）
+# G1 真机遥操数采（SONIC v1.1 + 双 RealSense RGB → GR00T VLA）
 
-本文是本机实操 runbook：**G1 + SONIC v1.1** 真机 PICO 全身遥操，并把 **机器人状态 / SMPL / 双路头部 RGB** 记到工作站，输出 LeRobot 数据集。
+本文是本机实操 runbook：**G1 + SONIC v1.1** 真机 PICO 全身遥操数采，输出可直接给 **Isaac-GR00T N1.7 / `UNITREE_G1_SONIC`** 微调的 LeRobot 数据集。
 
 策略固定用 `gear_sonic_deploy/policy/sonic_v1_1/`（`--cp policy/sonic_v1_1/model` + 对应 `observation_config.yaml`），不要用默认 `policy/release`。
 
-遥操按键见 [pico_real_teleop.md](pico_real_teleop.md)。上游英文教程：[data_collection.md](../../source/tutorials/data_collection.md)。
+遥操按键见 [pico_real_teleop.md](pico_real_teleop.md)。上游：[`data_collection.md`](../../source/tutorials/data_collection.md)、[`vla_workflow.md`](../../source/tutorials/vla_workflow.md)。
 
 ---
 
-## 0. 本机已核实（2026-10-30）
+## 0. 与 GR00T G1 VLA 的对应关系
 
-相机都在 **机器人 Orin `192.168.123.164`** 上（`unitree` / 密码 `123`），不是工作站 USB。
+下游训练仓库：[NVIDIA/Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T)，embodiment：`UNITREE_G1_SONIC`。
+
+| GR00T 模态 | 本数采落盘字段 | 说明 |
+|---|---|---|
+| video `ego_view` | `videos/.../observation.images.ego_view/*.mp4` | **必须**；颈部 D435I |
+| video `head` | `.../observation.images.head/*.mp4` | 可选；默认 GR00T 配置**不读** |
+| state 腿/腰/臂/手 | `observation.state` 切片（含 Dex3 左右各 7D） | Dex3 **实测状态** |
+| state `projected_gravity` | `observation.projected_gravity` | |
+| action `motion_token` | `action.motion_token` (64D) | SONIC latent；录制时由 deploy 的 `token_state` 写入 |
+| action `left/right_hand_joints` | `teleop.left_hand_joints` / `teleop.right_hand_joints`（各 **7D = Dex3**） | **夹爪动作标签**；Pico **Trigger 或 Grip**；exporter 可回退到 deploy 手指令/状态 |
+| language | `meta/tasks.jsonl` + `task_index` | `--task-prompt` |
+
+**Dex3 会录两路：**
+
+1. **状态**：`observation.state` 的 `left_hand` / `right_hand`（7+7）← 机器人反馈  
+2. **动作标签**：`teleop.*_hand_joints`（7+7）← Pico **Trigger/Grip** 开合指令（GR00T 训手用这个）；exporter 可回退用 deploy 手指令/实测
+
+数采脚本**没有漏字段**。旧数据若 teleop 手全 0，多半是当时只靠 Trigger、且没扣；新逻辑下按住 **左 Grip+A** 录制时左手也会闭合并写入标签。
+
+---
+
+## 1. 本机已核实（2026-10-30）
+
+相机在 **机器人 Orin `192.168.123.164`**（`unitree` / 密码 `123`），不是工作站 USB。
 
 | 角色 | 序列号 | 位置 | USB |
 |---|---|---|---|
-| **`ego_view`（主视角）** | `242622070951` | **新加颈部** D435I，前视工作区 | USB2 480M（`1-2.2`） |
-| **`head`（第二路）** | `254522070308` | **原装机载** D435I，偏下视 | USB2 480M（`1-2.3`） |
+| **`ego_view`（主视角，VLA 必用）** | `242622070951` | **新加颈部** D435I | USB2 480M（`1-2.2`） |
+| **`head`（第二路，可选）** | `254522070308` | **原装机载** D435I | USB2 480M（`1-2.3`） |
 
 | 压测 | 结果 |
 |---|---|
-| 双路 **仅 RGB** 640×480@30 | 约 30.2 / 30.0 fps，短测可用 |
-| 双路 RGB+Depth@30 | **不可用**（严重掉帧） |
-| 数采策略 | **只开 RGB**（`enable_depth=False`） |
-
-测试帧：`_assets/g1_neck_cam_242622070951.png`（新颈部）、`_assets/g1_head_cam_test.png`（原装）。
+| 双路 **仅 RGB** 640×480@30 | 约 30 fps，可用 |
+| 双路 RGB+Depth@30 | **不可用** |
+| 数采策略 | **只开 RGB** |
 
 ---
 
-## 1. 架构
+## 2. 架构
 
 ```text
   工作站                                              G1 Orin 192.168.123.164
 ┌────────────────┐ ┌────────────────┐               ┌─────────────────────────┐
-│ deploy v1.1    │ │ pico_manager   │               │ D435I neck 2426… = ego  │
-│ ZMQ :5557      │ │ ZMQ :5556      │               │ D435I stock 2545… = head│
-└───────┬────────┘ └───────┬────────┘               │ RGB-only @30 → :5555    │
-        └─────────┬────────┘────────────────────────┴───────────┬─────────────┘
-                  ▼                                             │
-         run_data_exporter.py  ←── camera-host 192.168.123.164 ─┘
-                  │
+│ deploy v1.1    │ │ pico_manager   │               │ D435I neck = ego_view   │
+│ ZMQ :5557      │ │ ZMQ :5556      │               │ D435I stock = head      │
+│ state+token    │ │ SMPL+Dex3 cmd  │               │ RGB-only @30 → :5555    │
+└───────┬────────┘ └───────┬────────┘               └───────────┬─────────────┘
+        └─────────┬────────┘────────────────────────────────────┘
                   ▼
-         outputs/<dataset>/  (parquet + ego_view.mp4 + head.mp4)
+         run_data_exporter.py  →  outputs/<dataset>/  (LeRobot + modality.json)
 ```
 
-| 源 | 端口 | 内容 |
+| 源 | 端口 | 写入数据集的关键内容 |
 |---|---|---|
-| C++ 部署 | `5557` | 关节 / IMU / robot_config |
-| Pico | `5556` | SMPL pose + command |
-| Camera server（机器人） | `5555` | `ego_view` + `head` JPEG |
+| C++ 部署 | `5557` | `observation.state`（含 Dex3 状态）、`action.motion_token`、重力/姿态 |
+| Pico | `5556` | SMPL、`teleop.*_hand_joints`（Dex3 目标）、录制按键 |
+| Camera（Orin） | `5555` | `ego_view` + `head` JPEG |
 
 ---
 
-## 2. 一次性准备
+## 3. 一次性准备
 
-### 2.1 工作站
+### 3.1 工作站
 
 ```bash
 cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
@@ -67,17 +86,11 @@ pkill -f g1_deploy_onnx_ref || true
 ss -ltn | grep -E '5556|5557' || echo ports_free
 ```
 
-### 2.2 机器人：同步仓库并起双 RGB server
+### 3.2 机器人：同步并起双 RGB server
 
-Orin 系统 Python 是 **3.8**，不能直接跑 `gear_sonic.camera.composed_camera`（typing 语法不兼容）。仓库脚本会优先走 **standalone** 发布器：
-
-- `gear_sonic_deploy/scripts/g1_dual_realsense_rgb_zmq_server.py`（RGB only，无 depth）
-- wrapper：`g1_dual_realsense_rgb_server.sh`（自动 `LD_PRELOAD=libgomp.so.1`，避免 OpenCV `libgomp` 冲突）
-
-工作站同步到 Orin（必须在**仓库根目录**执行，不要在 `gear_sonic_deploy/` 里跑）：
+Orin 为 Python 3.8，用 standalone 发布器（脚本已自动选择）：
 
 ```bash
-# 在工作站执行（ssh unitree@192.168.123.164，密码 123）
 cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
 rsync -av --relative \
   gear_sonic/camera \
@@ -87,46 +100,33 @@ rsync -av --relative \
   unitree@192.168.123.164:/home/unitree/GR00T-WholeBodyControl/
 ```
 
-机器人上确认两台相机：
-
 ```bash
 ssh unitree@192.168.123.164
-rs-enumerate-devices -s
-# 应同时看到 242622070951 与 254522070308
-```
-
-启动（机器人终端保持运行；已核实 `0.0.0.0:5555` LISTEN）：
-
-```bash
 cd /home/unitree/GR00T-WholeBodyControl
 bash gear_sonic_deploy/scripts/g1_dual_realsense_rgb_server.sh
-# 日志应类似：
-# [g1-cam] ego_view SN=242622070951  head SN=254522070308  port=5555  python=python3
-# ... g1_dual_realsense_rgb_zmq_server.py ...
+# 应 LISTEN :5555
 ```
 
-工作站预览：
+可选预览（与数采无关）：
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
 source .venv_data_collection/bin/activate
-# 若 imshow 报 “The function is not implemented”（装了 opencv-python-headless）：
-#   uv pip uninstall opencv-python-headless --python .venv_data_collection/bin/python
+# 若 imshow 报 GUI not implemented：先卸 opencv-python-headless
 python gear_sonic/scripts/run_camera_viewer.py \
   --camera-host 192.168.123.164 --camera-port 5555
 ```
 
-应看到两路：`ego_view`（颈部前视）+ `head`（原装下视）。预览只是可选检查，数采不依赖它。---
+---
 
-## 3. 真机数采启动顺序
+## 4. 真机数采启动顺序
 
 安全：吊带；物理急停有人盯；关掉 `run_sim_loop.py`。
 
-### 3.1 机器人 — Camera（已在第 2.2 节）
+### 4.1 机器人 — Camera
 
-保持 `g1_dual_realsense_rgb_server.sh` 运行，`5555` 在听。
+保持 `g1_dual_realsense_rgb_server.sh` 运行。
 
-### 3.2 工作站终端 1 — 部署（SONIC v1.1）
+### 4.2 工作站终端 1 — 部署（SONIC v1.1）
 
 ```bash
 cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl/gear_sonic_deploy"
@@ -137,12 +137,10 @@ source scripts/setup_env.sh
   --obs-config policy/sonic_v1_1/observation_config.yaml \
   --input-type zmq_manager \
   real
-# Init Done；确认左右 Dex3 都张开
+# Init Done；确认左右 Dex3 都张开，且 DDS 有 rt/dex3/*/state
 ```
 
-启动前确认文件存在：`policy/sonic_v1_1/model_encoder.onnx`、`model_decoder.onnx`、`observation_config.yaml`。
-
-### 3.3 工作站终端 2 — Pico
+### 4.3 工作站终端 2 — Pico
 
 ```bash
 cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
@@ -150,9 +148,9 @@ source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manager_thread_server.py --robot g1 --manager
 ```
 
-PC Service 需已开；头显 WORKING + Send。当前 Wi‑Fi 地址以 `ip -4 -br addr show wlp8s0` 为准（现为 `192.168.50.61`）。
+PC Service WORKING + Send。Wi‑Fi IP 以 `ip -4 -br addr show wlp8s0` 为准。
 
-### 3.4 工作站终端 3 — Data exporter（双 RGB）
+### 4.4 工作站终端 3 — Data exporter
 
 ```bash
 cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
@@ -165,66 +163,87 @@ python gear_sonic/scripts/run_data_exporter.py \
   --root-output-dir outputs
 ```
 
-或 tmux 一键（相机服务仍须在机器人上先开；同样指定 v1.1）：
+### 4.5 操作（含 Dex3）
 
-```bash
-python gear_sonic/scripts/launch_data_collection.py \
-  --camera-host 192.168.123.164 \
-  --record-head-camera \
-  --deploy-checkpoint policy/sonic_v1_1/model \
-  --deploy-obs-config policy/sonic_v1_1/observation_config.yaml \
-  --task-prompt "把桌上的杯子拿起来放到盘子里"
-```
-
-### 3.5 操作
-
-1. 标定姿态 → **A+B+X+Y** 启动 → **A+X** 进 POSE  
+1. 标定 → **A+B+X+Y** 启动 → **A+X** 进 **POSE**  
 2. **左 Grip + A**：开始/结束 episode  
 3. **左 Grip + B**：丢弃当前段  
-4. 急停：物理急停；软件在部署终端按 `O`
+4. **开合 Dex3**：扣 **Trigger 或 Grip**（任一 >0.5 即闭合该侧手），都会写入 `teleop.*_hand_joints`。  
+   - **左 Grip + A / 左 Grip + B** 仍是开始录制 / 丢弃；按住左 Grip 时左手也会闭合，因此录制组合键本身就会带上左手 Dex3 标签。  
+   - exporter 若收到的 Pico 手指令接近全 0，会回退写入 deploy 的 `last_*_hand_action`，再不行用实测 `*_hand_q`。  
+5. 抓取类任务请在 episode 内明确做「伸手 → Grip/Trigger 闭合 → 移动 → 松开」。  
+6. 急停：物理急停；部署终端按 `O`
+
+官方建议同一任务至少 **50–100** 条成功 episode 再微调。
 
 ---
 
-## 4. 落盘
+## 5. 落盘与训前处理
 
 ```text
 outputs/<dataset>/
-├── data/train-*.parquet
-├── videos/observation.images.ego_view/episode_*.mp4
-├── videos/observation.images.head/episode_*.mp4
-└── meta/...
+├── data/chunk-000/episode_*.parquet
+├── videos/chunk-000/observation.images.ego_view/episode_*.mp4
+├── videos/chunk-000/observation.images.head/episode_*.mp4   # 可选
+└── meta/
+    ├── info.json
+    ├── modality.json      # GR00T 需要
+    ├── episodes.jsonl
+    ├── tasks.jsonl
+    └── episodes_stats.jsonl
 ```
 
-清洗：
+### 5.1 校验是否够给 GR00T 训
 
 ```bash
 source .venv_data_collection/bin/activate
+python gear_sonic/scripts/validate_g1_sonic_vla_dataset.py \
+  --dataset-path outputs/<dataset>
+```
+
+期望：`motion_token` 大量非零；若要训夹爪，`teleop.*_hand_joints` 也要有明显非零比例。
+
+### 5.2 清洗（微调前必做）
+
+```bash
 python gear_sonic/scripts/process_dataset.py \
   --dataset-path outputs/<dataset> \
   --output-path outputs/<dataset>_cleaned
 ```
 
+去掉 discarded episode 与 stale SMPL 帧。多 session 可同一命令 merge。
+
+### 5.3 微调（在 Isaac-GR00T 仓库）
+
+```bash
+uv run python gr00t/experiment/launch_finetune.py \
+  --base-model-path nvidia/GR00T-N1.7-3B \
+  --dataset-path /path/to/<dataset>_cleaned \
+  --embodiment-tag UNITREE_G1_SONIC \
+  --modality-config-path gr00t/configs/data/embodiment_configs.py \
+  ...
+```
+
 ---
 
-## 5. 排错
+## 6. 排错
 
 | 现象 | 处理 |
 |---|---|
-| 红物体变蓝 / 蓝变红 | RGB/BGR 通道反了。工作站需用已修复的 `ImageUtils.decode_image`（返回 RGB）；Orin 上 `g1_dual_realsense_rgb_zmq_server.py` 保持 RGB→BGR 再 JPEG。旧 episode 需重录 |
-| `cv2.imshow` / GUI not implemented | `.venv_data_collection` 里卸掉 `opencv-python-headless`，保留 `opencv-python` |
-| 只有一台 RealSense | 检查新相机线；应出现两个 SN |
-| 双路深度掉帧 | 不要开深度；本脚本默认 RGB only |
-| `5555` 连不上 | 机器人 server 未起；`ss -ltn \| grep 5555` |
-| Orin `TypeError: 'type' object is not subscriptable` | 在跑 `composed_camera`；改用 `g1_dual_realsense_rgb_server.sh`（standalone） |
-| Orin `libgomp: cannot allocate memory in static TLS block` | 确认脚本已 `LD_PRELOAD=/lib/aarch64-linux-gnu/libgomp.so.1` |
-| deploy `Address already in use` | `pkill -f g1_deploy_onnx_ref` |
-| exporter 缺 `head` | 必须加 `--record-head-camera`，且 Orin 双路 server 在跑 |
-| 左手夹爪不动 | 查 `rt/dex3/left/state` 是否有数据；必要时整机重启 |
+| `teleop.*_hand_joints` 全 0 | 扣 **Trigger 或 Grip**；确认 Dex3 DDS；重启 pico_manager（需含 Grip→手指改动）；跑校验脚本 |
+| `observation.state` 手有值但 teleop 手为 0 | 更新后的 exporter 会回退填 hand action/state；仍全 0 则手根本没被驱动 |
+| `motion_token` 全 0 | deploy 未跑 v1.1 / 策略未启动；需有 `token_state` |
+| 红物体变蓝 | 工作站用已修的 `ImageUtils.decode_image`；重录 |
+| `cv2.imshow` GUI not implemented | 卸掉 `opencv-python-headless`；若重装 opencv 把 numpy 升到 2.x，再执行 `uv pip install 'numpy>=1.26,<2' --python .venv_data_collection/bin/python`（pinocchio 需 numpy 1.x） |
+| pinocchio / NumPy 2.x ImportError 或 segfault | 同上，把 `.venv_data_collection` 的 numpy 钉回 `<2` |
+| `5555` 连不上 | Orin 上起 `g1_dual_realsense_rgb_server.sh` |
+| 左手夹爪不动 | 查 `rt/dex3/left/state`；必要时整机重启 |
 
 ---
 
-## 6. 相关文档
+## 7. 相关文档
 
 - [pico_real_teleop.md](pico_real_teleop.md)  
 - [mujoco_pico_sim_teleop.md](mujoco_pico_sim_teleop.md)  
 - [../../source/tutorials/data_collection.md](../../source/tutorials/data_collection.md)  
+- [../../source/tutorials/vla_workflow.md](../../source/tutorials/vla_workflow.md)  

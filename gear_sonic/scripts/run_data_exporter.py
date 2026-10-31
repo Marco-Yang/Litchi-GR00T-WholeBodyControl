@@ -506,6 +506,33 @@ class GrootDataCollector:
             return arr.astype(np.float32)
         return np.zeros(7, dtype=np.float32)
 
+    def _resolve_dex3_hand_joints(
+        self,
+        hand_msg: dict | None,
+        pico_key: str,
+        proprio_action_key: str,
+        proprio_state_key: str,
+    ) -> np.ndarray:
+        """Return 7D Dex3 targets for ``teleop.*_hand_joints``.
+
+        Order: Pico Trigger/Grip command → deploy last hand action → measured ``hand_q``.
+        """
+        zeros = np.zeros(7, dtype=np.float32)
+        if hand_msg is not None and hand_msg.get(pico_key) is not None:
+            pico = np.asarray(hand_msg[pico_key], dtype=np.float32).reshape(-1)
+            if pico.size >= 7 and float(np.max(np.abs(pico[:7]))) > 1e-6:
+                return pico[:7].astype(np.float32)
+
+        proprio = self.latest_proprio_msg or {}
+        for key in (proprio_action_key, proprio_state_key):
+            val = proprio.get(key)
+            if val is None:
+                continue
+            arr = np.asarray(val, dtype=np.float32).reshape(-1)
+            if arr.size >= 7 and float(np.max(np.abs(arr[:7]))) > 1e-6:
+                return arr[:7].astype(np.float32)
+        return zeros
+
     @staticmethod
     def _extract_bool(pose_data: dict, key: str) -> bool:
         val = pose_data.get(key)
@@ -758,17 +785,16 @@ class GrootDataCollector:
             else planner_msg if planner_msg is not None
             else smpl_msg
         )
-        frame_data["teleop.left_hand_joints"] = (
-            hand_msg["left_hand_joints"].astype(np.float32)
-            if hand_msg is not None
-            and hand_msg.get("left_hand_joints") is not None
-            else np.zeros(7, dtype=np.float32)
+        # Dex3 7D action labels for GR00T UNITREE_G1_SONIC.
+        # Prefer Pico Trigger/Grip targets; if those are missing/zero, fall back to
+        # the command (then measured state) published on g1_debug so recording
+        # chords like Left Grip+A still yield non-empty teleop.*_hand_joints when
+        # the hand was actually driven.
+        frame_data["teleop.left_hand_joints"] = self._resolve_dex3_hand_joints(
+            hand_msg, "left_hand_joints", "last_left_hand_action", "left_hand_q"
         )
-        frame_data["teleop.right_hand_joints"] = (
-            hand_msg["right_hand_joints"].astype(np.float32)
-            if hand_msg is not None
-            and hand_msg.get("right_hand_joints") is not None
-            else np.zeros(7, dtype=np.float32)
+        frame_data["teleop.right_hand_joints"] = self._resolve_dex3_hand_joints(
+            hand_msg, "right_hand_joints", "last_right_hand_action", "right_hand_q"
         )
 
         # Planner command fields

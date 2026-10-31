@@ -500,6 +500,10 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
 
     Returns:
         Array of shape [25, 4, 4] representing fingertip positions
+
+    Close Dex3 when either Trigger OR Grip is pressed (>0.5). Grip is also used
+    in recording chords (Left Grip+A / Left Grip+B); holding Grip therefore both
+    closes that hand and populates ``teleop.*_hand_joints`` for VLA labels.
     """
     fingertips = np.zeros([25, 4, 4])
 
@@ -507,7 +511,7 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
     middle = 10
     # Control thumb based on shoulder button state (index 4 is thumb tip)
     fingertips[4 + thumb, 0, 3] = 1.0  # open thumb
-    if trigger > 0.5:
+    if trigger > 0.5 or grip > 0.5:
         fingertips[4 + middle, 0, 3] = 1.0  # close middle
 
     return fingertips
