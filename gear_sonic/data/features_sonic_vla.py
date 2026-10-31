@@ -395,6 +395,26 @@ def get_wrist_camera_modality_config() -> dict:
     }
 
 
+def get_head_camera_features() -> dict:
+    """Features for optional second head / neck RGB camera (``record_head_camera``)."""
+    return {
+        "observation.images.head": {
+            "dtype": "video",
+            "shape": [EGO_VIEW_HEIGHT, EGO_VIEW_WIDTH, 3],
+            "names": ["height", "width", "channel"],
+        },
+    }
+
+
+def get_head_camera_modality_config() -> dict:
+    """Modality config entry for optional head camera."""
+    return {
+        "video": {
+            "head": {"original_key": "observation.images.head"},
+        },
+    }
+
+
 def get_g1_robot_model(
     waist_location: Literal[
         "lower_body", "upper_body", "lower_and_upper_body"

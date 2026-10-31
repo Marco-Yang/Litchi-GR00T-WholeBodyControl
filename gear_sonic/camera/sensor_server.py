@@ -222,7 +222,16 @@ class CameraMountPosition(Enum):
 class ImageUtils:
     @staticmethod
     def encode_image(image: np.ndarray) -> str:
-        _, color_buffer = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        """Encode an RGB uint8 image to base64 JPEG.
+
+        Camera drivers in this repo (RealSense rgb8, USB, OAK) produce RGB.
+        OpenCV ``imencode`` expects BGR, so convert before compressing.
+        """
+        if image.ndim == 3 and image.shape[2] == 3:
+            bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        else:
+            bgr = image
+        _, color_buffer = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         return base64.b64encode(color_buffer).decode("utf-8")
 
     @staticmethod
@@ -232,9 +241,13 @@ class ImageUtils:
 
     @staticmethod
     def decode_image(image: str) -> np.ndarray:
+        """Decode base64 JPEG to RGB uint8 (matches VideoWriter ``rgb24`` / LeRobot)."""
         color_data = base64.b64decode(image)
         color_array = np.frombuffer(color_data, dtype=np.uint8)
-        return cv2.imdecode(color_array, cv2.IMREAD_COLOR)
+        bgr = cv2.imdecode(color_array, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise ValueError("Failed to decode JPEG image")
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     @staticmethod
     def decode_depth_image(image: str) -> np.ndarray:

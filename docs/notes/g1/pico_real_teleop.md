@@ -34,7 +34,7 @@ gear_sonic_deploy（C++ 策略，--input-type zmq_manager real）
 | 1 部署 | `./deploy.sh --robot g1 ... real` | `--robot` 写在 `real` 之前。`a3` / `a3_ultra` 转给 `scripts/deploy_a3.sh`。`h2` 暂无 C++ 后端 |
 | 2 Pico | `pico_manager_thread_server.py --robot g1 --manager` | 决定用哪个机器人的 IK/FK 模型 |
 
-头显填的 **192.168.110.79** 是这台电脑的 Wi‑Fi 地址，用来收 PICO 数据。它不是机器人的地址。G1 真机走另一张网卡上的 `192.168.123.x`，由 `real` 自动选择。
+头显填的是这台电脑的 **Wi‑Fi 地址**（当前 `wlp8s0` 为 **192.168.50.61**，以 `ip -4 -br addr show wlp8s0` 为准），用来收 PICO 数据。它不是机器人的地址。G1 真机走另一张网卡上的 `192.168.123.x`，由 `real` 自动选择。
 
 ---
 
@@ -69,7 +69,7 @@ pgrep -af run_sim_loop.py
 |---|---|
 | 遥操环境 | `$REPO/.venv_teleop` |
 | 部署可执行文件 | `$REPO/gear_sonic_deploy/target/release/g1_deploy_onnx_ref` |
-| 默认策略 | `$REPO/gear_sonic_deploy/policy/release/model_*.onnx` |
+| 本机默认策略（SONIC v1.1） | `$REPO/gear_sonic_deploy/policy/sonic_v1_1/model_*.onnx` + `observation_config.yaml` |
 | Planner | `$REPO/gear_sonic_deploy/planner/target_vel/V2/planner_sonic.onnx` |
 
 硬件：
@@ -107,7 +107,7 @@ bash /opt/apps/roboticsservice/runService.sh
 
 | 地址 | 用途 |
 |---|---|
-| **192.168.110.79** | 无线网卡 `wlp8s0`。头显 PC Service 一栏填这个 |
+| **192.168.50.61**（以现场 `wlp8s0` 为准） | 无线网卡。头显 PC Service 一栏填这个 |
 | 100.95.251.103 | Tailscale，不要填 |
 | 198.18.0.1 | Meta 虚拟网卡，不要填 |
 
@@ -122,7 +122,7 @@ ip -4 -br addr show wlp8s0
 
 1. PICO 与电脑连同一 Wi‑Fi。
 2. 打开 **XRoboToolkit** App。
-3. 在 **PC Service** 填入 **192.168.110.79**；状态显示 **WORKING** 即连接成功。若已填过，点 **Reconnect**。
+3. 在 **PC Service** 填入当前 Wi‑Fi IP（**192.168.50.61**）；状态显示 **WORKING** 即连接成功。若已填过，点 **Reconnect**。
 4. 勾选：
    - Tracking：`Head`、`Controller`
    - Data/Control：点 **Send**
@@ -136,31 +136,31 @@ ip -4 -br addr show wlp8s0
 
 ## 2. 两个终端启动（G1）
 
-开始前确认第 1 节已经完成：PC Service 进程在运行，头显状态是 **WORKING**，并且已经点了 **Send**。PC Service 没起来时，头显填 `192.168.110.79` 会报 `connect_error TCP connection failed`。
+开始前确认第 1 节已经完成：PC Service 进程在运行，头显状态是 **WORKING**，并且已经点了 **Send**。PC Service 没起来时，头显填错 Wi‑Fi IP 会报 `connect_error TCP connection failed`。
 
 不要启动 `run_sim_loop.py`。
 
-### 终端 1 — C++ 策略
+### 终端 1 — C++ 策略（本机默认 SONIC v1.1）
 
 ```bash
 cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl/gear_sonic_deploy"
 source scripts/setup_env.sh
-./deploy.sh --robot g1 --input-type zmq_manager real
-```
-
-`real` 会找带 `192.168.123.` 的网卡。找不到时脚本会改用其它非回环网卡并打印警告；这时把最后的 `real` 换成机器人实际 IP，例如 `192.168.123.161`。
-
-等到日志出现 **`Init Done`** 再继续。启动前终端会问 `Proceed with deployment? [Y/n]`，输入 `y`。
-
-使用 **SONIC v1.1** 时：
-
-```bash
 ./deploy.sh \
   --robot g1 \
   --cp policy/sonic_v1_1/model \
   --obs-config policy/sonic_v1_1/observation_config.yaml \
   --input-type zmq_manager \
   real
+```
+
+`real` 会找带 `192.168.123.` 的网卡。找不到时脚本会改用其它非回环网卡并打印警告；这时把最后的 `real` 换成机器人实际 IP，例如 `192.168.123.161`。
+
+等到日志出现 **`Init Done`** 再继续。启动前终端会问 `Proceed with deployment? [Y/n]`，输入 `y`。
+
+若要用旧的默认 `policy/release`：
+
+```bash
+./deploy.sh --robot g1 --input-type zmq_manager real
 ```
 
 ### 终端 2 — PICO 数据流
@@ -228,7 +228,7 @@ pkill -INT -x g1_deploy_onnx_ref || pkill -TERM -x g1_deploy_onnx_ref
 
 | 现象 | 处理 |
 |---|---|
-| 头显 `connect_error TCP connection failed` | PC Service 没启动。先跑第 1.1 节，再填 `192.168.110.79` |
+| 头显 `connect_error TCP connection failed` | PC Service 没启动，或 Wi‑Fi IP 变了。先跑第 1.1 节，再填当前 `wlp8s0`（现为 `192.168.50.61`） |
 | 终端 2 一直 `waiting for body data...` | Head/Controller 通了也不够。Full body 的 Tracker 数量要是 2，并且摄像头能看见脚踝。改完后重启终端 2 |
 | `Could not find 192.168.123.x interface` | 电脑没接到 G1 的控制网。接上网线或把 `real` 换成机器人 IP |
 | 终端 1 和仿真抢接口 | 停掉 `run_sim_loop.py` 后再开 `real` |
@@ -295,9 +295,43 @@ python gear_sonic/scripts/pico_manager_thread_server.py --robot a3_ultra --manag
 
 ---
 
-## 7. 相关文档
+## 7. 真机数采（SONIC v1.1 + 双 RealSense RGB）
 
-- 仿真操作：`docs/notes/mujoco_pico_sim_teleop.md`
+遥操部署须用 **SONIC v1.1**（见第 2 节终端 1）。再加 **相机 server（Orin）+ data exporter（工作站）**。完整顺序见：
+
+**[pico_real_data_collection.md](pico_real_data_collection.md)**
+
+本机已核实映射（2026-10-30）：
+
+| 角色 | SN | 位置 |
+|---|---|---|
+| `ego_view` | `242622070951` | 新加颈部 D435I（前视） |
+| `head` | `254522070308` | 原装机载 D435I（下视） |
+
+要点：
+
+1. Deploy：`--cp policy/sonic_v1_1/model --obs-config policy/sonic_v1_1/observation_config.yaml`
+2. **只开 RGB @30**（双路 depth 在 USB2 hub 上会掉帧）
+3. 在 **Orin `192.168.123.164`** 起：`bash gear_sonic_deploy/scripts/g1_dual_realsense_rgb_server.sh`（监听 `:5555`）
+4. 工作站第三终端：
+
+```bash
+cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+source .venv_data_collection/bin/activate
+python gear_sonic/scripts/run_data_exporter.py \
+  --task-prompt "把桌上的杯子拿起来放到盘子里" \
+  --camera-host 192.168.123.164 \
+  --camera-port 5555 \
+  --record-head-camera \
+  --root-output-dir outputs
+```
+
+5. 录制按键：**左 Grip + A** 开始/结束 episode；**左 Grip + B** 丢弃当前段---
+
+## 8. 相关文档
+
+- 仿真操作：`docs/notes/g1/mujoco_pico_sim_teleop.md`
+- 真机数采：`docs/notes/g1/pico_real_data_collection.md`
 - VR 硬件与软件安装：`docs/source/getting_started/vr_teleop_setup.md`
 - 全身遥操教程：`docs/source/tutorials/vr_wholebody_teleop.md`
 - A3 真机上电顺序：`docs/a3_training2sim2deploy.md` 第 6 节

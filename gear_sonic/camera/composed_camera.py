@@ -97,6 +97,9 @@ class ComposedCameraConfig:
     use_mjpeg: bool = False
     """Use on-device MJPEG encoding on OAK cameras to reduce USB bandwidth."""
 
+    enable_depth: bool = False
+    """Enable RealSense depth stream. Keep False for dual-RGB teleop data collection."""
+
     mjpeg_quality: int = 80
     """MJPEG quality 1-100 (only when use_mjpeg=True)."""
 
@@ -373,10 +376,20 @@ class ComposedCameraSensor(Sensor, SensorServer):
             return OAKSensor(config=oak_config, mount_position=mount_position, device_id=device_id)
 
         elif camera_type == "realsense":
-            from gear_sonic.camera.drivers.realsense import RealSenseSensor
+            from gear_sonic.camera.drivers.realsense import RealSenseConfig, RealSenseSensor
 
-            print(f"Initializing RealSense sensor for camera type: {camera_type}")
-            return RealSenseSensor(mount_position=mount_position)
+            rs_config = RealSenseConfig()
+            rs_config.fps = self.config.fps
+            print(
+                f"Initializing RealSense sensor for camera type: {camera_type}, "
+                f"device_id={device_id}, depth={'on' if self.config.enable_depth else 'off'}"
+            )
+            return RealSenseSensor(
+                mount_position=mount_position,
+                device_id=device_id,
+                enable_depth=self.config.enable_depth,
+                config=rs_config,
+            )
 
         elif camera_type.endswith(".mp4"):
             from gear_sonic.camera.drivers.dummy import ReplayDummySensor

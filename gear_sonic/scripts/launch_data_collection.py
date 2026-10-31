@@ -148,6 +148,9 @@ class DataCollectionLaunchConfig:
     record_wrist_cameras: bool = False
     """Record wrist camera streams (left_wrist, right_wrist) in the dataset."""
 
+    record_head_camera: bool = False
+    """Record second head/neck RGB stream (head) alongside ego_view."""
+
     text_to_speech: bool = True
     """Enable voice feedback via espeak (data exporter)."""
 
@@ -305,6 +308,7 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  DC frequency:    {config.data_exporter_frequency} Hz")
     print(f"  Camera viewer:   {'Yes' if config.camera_viewer else 'No'}")
     print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
+    print(f"  Head camera:     {'Yes' if config.record_head_camera else 'No'}")
     print(f"  Text-to-speech:  {'Yes' if config.text_to_speech else 'No'}")
     print(f"  PC IP (for PICO): {_get_local_ip()}")
     print(f"  Teleop vis:      vr3pt={config.pico_vis_vr3pt} smpl={config.pico_vis_smpl}")
@@ -412,6 +416,8 @@ def main(config: DataCollectionLaunchConfig):
         exporter_cmd += f" --dataset-name '{config.dataset_name}'"
     if config.record_wrist_cameras:
         exporter_cmd += " --record-wrist-cameras"
+    if config.record_head_camera:
+        exporter_cmd += " --record-head-camera"
     if not config.text_to_speech:
         exporter_cmd += " --no-text-to-speech"
 
