@@ -5,7 +5,7 @@ Example (GUI, all episodes in range, stay open):
   conda activate sikan
   cd /path/to/Litchi-GR00T-WholeBodyControl
   python -m datasets.data_check pipeline \\
-    --dataset datasets/walking \\
+    --dataset datasets/walking/2026-11-01-15-43-46 \\
     --work-dir datasets/data_check/runs/walking_0_15 \\
     --start 0 --end 15 \\
     --env-spacing 6
@@ -37,7 +37,7 @@ from datasets.data_check.lerobot_io import (  # noqa: E402
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--dataset", type=Path, default=_REPO / "datasets" / "walking")
+    p.add_argument("--dataset", type=Path, default=_REPO / "datasets" / "walking" / "2026-11-01-15-43-46")
     p.add_argument(
         "--work-dir",
         type=Path,

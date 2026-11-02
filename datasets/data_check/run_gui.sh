@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch GUI multi-G1 mode-2 stability check for datasets/walking.
+# Launch GUI multi-G1 mode-2 stability check for a cleaned walking session.
 #
 # Usage:
 #   bash datasets/data_check/run_gui.sh [num_envs] [start] [end] [work_dir]
@@ -30,7 +30,7 @@ fi
 
 echo "[run_gui] root=$ROOT num_envs=$NUM_ENVS start=${START:-all} end=${END:-all} work=$WORK_DIR"
 python -m datasets.data_check pipeline \
-  --dataset datasets/walking \
+  --dataset datasets/walking/2026-11-01-15-43-46 \
   --work-dir "$WORK_DIR" \
   --num-envs "$NUM_ENVS" \
   --env-spacing 3.0 \

@@ -497,10 +497,11 @@ but flagged in `meta/info.json`. By default, the processing script removes these
 flagged episodes so they are excluded from fine-tuning:
 
 ```bash
-# Clean a single dataset (removes discarded episodes + stale SMPL frames)
+# Clean into a task root (one --output-path). Sessions land as
+# datasets/walking/<session_name>/, matching outputs/ folder names.
 python gear_sonic/scripts/process_dataset.py \
     --dataset-path outputs/my_dataset \
-    --output-path outputs/my_dataset_cleaned
+    --output-path datasets/walking
 ```
 
 To keep discarded episodes (e.g., for inspection), pass `--no-remove-discarded`.
@@ -516,10 +517,10 @@ frozen (identical) lead-in frames that precede them:
 python gear_sonic/scripts/process_dataset.py \
     --dataset-path outputs/my_dataset
 
-# Clean and write to a new directory (non-destructive)
+# Clean under a task root (non-destructive)
 python gear_sonic/scripts/process_dataset.py \
     --dataset-path outputs/my_dataset \
-    --output-path outputs/my_dataset_cleaned
+    --output-path datasets/walking
 ```
 
 ```{warning}
@@ -530,34 +531,48 @@ positions/orientations instead of SMPL body parameters. In this case, you
 
     python gear_sonic/scripts/process_dataset.py \
         --dataset-path outputs/my_dataset \
-        --output-path outputs/my_dataset_cleaned \
+        --output-path datasets/walking \
         --no-remove-stale-smpl
 ```
 
-### Merge Multiple Datasets
+### Output layout (default)
 
-Combine several recording sessions into a single dataset.  The script
+`--output-path` is a single task-root address. Each input session is written
+to its own folder named after the `outputs/<session>` directory:
+
+```bash
+python gear_sonic/scripts/process_dataset.py \
+    --dataset-path outputs/session1 outputs/session2 outputs/session3 \
+    --output-path datasets/walking
+# -> datasets/walking/session1
+# -> datasets/walking/session2
+# -> datasets/walking/session3
+```
+
+### Merge Multiple Datasets (optional)
+
+Pass `--merge` to combine several sessions into one dataset.  The script
 validates that all sessions share the same `script_config` (robot
 configuration) before merging:
 
 ```bash
-# Merge by listing datasets on the command line
 python gear_sonic/scripts/process_dataset.py \
     --dataset-path outputs/session1 outputs/session2 outputs/session3 \
-    --output-path outputs/merged_dataset
+    --output-path outputs/merged_dataset \
+    --merge
 
-# Or use a text file (one dataset path per line, # for comments)
 python gear_sonic/scripts/process_dataset.py \
     --dataset-list datasets.txt \
-    --output-path outputs/merged_dataset
+    --output-path outputs/merged_dataset \
+    --merge
 ```
 
-SMPL cleaning is applied by default during merging.  When enabled, the script
-removes entire frames where the SMPL teleop pose is stuck at zeros — this
-happens during operator pauses or ZMQ packet-drop periods where the SMPL
-stream stops updating.  Consecutive frozen (identical) frames that lead into
-a zero block are also removed, since they represent stale data right before
-the dropout.  To skip this cleaning and merge only, add `--no-remove-stale-smpl`.
+SMPL cleaning is applied by default.  When enabled, the script removes entire
+frames where the SMPL teleop pose is stuck at zeros — this happens during
+operator pauses or ZMQ packet-drop periods where the SMPL stream stops
+updating.  Consecutive frozen (identical) frames that lead into a zero block
+are also removed, since they represent stale data right before the dropout.
+To skip this cleaning, add `--no-remove-stale-smpl`.
 
 ---
 

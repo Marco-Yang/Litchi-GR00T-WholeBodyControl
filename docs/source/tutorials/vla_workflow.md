@@ -87,10 +87,13 @@ After collection, run the processing script to remove discarded episodes
 source .venv_data_collection/bin/activate
 python gear_sonic/scripts/process_dataset.py \
     --dataset-path outputs/2026-04-03-14-30-00-G1-robot01 \
-    --output-path outputs/my_task_cleaned
+    --output-path datasets/walking
+# -> datasets/walking/2026-04-03-14-30-00-G1-robot01
 ```
 
-This ensures only successful demonstrations are used for fine-tuning.
+`--output-path` is one task-root address; cleaned sessions are written as
+sibling folders named like `outputs/`. This ensures only successful
+demonstrations are used for fine-tuning.
 
 ## Step 2: Fine-tuning with Isaac-GR00T
 

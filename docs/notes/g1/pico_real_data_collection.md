@@ -250,20 +250,39 @@ python gear_sonic/scripts/validate_g1_sonic_vla_dataset.py \
 
 ### 5.2 清洗（微调前必做）
 
+去掉 discarded episode 与 stale SMPL 帧。`--output-path` **只填一个地址**（任务根目录，如 `datasets/walking`）；其下按与 `outputs/` 相同的 session 文件夹名分别落盘，不会合成一个大包：
+
 ```bash
+# 单 / 多 session 都行：只改 --output-path 这一处任务根目录
 python gear_sonic/scripts/process_dataset.py \
-  --dataset-path outputs/<dataset> \
-  --output-path outputs/<dataset>_cleaned
+  --dataset-path \
+    outputs/2026-11-01-15-43-46 \
+    outputs/2026-11-01-16-12-03 \
+  --output-path datasets/walking
+# -> datasets/walking/2026-11-01-15-43-46
+# -> datasets/walking/2026-11-01-16-12-03
 ```
 
-去掉 discarded episode 与 stale SMPL 帧。多 session 可同一命令 merge。
+落盘结构（与 `outputs/` 对齐）：
+
+```text
+datasets/walking/                 # <-- 外参只给这个地址
+├── 2026-11-01-15-43-46/          # 独立 LeRobot 数据集
+│   ├── data/
+│   ├── videos/
+│   └── meta/
+├── 2026-11-01-16-12-03/
+└── ...
+```
+
+若仍需合并成单一数据集，另加 `--merge` 并把 `--output-path` 指到合并后的目录。
 
 ### 5.3 微调（在 Isaac-GR00T 仓库）
 
 ```bash
 uv run python gr00t/experiment/launch_finetune.py \
   --base-model-path nvidia/GR00T-N1.7-3B \
-  --dataset-path /path/to/<dataset>_cleaned \
+  --dataset-path /path/to/datasets/walking/<session> \
   --embodiment-tag UNITREE_G1_SONIC \
   --modality-config-path gr00t/configs/data/embodiment_configs.py \
   ...
@@ -309,12 +328,14 @@ export OMNI_KIT_ACCEPT_EULA=YES
 export CUDA_VISIBLE_DEVICES=0
 ```
 
+清洗后每个 session 是独立数据集，回放时把 `--dataset` 指到具体 session 目录：
+
 ### 8.1 GUI 抽查（推荐先看一小段）
 
 ```bash
 python -m datasets.data_check pipeline \
-  --dataset datasets/walking \
-  --work-dir datasets/data_check/runs/walking_0_15 \
+  --dataset datasets/walking/2026-11-01-15-43-46 \
+  --work-dir datasets/data_check/runs/2026-11-01-15-43-46_0_15 \
   --start 0 --end 15 \
   --num-envs 0 \
   --env-spacing 6 \
@@ -325,8 +346,8 @@ python -m datasets.data_check pipeline \
 
 ```bash
 python -m datasets.data_check pipeline \
-  --dataset datasets/walking \
-  --work-dir datasets/data_check/runs/walking_all \
+  --dataset datasets/walking/2026-11-01-15-43-46 \
+  --work-dir datasets/data_check/runs/2026-11-01-15-43-46_all \
   --num-envs 21 \
   --env-spacing 6 \
   --headless \

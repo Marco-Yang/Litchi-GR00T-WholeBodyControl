@@ -11,36 +11,35 @@ The script operates directly on the LeRobot v2.1 on-disk format
 
 Usage:
 
-    # Clean a single dataset in-place
+    # Clean sessions into a task root (recommended).
+    # --output-path is one address (e.g. datasets/walking); each input is
+    # written to output_path/<session_name>/, same naming as outputs/.
+    python gear_sonic/scripts/process_dataset.py \\
+        --dataset-path outputs/2026-11-01-15-43-46 outputs/2026-11-01-16-12-03 \\
+        --output-path datasets/walking
+    # -> datasets/walking/2026-11-01-15-43-46
+    # -> datasets/walking/2026-11-01-16-12-03
+
+    # Single session under the same task root
+    python gear_sonic/scripts/process_dataset.py \\
+        --dataset-path outputs/2026-11-01-15-43-46 \\
+        --output-path datasets/walking
+
+    # Clean a single dataset in-place (omit --output-path)
     python gear_sonic/scripts/process_dataset.py \\
         --dataset-path outputs/my_dataset
 
-    # Clean and write to a new directory (non-destructive)
+    # Optional: merge multiple sessions into one dataset
     python gear_sonic/scripts/process_dataset.py \\
-        --dataset-path outputs/my_dataset \\
-        --output-path outputs/my_dataset_cleaned
-
-    # Merge multiple datasets into one (validates matching script_config)
-    python gear_sonic/scripts/process_dataset.py \\
-        --dataset-path outputs/session1 outputs/session2 outputs/session3 \\
-        --output-path outputs/merged_dataset
+        --dataset-path outputs/session1 outputs/session2 \\
+        --output-path outputs/merged_dataset \\
+        --merge
 
     # Merge from a text file listing dataset paths (one per line)
     python gear_sonic/scripts/process_dataset.py \\
         --dataset-list datasets.txt \\
-        --output-path outputs/merged_dataset
-
-    # Skip SMPL cleaning (merge only)
-    python gear_sonic/scripts/process_dataset.py \\
-        --dataset-path outputs/session1 outputs/session2 \\
-        --output-path outputs/merged \\
-        --no-remove-stale-smpl
-
-    # Remove discarded episodes (flagged during collection via 'x' key)
-    python gear_sonic/scripts/process_dataset.py \\
-        --dataset-path outputs/my_dataset \\
-        --output-path outputs/my_dataset_cleaned \\
-        --remove-discarded
+        --output-path outputs/merged_dataset \\
+        --merge
 """
 
 from dataclasses import dataclass, field
@@ -405,6 +404,8 @@ def write_output_dataset(
 
     info["total_episodes"] = len(all_episodes)
     info["total_frames"] = total_frames
+    info["total_videos"] = len(all_episodes) * len(get_video_keys(info))
+    info["splits"] = {"train": f"0:{len(all_episodes)}"}
     info.pop("discarded_episode_indices", None)
 
     with open(meta_dir / "info.json", "w", encoding="utf-8") as f:
@@ -449,8 +450,17 @@ class ProcessDatasetConfig:
     Can be used instead of or in addition to --dataset-path."""
 
     output_path: Optional[str] = None
-    """Output directory for the processed dataset. If not specified and a
-    single dataset is given, the dataset is modified in-place."""
+    """Task/output root address (one path). By default each input session is
+    written to ``output_path / <session_name>/`` (same folder names as under
+    ``outputs/``). Example: ``--output-path datasets/walking``.
+
+    If omitted and a single dataset is given, the dataset is modified in-place.
+    With ``--merge``, this is the single merged dataset directory."""
+
+    merge: bool = False
+    """Merge all inputs into one LeRobot dataset at ``--output-path``
+    (legacy behavior). Default is to keep sessions in separate folders
+    under ``--output-path``."""
 
     remove_stale_smpl: bool = True
     """Remove frames where teleop.smpl_pose is all zeros (stale/dropped
@@ -459,6 +469,90 @@ class ProcessDatasetConfig:
     remove_discarded: bool = True
     """Remove episodes that were flagged as discarded during data collection
     (stored in meta/info.json under discarded_episode_indices)."""
+
+
+def _empty_stats() -> dict:
+    return {
+        "total_episodes": 0,
+        "episodes_with_stale": 0,
+        "total_frames": 0,
+        "frames_removed": 0,
+        "zero_frames": 0,
+        "frozen_leadin_frames": 0,
+        "episodes_dropped": 0,
+        "episodes_discarded": 0,
+    }
+
+
+def _print_stats_summary(total_stats: dict, output_label: str):
+    kept = total_stats["total_frames"] - total_stats["frames_removed"]
+    kept_episodes = (
+        total_stats["total_episodes"]
+        - total_stats["episodes_dropped"]
+        - total_stats["episodes_discarded"]
+    )
+
+    print("\n" + "=" * 70)
+    print("  Processing complete!")
+    print("=" * 70)
+    print(
+        f"  Episodes:  {kept_episodes} kept / {total_stats['total_episodes']} total"
+        f"  ({total_stats['episodes_dropped']} dropped, "
+        f"{total_stats['episodes_discarded']} discarded)"
+    )
+    print(
+        f"  Frames:    {kept} kept / {total_stats['total_frames']} total"
+        f"  ({total_stats['frames_removed']} removed)"
+    )
+    if total_stats["frames_removed"] > 0:
+        print(f"    Zero SMPL:       {total_stats['zero_frames']}")
+        print(f"    Frozen lead-in:  {total_stats['frozen_leadin_frames']}")
+        print(f"    Episodes affected: {total_stats['episodes_with_stale']}")
+    print(f"  Output:    {output_label}")
+    print("=" * 70)
+
+
+def _collect_tasks(dataset_paths: list[Path]) -> list[dict]:
+    all_tasks_meta: list[dict] = []
+    seen_task_ids: set = set()
+    for ds in dataset_paths:
+        for task in load_tasks_meta(ds):
+            tid = task.get("task_index", id(task))
+            if tid not in seen_task_ids:
+                all_tasks_meta.append(task)
+                seen_task_ids.add(tid)
+    return all_tasks_meta
+
+
+def _process_and_write_one(
+    ds_path: Path,
+    output_path: Path,
+    *,
+    remove_stale_smpl: bool,
+    remove_discarded: bool,
+) -> dict:
+    """Clean one dataset and write it to ``output_path`` (non-in-place)."""
+    print(f"\nProcessing: {ds_path}")
+    stats, episodes, info = process_single_dataset(
+        ds_path,
+        remove_stale_smpl=remove_stale_smpl,
+        remove_discarded=remove_discarded,
+        episode_index_offset=0,
+    )
+    if not episodes:
+        print(f"  WARNING: No valid episodes after processing {ds_path}; skipping write")
+        return stats
+
+    tasks_meta = _collect_tasks([ds_path])
+    script_config = info.get("script_config")
+    print(f"  Writing -> {output_path}")
+    if output_path.exists():
+        shutil.rmtree(output_path)
+    write_output_dataset(
+        output_path, episodes, info, tasks_meta, script_config,
+    )
+    copy_modality_json([ds_path], output_path)
+    return stats
 
 
 def main(cfg: ProcessDatasetConfig):
@@ -484,11 +578,16 @@ def main(cfg: ProcessDatasetConfig):
             print(f"ERROR: Not a valid LeRobot dataset (missing meta/info.json): {ds}")
             raise SystemExit(1)
 
-    merging = len(dataset_paths) > 1
     in_place = cfg.output_path is None
+    merging = cfg.merge
+
+    if in_place and len(dataset_paths) > 1:
+        print("ERROR: Multiple datasets require --output-path "
+              "(task root, e.g. datasets/walking).")
+        raise SystemExit(1)
 
     if merging and in_place:
-        print("ERROR: --output-path is required when merging multiple datasets.")
+        print("ERROR: --output-path is required with --merge.")
         raise SystemExit(1)
 
     output_path = Path(cfg.output_path) if cfg.output_path else dataset_paths[0]
@@ -499,10 +598,47 @@ def main(cfg: ProcessDatasetConfig):
     print(f"  Input datasets:       {len(dataset_paths)}")
     for ds in dataset_paths:
         print(f"    - {ds}")
-    print(f"  Output:               {output_path}{'  (in-place)' if in_place else ''}")
+    if in_place:
+        print(f"  Output:               {output_path}  (in-place)")
+    elif merging:
+        print(f"  Output:               {output_path}")
+        print("  Mode:                 merge")
+    else:
+        print(f"  Output root:          {output_path}")
+        print("  Mode:                 per-session folders (like outputs/)")
+        for ds in dataset_paths:
+            print(f"    -> {output_path / ds.name}")
     print(f"  Remove stale SMPL:    {cfg.remove_stale_smpl}")
     print(f"  Remove discarded:     {cfg.remove_discarded}")
     print("=" * 70)
+
+    # ---- Default: one cleaned dataset per input session under output root ----
+    if not in_place and not merging:
+        output_path.mkdir(parents=True, exist_ok=True)
+        total_stats = _empty_stats()
+        written = []
+        for ds_path in dataset_paths:
+            dest = output_path / ds_path.name
+            stats = _process_and_write_one(
+                ds_path,
+                dest,
+                remove_stale_smpl=cfg.remove_stale_smpl,
+                remove_discarded=cfg.remove_discarded,
+            )
+            for key in total_stats:
+                total_stats[key] += stats[key]
+            if (dest / "meta" / "info.json").exists():
+                written.append(dest)
+
+        if not written:
+            print("\nERROR: No valid episodes after processing.")
+            raise SystemExit(1)
+
+        _print_stats_summary(
+            total_stats,
+            output_label="\n             ".join(str(p) for p in written),
+        )
+        return
 
     # Validate script configs match across all datasets
     if merging:
@@ -513,28 +649,11 @@ def main(cfg: ProcessDatasetConfig):
         info = load_info(dataset_paths[0])
         script_config = info.get("script_config")
 
-    # Collect tasks from all datasets (deduplicated)
-    all_tasks_meta: list[dict] = []
-    seen_task_ids: set = set()
-    for ds in dataset_paths:
-        for task in load_tasks_meta(ds):
-            tid = task.get("task_index", id(task))
-            if tid not in seen_task_ids:
-                all_tasks_meta.append(task)
-                seen_task_ids.add(tid)
+    all_tasks_meta = _collect_tasks(dataset_paths)
 
     # Process each dataset
     all_episodes = []
-    total_stats = {
-        "total_episodes": 0,
-        "episodes_with_stale": 0,
-        "total_frames": 0,
-        "frames_removed": 0,
-        "zero_frames": 0,
-        "frozen_leadin_frames": 0,
-        "episodes_dropped": 0,
-        "episodes_discarded": 0,
-    }
+    total_stats = _empty_stats()
     reference_info = None
 
     for ds_path in dataset_paths:
@@ -600,6 +719,8 @@ def main(cfg: ProcessDatasetConfig):
 
         ds_info["total_frames"] = sum(len(ep["df"]) for ep in all_episodes)
         ds_info["total_episodes"] = len(all_episodes)
+        ds_info["total_videos"] = len(all_episodes) * len(get_video_keys(ds_info))
+        ds_info["splits"] = {"train": f"0:{len(all_episodes)}"}
         if cfg.remove_discarded:
             ds_info.pop("discarded_episode_indices", None)
         with open(output_path / "meta" / "info.json", "w", encoding="utf-8") as f:
@@ -611,23 +732,7 @@ def main(cfg: ProcessDatasetConfig):
         )
         copy_modality_json(dataset_paths, output_path)
 
-    # Print summary
-    kept = total_stats["total_frames"] - total_stats["frames_removed"]
-    kept_episodes = total_stats["total_episodes"] - total_stats["episodes_dropped"] - total_stats["episodes_discarded"]
-
-    print("\n" + "=" * 70)
-    print("  Processing complete!")
-    print("=" * 70)
-    print(f"  Episodes:  {kept_episodes} kept / {total_stats['total_episodes']} total"
-          f"  ({total_stats['episodes_dropped']} dropped, {total_stats['episodes_discarded']} discarded)")
-    print(f"  Frames:    {kept} kept / {total_stats['total_frames']} total"
-          f"  ({total_stats['frames_removed']} removed)")
-    if total_stats["frames_removed"] > 0:
-        print(f"    Zero SMPL:       {total_stats['zero_frames']}")
-        print(f"    Frozen lead-in:  {total_stats['frozen_leadin_frames']}")
-        print(f"    Episodes affected: {total_stats['episodes_with_stale']}")
-    print(f"  Output:    {output_path}")
-    print("=" * 70)
+    _print_stats_summary(total_stats, output_label=str(output_path))
 
 
 if __name__ == "__main__":

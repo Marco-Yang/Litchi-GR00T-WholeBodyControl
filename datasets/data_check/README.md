@@ -1,6 +1,6 @@
 # Walking 数据 mode-2 Isaac 动力学核验（含可视化）
 
-把 `datasets/walking` 里的 **SMPL + 手部 qpos** 组装成 SONIC **encode mode 2（smpl）**，在 **Isaac Sim GUI** 里一次拉起多台 G1（每台对应 1 条 episode），同时用 GPU 做关节/SMPL 跳变检测，方便你肉眼观察平衡与抖动。
+把某个清洗后的 session（如 `datasets/walking/<outputs 同名目录>/`）里的 **SMPL + 手部 qpos** 组装成 SONIC **encode mode 2（smpl）**，在 **Isaac Sim GUI** 里一次拉起多台 G1（每台对应 1 条 episode），同时用 GPU 做关节/SMPL 跳变检测，方便你肉眼观察平衡与抖动。
 
 ## 目录
 
@@ -43,7 +43,7 @@ export OMNI_KIT_ACCEPT_EULA=YES
 export CUDA_VISIBLE_DEVICES=0
 
 python -m datasets.data_check pipeline \
-  --dataset datasets/walking \
+  --dataset datasets/walking/2026-11-01-15-43-46 \
   --work-dir datasets/data_check/runs/walking_gui \
   --num-envs 8 \
   --env-spacing 3.0
@@ -54,7 +54,7 @@ python -m datasets.data_check pipeline \
 ```bash
 # episode 0..15（共 16 条）；num_envs 建议 ≤ 区间长度
 python -m datasets.data_check pipeline \
-  --dataset datasets/walking \
+  --dataset datasets/walking/2026-11-01-15-43-46 \
   --work-dir datasets/data_check/runs/walking_0_15 \
   --start 0 --end 15 \
   --num-envs 8 \
@@ -62,7 +62,7 @@ python -m datasets.data_check pipeline \
 
 # 等价写法
 python -m datasets.data_check pipeline \
-  --dataset datasets/walking \
+  --dataset datasets/walking/2026-11-01-15-43-46 \
   --work-dir datasets/data_check/runs/walking_0_15 \
   --episodes 0-15 \
   --num-envs 8
@@ -84,7 +84,7 @@ bash datasets/data_check/run_gui.sh 4 20 27 datasets/data_check/runs/batch2
 
 ```bash
 python -m datasets.data_check pipeline \
-  --dataset datasets/walking \
+  --dataset datasets/walking/2026-11-01-15-43-46 \
   --work-dir datasets/data_check/runs/suspect_gui \
   --episodes 0,3,7,12 \
   --num-envs 4 \
@@ -97,7 +97,7 @@ python -m datasets.data_check pipeline \
 
 ```bash
 python -m datasets.data_check convert \
-  --dataset datasets/walking \
+  --dataset datasets/walking/2026-11-01-15-43-46 \
   --output datasets/data_check/runs/walking_gui/mode2 \
   --start 0 --end 15
 ```
@@ -106,7 +106,7 @@ python -m datasets.data_check convert \
 
 ```bash
 python -m datasets.data_check analyze \
-  --dataset datasets/walking \
+  --dataset datasets/walking/2026-11-01-15-43-46 \
   --output datasets/data_check/runs/walking_gui/joint_stability.json \
   --start 0 --end 15
 ```
