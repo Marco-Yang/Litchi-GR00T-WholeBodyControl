@@ -1,7 +1,7 @@
 # MuJoCo 仿真 + PICO 全身遥操操作指南
 
-本文说明如何在本机用 **PICO VR** 对 **MuJoCo 中的 Unitree G1** 做 SONIC 全身遥操。  
-环境需已按仓库 README 配置完成（`.venv_teleop`、C++ `gear_sonic_deploy`、模型文件、XRoboToolkit PC Service）。
+本文说明如何在本机用 **PICO VR** 对 **MuJoCo 中的 Unitree G1** 做 **SONIC v1.1** 全身遥操。  
+环境需已按仓库 README 配置完成（`.venv_teleop`、C++ `gear_sonic_deploy`、v1.1 模型文件、XRoboToolkit PC Service）。
 
 ---
 
@@ -41,25 +41,26 @@ run_sim_loop.py（MuJoCo 仿真窗口）
 仓库根目录（下文记为 `$REPO`）：
 
 ```text
-/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl
+/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 ```
 
 新开终端建议先：
 
 ```bash
 source ~/.bashrc
-# 确认已设置：
-#   export TensorRT_ROOT=$HOME/TensorRT
-#   export PATH=/usr/local/cuda-13.2/bin:$HOME/.local/bin:$PATH
+# 本机已确认：
+#   export TensorRT_ROOT=/usr
+#   export PATH=/usr/local/cuda-12.9/bin:$HOME/.local/bin:$PATH
 ```
 
-确认文件存在：
+确认文件存在（**G1 + SONIC v1.1**）：
 
 | 项 | 路径 |
 |---|---|
 | 遥操环境 | `$REPO/.venv_teleop` |
 | 部署可执行文件 | `$REPO/gear_sonic_deploy/target/release/g1_deploy_onnx_ref` |
-| 默认策略 | `$REPO/gear_sonic_deploy/policy/release/model_*.onnx` |
+| **SONIC v1.1 策略** | `$REPO/gear_sonic_deploy/policy/sonic_v1_1/model_{encoder,decoder}.onnx` |
+| **v1.1 观测配置** | `$REPO/gear_sonic_deploy/policy/sonic_v1_1/observation_config.yaml` |
 | Planner | `$REPO/gear_sonic_deploy/planner/target_vel/V2/planner_sonic.onnx` |
 
 硬件：
@@ -95,7 +96,7 @@ bash /opt/apps/roboticsservice/runService.sh
 
 | 地址 | 用途 |
 |---|---|
-| **192.168.110.79** | 无线网卡 `wlp8s0`。头显 PC Service 一栏填这个 |
+| **192.168.110.104** | 无线网卡 `wlp8s0`。头显 PC Service 一栏填这个 |
 | 100.95.251.103 | Tailscale，不要填 |
 | 198.18.0.1 | Meta 虚拟网卡，不要填 |
 
@@ -110,7 +111,7 @@ ip -4 -br addr show wlp8s0
 
 1. PICO 与电脑连同一 Wi‑Fi。
 2. 打开 **XRoboToolkit** App。
-3. 在 **PC Service** 填入 **192.168.110.79**；状态显示 **WORKING** 即连接成功。若已填过，点 **Reconnect**。
+3. 在 **PC Service** 填入 **192.168.110.104**；状态显示 **WORKING** 即连接成功。若已填过，点 **Reconnect**。
 4. 勾选：
    - Tracking：`Head`、`Controller`
    - Data/Control：点 **Send**
@@ -124,45 +125,59 @@ ip -4 -br addr show wlp8s0
 
 ## 2. 三个终端启动
 
-开始前确认第 1 节已经完成：PC Service 进程在运行，头显状态是 **WORKING**，并且已经点了 **Send**。PC Service 没起来时，头显填 `192.168.110.79` 会报 `connect_error TCP connection failed`。
+开始前确认第 1 节已经完成：PC Service 进程在运行，头显状态是 **WORKING**，并且已经点了 **Send**。PC Service 没起来时，头显填 `192.168.110.104` 会报 `connect_error TCP connection failed`。
+
+> **顺序**：先终端 1（等 MuJoCo 窗口出现）→ 再终端 2（等到 **`Init Done`**）→ 最后终端 3。  
+> G1 本机固定用 **SONIC v1.1**，不要用 `policy/release`。
 
 ### 终端 1 — MuJoCo 仿真
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/run_sim_loop.py --robot g1
 ```
 
 应弹出 MuJoCo 窗口；机器人初始可能悬空，属正常。
 
-### 终端 2 — C++ 策略（等终端 1 就绪后再开）
+### 终端 2 — C++ 策略（SONIC v1.1）
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl/gear_sonic_deploy"
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl/gear_sonic_deploy
 source scripts/setup_env.sh
-./deploy.sh --robot g1 --input-type zmq_manager sim
-```
-
-等到日志出现 **`Init Done`** 再继续。
-
-使用 **SONIC v1.1** 时：
-
-```bash
 ./deploy.sh \
   --robot g1 \
   --cp policy/sonic_v1_1/model \
   --obs-config policy/sonic_v1_1/observation_config.yaml \
   --input-type zmq_manager \
+  --motor-kp-scale 4,10=1.5 \
+  --motor-kd-scale 4,10=1.5 \
   sim
 ```
+
+脚本会询问是否确认部署，输入 `Y` 回车。等到日志出现 **`Init Done`** 再继续。  
+确认日志里 encoder/decoder/obs-config 路径都带 `policy/sonic_v1_1/`。
+
+| 参数 | 含义 |
+|---|---|
+| `--cp policy/sonic_v1_1/model` | v1.1 模型前缀（自动拼 `_encoder.onnx` / `_decoder.onnx`） |
+| `--obs-config policy/sonic_v1_1/observation_config.yaml` | 必须与 v1.1 模型配套，勿混用 release |
+| `--input-type zmq_manager` | 接收终端 3 的 PICO / ZMQ 数据 |
+| `--motor-kp/kd-scale 4,10=1.5` | 左右踝 pitch（硬件索引 4、10）增益 ×1.5（v1.1 推荐） |
+| `sim` | 仿真模式（禁用 CRC，走 loopback） |
+
+> `deploy.sh` 对本机默认已指向 v1.1；上表参数请**显式写出**，避免误用旧 checkpoint。
 
 ### 终端 3 — PICO 数据流
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 source .venv_teleop/bin/activate
-python gear_sonic/scripts/pico_manager_thread_server.py --robot g1 --manager --vis_vr3pt --vis_smpl
+python gear_sonic/scripts/pico_manager_thread_server.py \
+  --robot g1 \
+  --manager \
+  --vis_vr3pt \
+  --vis_smpl
 ```
 
 应再弹出可视化窗口（G1 参考姿态 / SMPL）。首次建议带 `--vis_vr3pt --vis_smpl`，确认跟踪正常后再去掉可视化以减负。
@@ -218,8 +233,8 @@ python gear_sonic/scripts/pico_manager_thread_server.py --robot g1 --manager --v
 | 脚部乱、易摔 | Tracker 未配对、电池不足、衣物遮挡；重新标定 |
 | 动作一顿一顿 | Wi‑Fi 延迟；终端 2 若出现 `High ZMQ latency`，换近距离私有路由 |
 | 延迟参考 | 好：&lt;10 ms；可接受：10–30 ms；差：&gt;30 ms |
-| 找不到 TensorRT | `source ~/.bashrc`，确认 `echo $TensorRT_ROOT` 为 `$HOME/TensorRT` |
-| 路径含空格 | 命令中的 `cd` 路径请始终加引号（本仓库路径含空格） |
+| 找不到 TensorRT | `source ~/.bashrc`，确认 `echo $TensorRT_ROOT` 为 `/usr`；`LD_LIBRARY_PATH` 含 `/usr/lib/x86_64-linux-gnu` 与 `/usr/local/cuda-12.9/lib64` |
+| 策略不是 v1.1 | 检查终端 2 日志：路径必须是 `policy/sonic_v1_1/`，不要用 `policy/release` |
 
 ---
 
@@ -231,12 +246,19 @@ python gear_sonic/scripts/pico_manager_thread_server.py --robot g1 --manager --v
 4. 再练自然行走与转向。
 5. **仿真熟练并会急停后**，再按 `docs/notes/pico_real_teleop.md` 上真机。真机时必须先关掉 `run_sim_loop.py`（sim 与 real 不能同时跑）。
 
-真机启动示例（勿与终端 1 同时开；完整步骤见 `docs/notes/pico_real_teleop.md`）：
+真机启动示例（勿与终端 1 同时开；完整步骤见 [pico_real_teleop.md](pico_real_teleop.md)）：
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl/gear_sonic_deploy"
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl/gear_sonic_deploy
 source scripts/setup_env.sh
-./deploy.sh --robot g1 --input-type zmq_manager real
+./deploy.sh \
+  --robot g1 \
+  --cp policy/sonic_v1_1/model \
+  --obs-config policy/sonic_v1_1/observation_config.yaml \
+  --input-type zmq_manager \
+  --motor-kp-scale 4,10=1.5 \
+  --motor-kd-scale 4,10=1.5 \
+  real
 ```
 
 ---
@@ -260,7 +282,7 @@ source scripts/setup_env.sh
 **一次性准备**（只需做一次）：
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl/gear_sonic_deploy"
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl/gear_sonic_deploy
 ./scripts/setup_a3_sim_env.sh        # 给 conda 环境 a3_deploy_verify 装 mujoco + joint_msgs Python 绑定
 ```
 
@@ -270,18 +292,19 @@ cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl/gear_sonic
 
 - 唯一可下载的权重是 Hugging Face `sonic-for-a3/sonic` 的 `035_step200000`（PT / ONNX / RKNN；整个 HF 与 GitHub 上没有 A3 Ultra 专属权重）。官方 README 与发布元数据（`config.json` 里 `"robots": ["A3", "A3 Ultra"]`、`"policy_joints": 29`）都明确说它同时支持 A3 与 A3 Ultra（训练用 A3 的 URDF，域随机化针对 A3 / A3U 两者调过）。下载命令：
   ```bash
+  cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
   python download_from_hf.py --robot a3_ultra --component onnx      # 部署/仿真用（g1 与 a3_fast 两个 ONNX）
   python download_from_hf.py --robot a3_ultra --component rknn      # RK3588 板子用
   python download_from_hf.py --robot a3_ultra --component pt        # PyTorch 权重（继续训练/导出用）
   ```
 - 策略只驱动 **29 个身体关节**。A3 Ultra 多出来的两个头关节**固定在默认姿态**（q=0，Kp=40 / Kd=2，与 A3 完全一致），手指不驱动；其余 29 个关节的输出、Kp/Kd、动作缩放、默认站姿都和 A3 一致。Pico 链路里的重定向节点默认也不发送头部角度（`a3_teleop_retarget_node.py --track-head` 才会发）。
 - 兼容性的依据和本机验证见 `docs/workflow/a3_integration_plan.md` 第 14 节；**真机未验证**。
-> 仓库路径含空格会让部分脚本拆分参数，建议用无空格软链接路径，例如 `ln -s "$REPO" /tmp/gwbc`，下面都在 `/tmp/gwbc` 下执行。
 
 ### 终端 1 — MuJoCo 仿真
 
 ```bash
-cd /tmp/gwbc && source .venv_teleop/bin/activate
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
+source .venv_teleop/bin/activate
 python gear_sonic/scripts/run_sim_loop.py --robot a3_ultra
 ```
 
@@ -291,7 +314,7 @@ python gear_sonic/scripts/run_sim_loop.py --robot a3_ultra
 ### 终端 2 — C++ 策略 + Pico 重定向链
 
 ```bash
-cd /tmp/gwbc/gear_sonic_deploy
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl/gear_sonic_deploy
 source scripts/setup_env.sh
 ./deploy.sh --robot a3_ultra --input-type zmq_manager sim --encoder a3-fast      # 默认，下载的 035 a3_fast 权重
 ```
@@ -316,7 +339,8 @@ source scripts/setup_env.sh
 ### 终端 3 — PICO 数据流
 
 ```bash
-cd /tmp/gwbc && source .venv_teleop/bin/activate
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
+source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manager_thread_server.py --robot a3_ultra --manager --num_frames_to_send 10
 ```
 

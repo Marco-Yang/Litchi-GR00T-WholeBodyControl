@@ -62,15 +62,15 @@ PICO 头显 + 手柄 + 脚踝 Tracker
 
 ### 3.1 本机 IP（填进 PICO 的就是这个）
 
-本机 `hostname -I` 的实际输出：
+本机 `hostname -I` 的实际输出（以当前机器为准，会变）：
 
 ```text
-192.168.110.79 198.18.0.1
+192.168.110.104 198.18.0.1
 ```
 
 | 地址 | 用途 |
 |---|---|
-| **192.168.110.79** | 局域网地址。PICO 的 XRoboToolkit 里填这个 |
+| **192.168.110.104**（`wlp8s0`） | 局域网地址。PICO 的 XRoboToolkit 里填这个 |
 | 198.18.0.1 | 代理/虚拟网卡地址，不要填进 PICO |
 
 需要重新确认时再跑：
@@ -85,28 +85,28 @@ hostname -I
 
 | 检查项 | 本机实际值 |
 |---|---|
-| `$TensorRT_ROOT` | `/home/user/TensorRT` |
-| `nvcc` | `/usr/local/cuda-13.2/bin/nvcc` |
+| `$TensorRT_ROOT` | `/usr` |
+| `nvcc` | `/usr/local/cuda-12.9/bin/nvcc` |
 
 需要重新确认时再跑：
 
 ```bash
 source ~/.bashrc
-echo $TensorRT_ROOT    # /home/user/TensorRT
-which nvcc             # /usr/local/cuda-13.2/bin/nvcc
+echo $TensorRT_ROOT    # /usr
+which nvcc             # /usr/local/cuda-12.9/bin/nvcc
 ```
 
 如果输出为空，手动补上：
 
 ```bash
-export TensorRT_ROOT=$HOME/TensorRT
-export PATH=/usr/local/cuda-13.2/bin:$HOME/.local/bin:$PATH
+export TensorRT_ROOT=/usr
+export PATH=/usr/local/cuda-12.9/bin:$HOME/.local/bin:$PATH
 ```
 
 ### 3.3 确认模型文件存在
 
 ```bash
-REPO="/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+REPO="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl"
 
 ls -lh \
   "$REPO/gear_sonic_deploy/target/release/g1_deploy_onnx_ref" \
@@ -131,7 +131,7 @@ ls -lh \
 ### 3.4 确认 Python 环境
 
 ```bash
-REPO="/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+REPO="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl"
 "$REPO/.venv_teleop/bin/python" -c \
   "import xrobotoolkit_sdk, mujoco, pinocchio, zmq; print('OK mujoco', mujoco.__version__)"
 # 期望输出：OK mujoco 3.15.0
@@ -171,7 +171,7 @@ PICO 与电脑必须在同一网络。在 PICO 控制中心底部确认已连 Wi
 在 `PC Service` 一栏点 `Enter`，输入本机局域网地址：
 
 ```text
-192.168.110.79
+192.168.110.104
 ```
 
 不要填 `198.18.0.1`。确认后状态栏显示 **WORKING** 表示连接成功。若已填写，点 **Reconnect**。
@@ -212,9 +212,9 @@ Settings → Developer → Safeguard → **关闭**
 ### 终端 1 — MuJoCo 仿真
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 source .venv_teleop/bin/activate
-python gear_sonic/scripts/run_sim_loop.py
+python gear_sonic/scripts/run_sim_loop.py --robot g1
 ```
 
 **预期结果**：弹出 MuJoCo 窗口，G1 机器人出现在场景中（可能初始悬空，属正常）。
@@ -226,10 +226,11 @@ python gear_sonic/scripts/run_sim_loop.py
 等终端 1 的 MuJoCo 窗口稳定后，打开新终端：
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl/gear_sonic_deploy"
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl/gear_sonic_deploy
 source scripts/setup_env.sh
 
 ./deploy.sh \
+  --robot g1 \
   --cp policy/sonic_v1_1/model \
   --obs-config policy/sonic_v1_1/observation_config.yaml \
   --input-type zmq_manager \
@@ -242,8 +243,9 @@ source scripts/setup_env.sh
 
 | 参数 | 含义 |
 |---|---|
+| `--robot g1` | 指定 G1（与终端 1/3 一致） |
 | `--cp policy/sonic_v1_1/model` | 指定 SONIC v1.1 模型前缀（会自动拼 `_encoder.onnx` / `_decoder.onnx`） |
-| `--obs-config policy/sonic_v1_1/observation_config.yaml` | 使用 v1.1 的观测配置（不能混用默认配置） |
+| `--obs-config policy/sonic_v1_1/observation_config.yaml` | 使用 v1.1 的观测配置（不能混用 release） |
 | `--input-type zmq_manager` | 接收 PICO 遥操数据（通过 ZMQ） |
 | `--motor-kp-scale 4,10=1.5` | 左脚踝 pitch（索引 4）和右脚踝 pitch（索引 10）Kp 增益 ×1.5 |
 | `--motor-kd-scale 4,10=1.5` | 同上，Kd 增益 ×1.5 |
@@ -251,19 +253,20 @@ source scripts/setup_env.sh
 
 脚本会询问是否确认部署，输入 `Y` 回车。
 
-**预期结果**：日志滚动，最终出现 **`Init done`**。
+**预期结果**：日志滚动，最终出现 **`Init Done`**；路径须含 `policy/sonic_v1_1/`。
 
 ---
 
 ### 终端 3 — PICO 数据流
 
-等终端 2 出现 `Init done` 后，打开新终端：
+等终端 2 出现 `Init Done` 后，打开新终端：
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 source .venv_teleop/bin/activate
 
 python gear_sonic/scripts/pico_manager_thread_server.py \
+  --robot g1 \
   --manager \
   --vis_vr3pt \
   --vis_smpl
@@ -417,9 +420,9 @@ sudo ufw status    # 若 active，考虑暂时关闭或放行相关端口
 
 ```bash
 source ~/.bashrc
-# 或手动：
-export TensorRT_ROOT=$HOME/TensorRT
-export LD_LIBRARY_PATH=$TensorRT_ROOT/lib:$LD_LIBRARY_PATH
+# 或手动（deb 安装的 TensorRT 10.13 在系统路径）：
+export TensorRT_ROOT=/usr
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda-12.9/lib64:$LD_LIBRARY_PATH
 ```
 
 然后重新运行终端 2 的命令。
@@ -450,10 +453,11 @@ export LD_LIBRARY_PATH=$TensorRT_ROOT/lib:$LD_LIBRARY_PATH
 **终端 2 — 真机策略**
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl/gear_sonic_deploy"
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl/gear_sonic_deploy
 source scripts/setup_env.sh
 
 ./deploy.sh \
+  --robot g1 \
   --cp policy/sonic_v1_1/model \
   --obs-config policy/sonic_v1_1/observation_config.yaml \
   --input-type zmq_manager \
@@ -468,9 +472,9 @@ source scripts/setup_env.sh
 **终端 3 — PICO 数据流（与仿真相同，可去掉可视化节省资源）**
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 source .venv_teleop/bin/activate
-python gear_sonic/scripts/pico_manager_thread_server.py --manager
+python gear_sonic/scripts/pico_manager_thread_server.py --robot g1 --manager
 ```
 
 遥操操作流程与仿真完全一致，急停方法也相同。
@@ -481,7 +485,7 @@ python gear_sonic/scripts/pico_manager_thread_server.py --manager
 
 ```
 仓库根目录：
-/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl/
+/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl/
 │
 ├── .venv_teleop/                          # 遥操 Python 环境
 │

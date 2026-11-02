@@ -280,13 +280,18 @@ esac
 INTERFACE_MODE="real"
 
 # Default configuration values (can be overridden by command line)
-CHECKPOINT_DEFAULT="policy/release/model"
-OBS_CONFIG_DEFAULT="policy/release/observation_config.yaml"
+# Prefer SONIC v1.1 (heading-normalized + wrist-pose aug). Do not silently fall
+# back to policy/release — that is a different checkpoint family.
+CHECKPOINT_DEFAULT="policy/sonic_v1_1/model"
+OBS_CONFIG_DEFAULT="policy/sonic_v1_1/observation_config.yaml"
 PLANNER_DEFAULT="planner/target_vel/V2/planner_sonic.onnx"
 MOTION_DATA_DEFAULT="reference/example/"
 INPUT_TYPE_DEFAULT="manager"
 OUTPUT_TYPE_DEFAULT="all"
 ZMQ_HOST_DEFAULT="localhost"
+# Tested SONIC v1.1 ankle-pitch gain tuning (hardware indices 4 and 10).
+MOTOR_KP_SCALE_DEFAULTS=("4,10=1.5")
+MOTOR_KD_SCALE_DEFAULTS=("4,10=1.5")
 
 # Initialize with defaults (will be set after parsing)
 CHECKPOINT="$CHECKPOINT_DEFAULT"
@@ -389,6 +394,14 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Apply SONIC v1.1 gain defaults only when the caller did not override them.
+if [[ ${#MOTOR_KP_SCALES[@]} -eq 0 ]]; then
+    MOTOR_KP_SCALES=("${MOTOR_KP_SCALE_DEFAULTS[@]}")
+fi
+if [[ ${#MOTOR_KD_SCALES[@]} -eq 0 ]]; then
+    MOTOR_KD_SCALES=("${MOTOR_KD_SCALE_DEFAULTS[@]}")
+fi
 
 # ============================================================================
 # Display Header

@@ -495,24 +495,27 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
 
     Args:
         hand: "left" or "right"
-        trigger: Trigger button value (0-1)
-        grip: Grip button value (0-1)
+        trigger: Trigger value (0-1). Dex3 is **closed by default**;
+            press Trigger (>0.5) to **open**. Grip does not drive the hand.
+        grip: unused for hand open/close (kept for call-site compat).
+            Left Grip+A / Left Grip+B remain recording start/abort only.
 
     Returns:
-        Array of shape [25, 4, 4] representing fingertip positions
+        Array of shape [25, 4, 4] representing fingertip positions.
 
-    Close Dex3 when either Trigger OR Grip is pressed (>0.5). Grip is also used
-    in recording chords (Left Grip+A / Left Grip+B); holding Grip therefore both
-    closes that hand and populates ``teleop.*_hand_joints`` for VLA labels.
+    Encoding (see G1GripperInverseKinematicsSolver): thumb tip at x=1;
+    middle tip at x=1 → grip≈1 (closed); middle tip at x=0 → grip≈0 (open).
     """
+    del grip  # recording chords only; do not drive Dex3 on Grip
     fingertips = np.zeros([25, 4, 4])
 
     thumb = 0
     middle = 10
-    # Control thumb based on shoulder button state (index 4 is thumb tip)
-    fingertips[4 + thumb, 0, 3] = 1.0  # open thumb
-    if trigger > 0.5 or grip > 0.5:
-        fingertips[4 + middle, 0, 3] = 1.0  # close middle
+    # Thumb tip reference at x=1; middle tip x encodes close amount.
+    fingertips[4 + thumb, 0, 3] = 1.0
+    # Default closed; Trigger opens (invert of previous close-on-trigger).
+    if trigger <= 0.5:
+        fingertips[4 + middle, 0, 3] = 1.0  # closed
 
     return fingertips
 

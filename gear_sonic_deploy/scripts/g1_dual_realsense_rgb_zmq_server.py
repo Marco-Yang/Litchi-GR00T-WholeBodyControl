@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import json
+import os
 import signal
 import sys
 import threading
@@ -22,6 +24,27 @@ import msgpack
 import numpy as np
 import pyrealsense2 as rs
 import zmq
+
+DEFAULT_WRIST_STATUS_FILE = "/tmp/g1_wrist_status.json"
+
+
+def read_wrist_status(path, max_age_s=3.0):
+    """Return (left_err, right_err, fps_str) or None if wrist status unavailable."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        age = time.time() - os.path.getmtime(path)
+        with open(path, "r") as f:
+            data = json.load(f)
+        if age > max_age_s and not data.get("alive", False):
+            return ("stale", "stale", "-")
+        if age > max_age_s:
+            return ("stale(%.1fs)" % age, "stale(%.1fs)" % age, "-")
+        fps = data.get("fps")
+        fps_s = "-" if fps is None else ("%.1f" % float(fps))
+        return (data.get("left_err"), data.get("right_err"), fps_s)
+    except Exception:
+        return None
 
 
 def encode_jpeg_b64(rgb_image, quality=80):
@@ -88,6 +111,17 @@ def main():
     ap.add_argument("--width", type=int, default=640)
     ap.add_argument("--height", type=int, default=480)
     ap.add_argument("--jpeg-quality", type=int, default=80)
+    ap.add_argument(
+        "--wrist-status-file",
+        default=os.environ.get("G1_WRIST_STATUS_FILE", DEFAULT_WRIST_STATUS_FILE),
+        help="Optional JSON from g1_wrist_abham; when present, status line includes wrist errs",
+    )
+    ap.add_argument(
+        "--show-wrist-status",
+        action="store_true",
+        default=os.environ.get("G1_SHOW_WRIST_STATUS", "0") in ("1", "true", "TRUE", "yes"),
+        help="Always print wrist fields (offline if status file missing)",
+    )
     args = ap.parse_args()
 
     print("[g1-dual-rgb] devices:")
@@ -146,8 +180,8 @@ def main():
             idx += 1
             if sent % 30 == 0:
                 now = time.monotonic()
-                print(
-                    "[g1-dual-rgb] sent=%d dropped=%d fps=%.1f ego_err=%s head_err=%s"
+                line = (
+                    "[g1-cam] sent=%d dropped=%d fps=%.1f ego_err=%s head_err=%s"
                     % (
                         sent,
                         dropped,
@@ -156,6 +190,13 @@ def main():
                         head._err,
                     )
                 )
+                wrist = read_wrist_status(args.wrist_status_file)
+                if wrist is not None:
+                    wl, wr, wfps = wrist
+                    line += " | wrist_fps=%s left_err=%s right_err=%s" % (wfps, wl, wr)
+                elif args.show_wrist_status:
+                    line += " | wrist_fps=- left_err=offline right_err=offline"
+                print(line)
                 fps_t = now
 
         sleep_t = target - time.monotonic()

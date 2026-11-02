@@ -1,26 +1,23 @@
 """
 ROS-free camera viewer with optional recording.
 
-Connects to a ZMQ camera server (MuJoCo sim SensorServer or real robot camera)
-and displays live camera feeds using OpenCV. Supports recording to MP4.
+Connects to one or more ZMQ camera servers and displays whatever streams arrive
+(OpenCV). Supports recording to MP4.
 
 Virtual environment setup (run from repo root):
     bash install_scripts/install_data_collection.sh
     source .venv_data_collection/bin/activate
 
-Usage:
-    python gear_sonic/scripts/run_camera_viewer.py --camera-host localhost --camera-port 5555
+Usage (shows whatever streams are live — 1..4 of ego/head/wrists):
+    python gear_sonic/scripts/run_camera_viewer.py \\
+      --camera-host 192.168.123.164
 
 Controls (OpenCV window must be focused):
     R - Start/stop recording
     Q - Quit
-
-Output structure:
-    camera_recordings/
-    └── rec_20260403_143052/
-        ├── ego_view.mp4
-        └── head_left_color_image.mp4
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +31,13 @@ import tyro
 from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 
 
+# Preferred tile order when present; unknown names append alphabetically.
+_STREAM_ORDER = ("ego_view", "head", "left_wrist", "right_wrist")
+
+_DEFAULT_EGO_HEAD_PORT = 5555
+_DEFAULT_WRIST_PORT = 5558
+
+
 @dataclass
 class CameraViewerConfig:
     """CLI config for the ROS-free camera viewer."""
@@ -41,8 +45,14 @@ class CameraViewerConfig:
     camera_host: str = "localhost"
     """Camera server hostname."""
 
-    camera_port: int = 5555
-    """Camera server port."""
+    camera_port: int = _DEFAULT_EGO_HEAD_PORT
+    """ZMQ port for ego_view + head (default 5555)."""
+
+    wrist_port: int = _DEFAULT_WRIST_PORT
+    """ZMQ port for wrist Abham server (default 5558). Always subscribed; missing streams are skipped."""
+
+    camera_ports: Optional[tuple[int, ...]] = None
+    """Override: explicit ZMQ PUB ports only (default: camera_port + wrist_port)."""
 
     fps: int = 30
     """Target display refresh rate (Hz)."""
@@ -53,26 +63,100 @@ class CameraViewerConfig:
     codec: str = "mp4v"
     """Video codec for recording (e.g., 'mp4v', 'XVID')."""
 
-    max_display_width: int = 640
+    max_display_width: int = 480
     """Max width per camera tile in the display window."""
+
+    wait_secs: float = 10.0
+    """How long to wait for the first frame from any port."""
+
+
+def _resolve_ports(config: CameraViewerConfig) -> list[int]:
+    if config.camera_ports:
+        return list(config.camera_ports)
+    ports = [config.camera_port]
+    if config.wrist_port not in ports:
+        ports.append(config.wrist_port)
+    return ports
+
+
+def _ordered_names(names: set[str]) -> list[str]:
+    ordered = [n for n in _STREAM_ORDER if n in names]
+    rest = sorted(names - set(ordered))
+    return ordered + rest
+
+
+def _merge_latest(clients: list[ComposedCameraClientSensor]) -> dict:
+    """Merge images/timestamps from all ports; later ports override same key."""
+    images: dict = {}
+    timestamps: dict = {}
+    for client in clients:
+        msg = client.read(blocking=False)
+        if not msg:
+            continue
+        if msg.get("images"):
+            images.update(msg["images"])
+        if msg.get("timestamps"):
+            timestamps.update(msg["timestamps"])
+    if not images:
+        return {}
+    return {"images": images, "timestamps": timestamps}
+
+
+def _layout_tiles(tiles: list[np.ndarray]) -> np.ndarray:
+    """1–2: row; 3–4: 2x2; more: wrap at 2 columns."""
+    if not tiles:
+        return np.zeros((240, 320, 3), dtype=np.uint8)
+
+    max_h = max(t.shape[0] for t in tiles)
+    max_w = max(t.shape[1] for t in tiles)
+
+    def pad(t: np.ndarray) -> np.ndarray:
+        h, w = t.shape[:2]
+        out = np.zeros((max_h, max_w, 3), dtype=np.uint8)
+        out[:h, :w] = t
+        return out
+
+    padded = [pad(t) for t in tiles]
+    n = len(padded)
+    if n <= 2:
+        return np.hstack(padded)
+
+    cols = 2
+    rows = []
+    for i in range(0, n, cols):
+        row = padded[i : i + cols]
+        while len(row) < cols:
+            row.append(np.zeros((max_h, max_w, 3), dtype=np.uint8))
+        rows.append(np.hstack(row))
+    return np.vstack(rows)
 
 
 def main(config: CameraViewerConfig):
-    client = ComposedCameraClientSensor(server_ip=config.camera_host, port=config.camera_port)
+    ports = _resolve_ports(config)
+    clients = [
+        ComposedCameraClientSensor(server_ip=config.camera_host, port=p) for p in ports
+    ]
+    print(f"Subscribing {config.camera_host}:{ports}")
 
-    print("Waiting for first camera frame...")
-    sample = None
-    for _ in range(100):
-        sample = client.read(blocking=False)
-        if sample and sample.get("images"):
+    print("Waiting for first camera frame from any port...")
+    sample = {}
+    deadline = time.time() + config.wait_secs
+    while time.time() < deadline:
+        sample = _merge_latest(clients)
+        if sample.get("images"):
             break
-        time.sleep(0.1)
+        time.sleep(0.05)
 
-    if sample is None or not sample.get("images"):
-        print("ERROR: No camera frames received after 10s. Check the camera server.")
+    if not sample.get("images"):
+        print(
+            f"ERROR: No camera frames after {config.wait_secs:.0f}s. "
+            f"Check servers on {config.camera_host}:{ports}."
+        )
+        for c in clients:
+            c.close()
         return
 
-    camera_names = sorted(sample["images"].keys())
+    camera_names = _ordered_names(set(sample["images"].keys()))
     print(f"Detected {len(camera_names)} camera stream(s): {camera_names}")
 
     output_dir = Path(config.output_path) if config.output_path else Path("camera_recordings")
@@ -85,7 +169,6 @@ def main(config: CameraViewerConfig):
     loop_period = 1.0 / config.fps
 
     window_name = "SONIC Camera Viewer"
-
     print(f"Target FPS: {config.fps}")
     print(f"Recordings will be saved to: {output_dir}")
     print("Controls: R = start/stop recording, Q = quit")
@@ -94,13 +177,16 @@ def main(config: CameraViewerConfig):
         while True:
             t_start = time.monotonic()
 
-            image_data = client.read(blocking=False)
-            if image_data is None or not image_data.get("images"):
+            image_data = _merge_latest(clients)
+            if not image_data.get("images"):
                 elapsed = time.monotonic() - t_start
                 remaining = loop_period - elapsed
                 if remaining > 0:
                     time.sleep(remaining)
                 continue
+
+            # Hot-plug / late ports: show whatever is present this frame.
+            camera_names = _ordered_names(set(image_data["images"].keys()))
 
             tiles = []
             for name in camera_names:
@@ -108,7 +194,7 @@ def main(config: CameraViewerConfig):
                 if img is None:
                     continue
 
-                if img.shape[2] == 3:
+                if img.ndim == 3 and img.shape[2] == 3:
                     img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                 else:
                     img_bgr = img
@@ -123,34 +209,33 @@ def main(config: CameraViewerConfig):
                         img_bgr, (config.max_display_width, int(h * scale))
                     )
 
-                label = f"{name}"
-                if is_recording:
-                    label = f"[REC] {name}"
+                label = f"[REC] {name}" if is_recording else name
                 cv2.putText(
-                    img_bgr, label, (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
+                    img_bgr,
+                    label,
+                    (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2,
                 )
                 tiles.append(img_bgr)
 
             if tiles:
-                max_h = max(t.shape[0] for t in tiles)
-                padded = []
-                for t in tiles:
-                    if t.shape[0] < max_h:
-                        pad = np.zeros(
-                            (max_h - t.shape[0], t.shape[1], 3), dtype=np.uint8
-                        )
-                        t = np.vstack([t, pad])
-                    padded.append(t)
-                canvas = np.hstack(padded)
+                canvas = _layout_tiles(tiles)
 
                 if is_recording:
                     frame_count += 1
                     elapsed_rec = time.time() - recording_start_time
                     status = f"REC {frame_count}f / {elapsed_rec:.1f}s"
                     cv2.putText(
-                        canvas, status, (canvas.shape[1] - 300, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2,
+                        canvas,
+                        status,
+                        (10, canvas.shape[0] - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 0, 255),
+                        2,
                     )
 
                 cv2.imshow(window_name, canvas)
@@ -206,7 +291,8 @@ def main(config: CameraViewerConfig):
                 duration = time.time() - recording_start_time
                 print(f"Final recording: {duration:.1f}s, {frame_count} frames")
 
-        client.close()
+        for c in clients:
+            c.close()
         cv2.destroyAllWindows()
 
 

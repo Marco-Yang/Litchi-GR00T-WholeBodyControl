@@ -34,7 +34,7 @@ gear_sonic_deploy（C++ 策略，--input-type zmq_manager real）
 | 1 部署 | `./deploy.sh --robot g1 ... real` | `--robot` 写在 `real` 之前。`a3` / `a3_ultra` 转给 `scripts/deploy_a3.sh`。`h2` 暂无 C++ 后端 |
 | 2 Pico | `pico_manager_thread_server.py --robot g1 --manager` | 决定用哪个机器人的 IK/FK 模型 |
 
-头显填的是这台电脑的 **Wi‑Fi 地址**（当前 `wlp8s0` 为 **192.168.50.61**，以 `ip -4 -br addr show wlp8s0` 为准），用来收 PICO 数据。它不是机器人的地址。G1 真机走另一张网卡上的 `192.168.123.x`，由 `real` 自动选择。
+头显填的是这台电脑的 **Wi‑Fi 地址**（当前 `wlp8s0` 为 **192.168.50.112**，以 `ip -4 -br addr show wlp8s0` 为准），用来收 PICO 数据。它不是机器人的地址。G1 真机走另一张网卡上的 `192.168.123.x`，由 `real` 自动选择。
 
 ---
 
@@ -43,16 +43,16 @@ gear_sonic_deploy（C++ 策略，--input-type zmq_manager real）
 仓库根目录（下文记为 `$REPO`）：
 
 ```text
-/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl
+/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 ```
 
 新开终端建议先：
 
 ```bash
 source ~/.bashrc
-# 确认已设置：
-#   export TensorRT_ROOT=$HOME/TensorRT
-#   export PATH=/usr/local/cuda-13.2/bin:$HOME/.local/bin:$PATH
+# 本机已确认：
+#   export TensorRT_ROOT=/usr
+#   export PATH=/usr/local/cuda-12.9/bin:$HOME/.local/bin:$PATH
 ```
 
 确认没有残留的仿真进程：
@@ -107,7 +107,7 @@ bash /opt/apps/roboticsservice/runService.sh
 
 | 地址 | 用途 |
 |---|---|
-| **192.168.50.61**（以现场 `wlp8s0` 为准） | 无线网卡。头显 PC Service 一栏填这个 |
+| **192.168.50.112**（以现场 `wlp8s0` 为准） | 无线网卡。头显 PC Service 一栏填这个 |
 | 100.95.251.103 | Tailscale，不要填 |
 | 198.18.0.1 | Meta 虚拟网卡，不要填 |
 
@@ -122,7 +122,7 @@ ip -4 -br addr show wlp8s0
 
 1. PICO 与电脑连同一 Wi‑Fi。
 2. 打开 **XRoboToolkit** App。
-3. 在 **PC Service** 填入当前 Wi‑Fi IP（**192.168.50.61**）；状态显示 **WORKING** 即连接成功。若已填过，点 **Reconnect**。
+3. 在 **PC Service** 填入当前 Wi‑Fi IP（**192.168.50.112**）；状态显示 **WORKING** 即连接成功。若已填过，点 **Reconnect**。
 4. 勾选：
    - Tracking：`Head`、`Controller`
    - Data/Control：点 **Send**
@@ -143,13 +143,15 @@ ip -4 -br addr show wlp8s0
 ### 终端 1 — C++ 策略（本机默认 SONIC v1.1）
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl/gear_sonic_deploy"
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl/gear_sonic_deploy
 source scripts/setup_env.sh
 ./deploy.sh \
   --robot g1 \
   --cp policy/sonic_v1_1/model \
   --obs-config policy/sonic_v1_1/observation_config.yaml \
   --input-type zmq_manager \
+  --motor-kp-scale 4,10=1.5 \
+  --motor-kd-scale 4,10=1.5 \
   real
 ```
 
@@ -157,16 +159,12 @@ source scripts/setup_env.sh
 
 等到日志出现 **`Init Done`** 再继续。启动前终端会问 `Proceed with deployment? [Y/n]`，输入 `y`。
 
-若要用旧的默认 `policy/release`：
-
-```bash
-./deploy.sh --robot g1 --input-type zmq_manager real
-```
+> 不要用 `policy/release`。本机 G1 固定 SONIC v1.1。
 
 ### 终端 2 — PICO 数据流
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manager_thread_server.py --robot g1 --manager --vis_vr3pt --vis_smpl
 ```
@@ -228,12 +226,12 @@ pkill -INT -x g1_deploy_onnx_ref || pkill -TERM -x g1_deploy_onnx_ref
 
 | 现象 | 处理 |
 |---|---|
-| 头显 `connect_error TCP connection failed` | PC Service 没启动，或 Wi‑Fi IP 变了。先跑第 1.1 节，再填当前 `wlp8s0`（现为 `192.168.50.61`） |
+| 头显 `connect_error TCP connection failed` | PC Service 没启动，或 Wi‑Fi IP 变了。先跑第 1.1 节，再填当前 `wlp8s0`（现为 `192.168.50.112`） |
 | 终端 2 一直 `waiting for body data...` | Head/Controller 通了也不够。Full body 的 Tracker 数量要是 2，并且摄像头能看见脚踝。改完后重启终端 2 |
 | `Could not find 192.168.123.x interface` | 电脑没接到 G1 的控制网。接上网线或把 `real` 换成机器人 IP |
 | 终端 1 和仿真抢接口 | 停掉 `run_sim_loop.py` 后再开 `real` |
 | 动作一顿一顿 | PICO 的 Wi‑Fi 延迟。终端 1 若出现 `High ZMQ latency`，换近距离私有路由 |
-| 找不到 TensorRT | `source ~/.bashrc`，确认 `echo $TensorRT_ROOT` 为 `$HOME/TensorRT` |
+| 找不到 TensorRT | `source ~/.bashrc`，确认 `echo $TensorRT_ROOT` 为 `/usr` |
 | 路径含空格 | 命令中的 `cd` 路径请始终加引号 |
 
 ---
@@ -248,10 +246,9 @@ PICO 的连接、IP 和 PC Service 与第 1 节相同。操作顺序和 G1 一�
 
 ### 终端 1 — C++ 策略
 
-路径含空格时用无空格软链接，例如 `ln -s "$REPO" /tmp/gwbc`。
-
 ```bash
-cd /tmp/gwbc/gear_sonic_deploy
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl/gear_sonic_deploy
+source scripts/setup_env.sh
 ./deploy.sh --robot a3_ultra --input-type zmq_manager real --encoder a3-fast
 ```
 
@@ -285,7 +282,8 @@ pkill -INT -x a3_deploy_onnx_ref || pkill -TERM -x a3_deploy_onnx_ref
 ### 终端 2 — PICO 数据流
 
 ```bash
-cd /tmp/gwbc && source .venv_teleop/bin/activate
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
+source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manager_thread_server.py --robot a3_ultra --manager --num_frames_to_send 10
 ```
 
@@ -316,7 +314,7 @@ python gear_sonic/scripts/pico_manager_thread_server.py --robot a3_ultra --manag
 4. 工作站第三终端：
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 source .venv_data_collection/bin/activate
 python gear_sonic/scripts/run_data_exporter.py \
   --task-prompt "把桌上的杯子拿起来放到盘子里" \

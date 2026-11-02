@@ -16,6 +16,7 @@
 |---|---|---|
 | video `ego_view` | `videos/.../observation.images.ego_view/*.mp4` | **必须**；颈部 D435I |
 | video `head` | `.../observation.images.head/*.mp4` | 可选；默认 GR00T 配置**不读** |
+| video `left/right_wrist` | `.../observation.images.left_wrist` / `right_wrist` | 可选；腕部 Abham UVC（需 `--record-wrist-cameras` + Orin `:5558`） |
 | state 腿/腰/臂/手 | `observation.state` 切片（含 Dex3 左右各 7D） | Dex3 **实测状态** |
 | state `projected_gravity` | `observation.projected_gravity` | |
 | action `motion_token` | `action.motion_token` (64D) | SONIC latent；录制时由 deploy 的 `token_state` 写入 |
@@ -35,16 +36,18 @@
 
 相机在 **机器人 Orin `192.168.123.164`**（`unitree` / 密码 `123`），不是工作站 USB。
 
-| 角色 | 序列号 | 位置 | USB |
+| 角色 | 标识 | 位置 / 类型 | 备注 |
 |---|---|---|---|
-| **`ego_view`（主视角，VLA 必用）** | `242622070951` | **新加颈部** D435I | USB2 480M（`1-2.2`） |
-| **`head`（第二路，可选）** | `254522070308` | **原装机载** D435I | USB2 480M（`1-2.3`） |
+| **`ego_view`（主视角，VLA 必用）** | SN `242622070951` | 颈部 D435I | ZMQ `:5555` |
+| **`head`（第二路，可选）** | SN `254522070308` | 机载 D435I | 同 `:5555` |
+| **`left_wrist` / `right_wrist`（可选）** | Abham `HHW002` / `HHW001` | 腕部 UVC（`1c45:6200`） | 与强脑 USB-485 同插入端；ZMQ `:5558` |
 
 | 压测 | 结果 |
 |---|---|
-| 双路 **仅 RGB** 640×480@30 | 约 30 fps，可用 |
-| 双路 RGB+Depth@30 | **不可用** |
-| 数采策略 | **只开 RGB** |
+| 双 RealSense **仅 RGB** 640×480@30 | 约 30 fps，可用 |
+| 双 RealSense RGB+Depth@30 | **不可用** |
+| 双腕部 Abham MJPG 640×480 | 约 30 fps（需 Hub/`ttyACM*` 在线） |
+| 数采策略 | RealSense **只开 RGB**；腕部按需 |
 
 ---
 
@@ -52,12 +55,12 @@
 
 ```text
   工作站                                              G1 Orin 192.168.123.164
-┌────────────────┐ ┌────────────────┐               ┌─────────────────────────┐
-│ deploy v1.1    │ │ pico_manager   │               │ D435I neck = ego_view   │
-│ ZMQ :5557      │ │ ZMQ :5556      │               │ D435I stock = head      │
-│ state+token    │ │ SMPL+Dex3 cmd  │               │ RGB-only @30 → :5555    │
-└───────┬────────┘ └───────┬────────┘               └───────────┬─────────────┘
-        └─────────┬────────┘────────────────────────────────────┘
+┌────────────────┐ ┌────────────────┐               ┌──────────────────────────┐
+│ deploy v1.1    │ │ pico_manager   │               │ D435I ego+head → :5555   │
+│ ZMQ :5557      │ │ ZMQ :5556      │               │ Abham wrists  → :5558    │
+│ state+token    │ │ SMPL+Dex3 cmd  │               │ （腕部可选）               │
+└───────┬────────┘ └───────┬────────┘               └────────────┬─────────────┘
+        └─────────┬────────┘─────────────────────────────────────┘
                   ▼
          run_data_exporter.py  →  outputs/<dataset>/  (LeRobot + modality.json)
 ```
@@ -66,7 +69,10 @@
 |---|---|---|
 | C++ 部署 | `5557` | `observation.state`（含 Dex3 状态）、`action.motion_token`、重力/姿态 |
 | Pico | `5556` | SMPL、`teleop.*_hand_joints`（Dex3 目标）、录制按键 |
-| Camera（Orin） | `5555` | `ego_view` + `head` JPEG |
+| Camera 头胸（Orin） | `5555` | `ego_view` + `head` JPEG（双 RealSense） |
+| Camera 腕部（Orin，可选） | `5558` | `left_wrist` + `right_wrist` JPEG（Abham UVC） |
+
+> **端口不要混：** Pico pose = `5556`；头胸相机 = `5555`；腕部相机 = `5558`。
 
 ---
 
@@ -80,7 +86,7 @@
 |---|---|---|
 | **192.168.50.112**（以现场 `wlp8s0` 为准） | 工作站 Wi‑Fi | 头显 XRoboToolkit **PC Service** 填这个 |
 | **192.168.123.100** | 工作站有线 `enp11s0`（NM 连接名 `G1-Control`） | DDS / `deploy.sh ... real` 本机侧 |
-| **192.168.123.164** | G1 Orin | SSH / 相机 ZMQ `:5555` |
+| **192.168.123.164** | G1 Orin | SSH / 相机 ZMQ `:5555`（头胸）+ 可选腕部 `:5558` |
 | **192.168.123.161** | G1 机体系 | Unitree 本体控制 |
 
 ```bash
@@ -123,34 +129,49 @@ PC Service（头显填 **当前** `wlp8s0` IP，现为 `192.168.50.112`）：
 pgrep -af RoboticsServiceProcess || bash /opt/apps/roboticsservice/runService.sh
 ```
 
-### 3.2 机器人：同步并起双 RGB server
+### 3.2 机器人：同步并启动相机 server
 
-Orin 为 Python 3.8，用 standalone 发布器（脚本已自动选择）。**先确认 3.0 里 Orin ping 通。**
+Orin 为 Python 3.8，用 **一条** 统一启动脚本。**先确认 3.0 里 Orin ping 通。**
+
+工作站同步脚本：
 
 ```bash
 cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 rsync -av --relative \
   gear_sonic/camera \
   gear_sonic/__init__.py \
+  gear_sonic_deploy/scripts/g1_camera_rgb_server.sh \
   gear_sonic_deploy/scripts/g1_dual_realsense_rgb_server.sh \
   gear_sonic_deploy/scripts/g1_dual_realsense_rgb_zmq_server.py \
+  gear_sonic_deploy/scripts/g1_wrist_abham_rgb_server.sh \
+  gear_sonic_deploy/scripts/g1_wrist_abham_rgb_zmq_server.py \
   unitree@192.168.123.164:/home/unitree/GR00T-WholeBodyControl/
 ```
+
+Orin 上启动（SSH `unitree@192.168.123.164`，密码 `123`）— **只这一条**：
 
 ```bash
 ssh unitree@192.168.123.164
 cd /home/unitree/GR00T-WholeBodyControl
-bash gear_sonic_deploy/scripts/g1_dual_realsense_rgb_server.sh
-# 应 LISTEN :5555
+
+# 默认：只启 ego_view + head → :5555
+bash gear_sonic_deploy/scripts/g1_camera_rgb_server.sh
+
+# 四路：外加参数 wrist（再启 left/right_wrist → :5558）
+# 需强脑插入端在线（ttyACM0/1 + Abham HHW001/HHW002）
+bash gear_sonic_deploy/scripts/g1_camera_rgb_server.sh wrist
 ```
 
-可选预览（与数采无关）：
+### 3.3 工作站：相机监控（可选，与数采无关）
+
+一条命令：订 `:5555` + `:5558`，**有几路显示几路**（最多 2×2）：
 
 ```bash
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 source .venv_data_collection/bin/activate
 # 若 imshow 报 GUI not implemented：先卸 opencv-python-headless
 python gear_sonic/scripts/run_camera_viewer.py \
-  --camera-host 192.168.123.164 --camera-port 5555
+  --camera-host 192.168.123.164
 ```
 
 ---
@@ -161,7 +182,21 @@ python gear_sonic/scripts/run_camera_viewer.py \
 
 ### 4.1 机器人 — Camera
 
-保持 `g1_dual_realsense_rgb_server.sh` 运行。
+按 **§3.2** 一条命令：
+
+```bash
+# Orin
+bash gear_sonic_deploy/scripts/g1_camera_rgb_server.sh          # ego+head
+# 或
+bash gear_sonic_deploy/scripts/g1_camera_rgb_server.sh wrist    # 四路
+```
+
+工作站确认画面（§3.3，有什么显示什么）：
+
+```bash
+source .venv_data_collection/bin/activate
+python gear_sonic/scripts/run_camera_viewer.py --camera-host 192.168.123.164
+```
 
 ### 4.2 工作站终端 1 — 部署（SONIC v1.1）
 
@@ -301,6 +336,8 @@ uv run python gr00t/experiment/launch_finetune.py \
 | `cv2.imshow` GUI not implemented | 卸掉 `opencv-python-headless`；若重装 opencv 把 numpy 升到 2.x，再执行 `uv pip install 'numpy>=1.26,<2' --python .venv_data_collection/bin/python`（pinocchio 需 numpy 1.x） |
 | pinocchio / NumPy 2.x ImportError 或 segfault | 同上，把 `.venv_data_collection` 的 numpy 钉回 `<2` |
 | `5555` 连不上 | Orin 上起 `g1_dual_realsense_rgb_server.sh`；确认本机有 `192.168.123.x` 且 `ping 192.168.123.164` |
+| 监控无腕部画面 | Orin 用 `g1_camera_rgb_server.sh wrist`；查 `ls /dev/v4l/by-id/*Abham* /dev/ttyACM*`；强脑插入端易掉线需重插 |
+| 腕部占了 `5556` | 与 Pico 冲突；腕部必须用 `5558` |
 | `Could not find 192.168.123.x` / real 起不来 | 工作站未接 G1 控制网；插网线后再 `ip -4 -br addr` |
 | 头显 `connect_error` | PC Service 未起，或 Wi‑Fi IP 变了（现 `wlp8s0`=`192.168.50.112`） |
 | 按 A+X 进程中止 | 缺 `gear_sonic/data/human/human_joints_info.pkl` |
