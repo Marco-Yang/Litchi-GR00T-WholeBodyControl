@@ -19,15 +19,15 @@
 | state 腿/腰/臂/手 | `observation.state` 切片（含 Dex3 左右各 7D） | Dex3 **实测状态** |
 | state `projected_gravity` | `observation.projected_gravity` | |
 | action `motion_token` | `action.motion_token` (64D) | SONIC latent；录制时由 deploy 的 `token_state` 写入 |
-| action `left/right_hand_joints` | `teleop.left_hand_joints` / `teleop.right_hand_joints`（各 **7D = Dex3**） | **夹爪动作标签**；Pico **Trigger 或 Grip**；exporter 可回退到 deploy 手指令/状态 |
+| action `left/right_hand_joints` | `teleop.left_hand_joints` / `teleop.right_hand_joints`（各 **7D = Dex3**） | **夹爪动作标签**；仅 Pico **Trigger**（默认闭合，扣下张开）；exporter 可回退到 deploy 手指令/状态 |
 | language | `meta/tasks.jsonl` + `task_index` | `--task-prompt` |
 
 **Dex3 会录两路：**
 
 1. **状态**：`observation.state` 的 `left_hand` / `right_hand`（7+7）← 机器人反馈  
-2. **动作标签**：`teleop.*_hand_joints`（7+7）← Pico **Trigger/Grip** 开合指令（GR00T 训手用这个）；exporter 可回退用 deploy 手指令/实测
+2. **动作标签**：`teleop.*_hand_joints`（7+7）← Pico **仅 Trigger** 开合指令（GR00T 训手用这个）；exporter 可回退用 deploy 手指令/实测
 
-数采脚本**没有漏字段**。旧数据若 teleop 手全 0，多半是当时只靠 Trigger、且没扣；新逻辑下按住 **左 Grip+A** 录制时左手也会闭合并写入标签。
+数采脚本**没有漏字段**。**左 Grip+A / 左 Grip+B** 只负责开始/丢弃录制，**不会**闭合 Dex3；夹爪默认闭合，扣 **Trigger** 张开。
 
 ---
 
@@ -72,26 +72,63 @@
 
 ## 3. 一次性准备
 
+### 3.0 上真机前网络自检（必做）
+
+两张网、两个地址，不要混：
+
+| 地址 | 网卡 / 位置 | 用途 |
+|---|---|---|
+| **192.168.50.112**（以现场 `wlp8s0` 为准） | 工作站 Wi‑Fi | 头显 XRoboToolkit **PC Service** 填这个 |
+| **192.168.123.100** | 工作站有线 `enp11s0`（NM 连接名 `G1-Control`） | DDS / `deploy.sh ... real` 本机侧 |
+| **192.168.123.164** | G1 Orin | SSH / 相机 ZMQ `:5555` |
+| **192.168.123.161** | G1 机体系 | Unitree 本体控制 |
+
+```bash
+# 1) 头显填的 Wi‑Fi IP（当前实测 wlp8s0）
+ip -4 -br addr show wlp8s0
+
+# 2) 本机必须有 192.168.123.x（网线接 G1 控制网）；没有则 real / 相机都会失败
+ip -4 -br addr | grep 192.168.123 || echo 'MISSING G1 control iface — 插网线后再继续'
+
+# 3) Orin 可达
+ping -c 2 -W 2 192.168.123.164
+```
+
+`A+X`（POSE）依赖 SMPL FK 资产（本机已生成；若换机请确认存在）：
+
+```text
+gear_sonic/data/human/human_joints_info.pkl
+```
+
 ### 3.1 工作站
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
-bash install_scripts/install_data_collection.sh   # → .venv_data_collection
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
+# 若尚未装数采环境：
+# bash install_scripts/install_data_collection.sh   # → .venv_data_collection
 ```
 
-清端口残留：
+清仿真 / 部署残留（**sim 与 real 不能同时跑**）：
 
 ```bash
+pkill -f run_sim_loop.py || true
 pkill -f g1_deploy_onnx_ref || true
+pkill -f pico_manager_thread_server.py || true
 ss -ltn | grep -E '5556|5557' || echo ports_free
+```
+
+PC Service（头显填 **当前** `wlp8s0` IP，现为 `192.168.50.112`）：
+
+```bash
+pgrep -af RoboticsServiceProcess || bash /opt/apps/roboticsservice/runService.sh
 ```
 
 ### 3.2 机器人：同步并起双 RGB server
 
-Orin 为 Python 3.8，用 standalone 发布器（脚本已自动选择）：
+Orin 为 Python 3.8，用 standalone 发布器（脚本已自动选择）。**先确认 3.0 里 Orin ping 通。**
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 rsync -av --relative \
   gear_sonic/camera \
   gear_sonic/__init__.py \
@@ -120,7 +157,7 @@ python gear_sonic/scripts/run_camera_viewer.py \
 
 ## 4. 真机数采启动顺序
 
-安全：吊带；物理急停有人盯；关掉 `run_sim_loop.py`。
+安全：吊带；物理急停有人盯；**已关掉** `run_sim_loop.py`；PC Service **WORKING + Send**。
 
 ### 4.1 机器人 — Camera
 
@@ -129,31 +166,39 @@ python gear_sonic/scripts/run_camera_viewer.py \
 ### 4.2 工作站终端 1 — 部署（SONIC v1.1）
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl/gear_sonic_deploy"
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl/gear_sonic_deploy
 source scripts/setup_env.sh
 ./deploy.sh \
   --robot g1 \
   --cp policy/sonic_v1_1/model \
   --obs-config policy/sonic_v1_1/observation_config.yaml \
   --input-type zmq_manager \
+  --motor-kp-scale 4,10=1.5 \
+  --motor-kd-scale 4,10=1.5 \
   real
-# Init Done；确认左右 Dex3 都张开，且 DDS 有 rt/dex3/*/state
+# 提示 Proceed 时输入 y；等到 Init Done
+# 确认左右 Dex3 都张开，且 DDS 有 rt/dex3/*/state
 ```
+
+`real` 自动选本机 `192.168.123.x` 网卡。若脚本报找不到该网段，先查网线；仍不行把最后的 `real` 换成机器人实际 IP（例如 `192.168.123.164` 所在侧的本机地址对应接口，或直接传接口名）。
 
 ### 4.3 工作站终端 2 — Pico
 
+数采可关可视化减负；首次上真机建议先开可视化确认脚部跟踪：
+
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 source .venv_teleop/bin/activate
+# 首次：加 --vis_vr3pt --vis_smpl；确认跟踪 OK 后再去掉减负
 python gear_sonic/scripts/pico_manager_thread_server.py --robot g1 --manager
 ```
 
-PC Service WORKING + Send。Wi‑Fi IP 以 `ip -4 -br addr show wlp8s0` 为准。
+头显 PC Service 填 **192.168.50.112**（变了就用 `ip -4 -br addr show wlp8s0` 重查）。缺 `human_joints_info.pkl` 时按 **A+X** 会直接崩。
 
 ### 4.4 工作站终端 3 — Data exporter
 
 ```bash
-cd "/home/user/YZY/HumanWBM/Demo/RL controller/GR00T-WholeBodyControl"
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 source .venv_data_collection/bin/activate
 python gear_sonic/scripts/run_data_exporter.py \
   --task-prompt "把桌上的杯子拿起来放到盘子里" \
@@ -165,14 +210,14 @@ python gear_sonic/scripts/run_data_exporter.py \
 
 ### 4.5 操作（含 Dex3）
 
-1. 标定 → **A+B+X+Y** 启动 → **A+X** 进 **POSE**  
+1. 标定姿态 → **A+B+X+Y** 启动（PLANNER）→ 身体对齐后再 **A+X** 进 **POSE**  
 2. **左 Grip + A**：开始/结束 episode  
 3. **左 Grip + B**：丢弃当前段  
-4. **开合 Dex3**：扣 **Trigger 或 Grip**（任一 >0.5 即闭合该侧手），都会写入 `teleop.*_hand_joints`。  
-   - **左 Grip + A / 左 Grip + B** 仍是开始录制 / 丢弃；按住左 Grip 时左手也会闭合，因此录制组合键本身就会带上左手 Dex3 标签。  
+4. **开合 Dex3**：**只扣 Trigger**：默认闭合，扣下（>0.5）张开；写入 `teleop.*_hand_joints`。  
+   - **左 Grip + A / 左 Grip + B** 只做开始录制 / 丢弃，**不**驱动夹爪。  
    - exporter 若收到的 Pico 手指令接近全 0，会回退写入 deploy 的 `last_*_hand_action`，再不行用实测 `*_hand_q`。  
-5. 抓取类任务请在 episode 内明确做「伸手 → Grip/Trigger 闭合 → 移动 → 松开」。  
-6. 急停：物理急停；部署终端按 `O`
+5. 抓取类任务请在 episode 内明确做「伸手 → 松开 Trigger 抓取 → 移动 → 扣 Trigger 放开」。  
+6. 急停：物理急停；部署终端按 `O`（焦点必须在该终端）
 
 官方建议同一任务至少 **50–100** 条成功 episode 再微调。
 
@@ -230,13 +275,16 @@ uv run python gr00t/experiment/launch_finetune.py \
 
 | 现象 | 处理 |
 |---|---|
-| `teleop.*_hand_joints` 全 0 | 扣 **Trigger 或 Grip**；确认 Dex3 DDS；重启 pico_manager（需含 Grip→手指改动）；跑校验脚本 |
+| `teleop.*_hand_joints` 全 0 | 松开 **Trigger** 闭合 / 扣下张开（Grip 不驱动手）；确认 Dex3 DDS；重启 pico_manager；跑校验脚本 |
 | `observation.state` 手有值但 teleop 手为 0 | 更新后的 exporter 会回退填 hand action/state；仍全 0 则手根本没被驱动 |
 | `motion_token` 全 0 | deploy 未跑 v1.1 / 策略未启动；需有 `token_state` |
 | 红物体变蓝 | 工作站用已修的 `ImageUtils.decode_image`；重录 |
 | `cv2.imshow` GUI not implemented | 卸掉 `opencv-python-headless`；若重装 opencv 把 numpy 升到 2.x，再执行 `uv pip install 'numpy>=1.26,<2' --python .venv_data_collection/bin/python`（pinocchio 需 numpy 1.x） |
 | pinocchio / NumPy 2.x ImportError 或 segfault | 同上，把 `.venv_data_collection` 的 numpy 钉回 `<2` |
-| `5555` 连不上 | Orin 上起 `g1_dual_realsense_rgb_server.sh` |
+| `5555` 连不上 | Orin 上起 `g1_dual_realsense_rgb_server.sh`；确认本机有 `192.168.123.x` 且 `ping 192.168.123.164` |
+| `Could not find 192.168.123.x` / real 起不来 | 工作站未接 G1 控制网；插网线后再 `ip -4 -br addr` |
+| 头显 `connect_error` | PC Service 未起，或 Wi‑Fi IP 变了（现 `wlp8s0`=`192.168.50.112`） |
+| 按 A+X 进程中止 | 缺 `gear_sonic/data/human/human_joints_info.pkl` |
 | 左手夹爪不动 | 查 `rt/dex3/left/state`；必要时整机重启 |
 
 ---
@@ -247,3 +295,47 @@ uv run python gr00t/experiment/launch_finetune.py \
 - [mujoco_pico_sim_teleop.md](mujoco_pico_sim_teleop.md)  
 - [../../source/tutorials/data_collection.md](../../source/tutorials/data_collection.md)  
 - [../../source/tutorials/vla_workflow.md](../../source/tutorials/vla_workflow.md)  
+
+---
+
+## 8. 数据回放筛选（在数据电脑上）
+
+在装有 Isaac Lab 的**数据电脑**上做：关节/SMPL 跳变预筛 + Isaac mode-2 回放。仓库根目录：`Litchi-GR00T-WholeBodyControl`。
+
+```bash
+conda activate sikan
+cd /path/to/Litchi-GR00T-WholeBodyControl
+export OMNI_KIT_ACCEPT_EULA=YES
+export CUDA_VISIBLE_DEVICES=0
+```
+
+### 8.1 GUI 抽查（推荐先看一小段）
+
+```bash
+python -m datasets.data_check pipeline \
+  --dataset datasets/walking \
+  --work-dir datasets/data_check/runs/walking_0_15 \
+  --start 0 --end 15 \
+  --num-envs 0 \
+  --env-spacing 6 \
+  --python "$(which python)"
+```
+
+### 8.2 全量 headless
+
+```bash
+python -m datasets.data_check pipeline \
+  --dataset datasets/walking \
+  --work-dir datasets/data_check/runs/walking_all \
+  --num-envs 21 \
+  --env-spacing 6 \
+  --headless \
+  --exit-after-metrics \
+  --python "$(which python)"
+```
+
+### 8.3 看结果
+
+- 跳变不通过：`<work-dir>/joint_stability.json`（字段 `unstable_episode_indices`）
+- 汇总：`<work-dir>/failed_validation.txt`（若已生成）
+- Isaac 指标：`<work-dir>/isaac_eval/metrics/metrics_eval.json`

@@ -1549,6 +1549,19 @@ class TrackingCommand(CommandTerm):
         )
         return root_quat_z_up
 
+    def canonicalize_smpl_root_quat(self, root_quat: torch.Tensor) -> torch.Tensor:
+        """Map stored SMPL root quat into the robot/policy frame.
+
+        Training clips (Y-up bones) need ``smpl_y_up`` + ``remove_smpl_base_rot``.
+        Pico teleop streams are already in that frame (same as C++ ZMQ path) —
+        ``smpl_teleop_preprocessed`` skips both so we do not flip heading.
+        """
+        if getattr(self.motion_lib, "smpl_teleop_preprocessed", False):
+            return root_quat
+        if self.motion_lib.smpl_y_up:
+            root_quat = self.smpl_root_ytoz_up(root_quat)
+        return rotations.remove_smpl_base_rot(root_quat, w_last=False)
+
     @property
     def smpl_pose_noheading(self) -> torch.Tensor:
         """Return SMPL pose with root heading removed (preserving pitch/roll).
@@ -1563,9 +1576,7 @@ class TrackingCommand(CommandTerm):
             self.motion_ids, self.motion_start_time_steps + self.time_steps
         )
         root_quat = torch_transform.angle_axis_to_quaternion(smpl_pose[..., :3]).view(-1, 4)
-        if self.motion_lib.smpl_y_up:
-            root_quat = self.smpl_root_ytoz_up(root_quat)
-        root_quat = rotations.remove_smpl_base_rot(root_quat, w_last=False)
+        root_quat = self.canonicalize_smpl_root_quat(root_quat)
         root_heading_inv = rotations.calc_heading_quat_inv(root_quat, w_last=False)
         root_quat_noheading = rotations.quat_mul(root_heading_inv, root_quat, w_last=False)
         smpl_pose[..., :3] = torch_transform.quaternion_to_angle_axis(root_quat_noheading).view(
@@ -1584,10 +1595,7 @@ class TrackingCommand(CommandTerm):
             self.motion_ids, self.motion_start_time_steps + self.time_steps
         )
         root_quat = torch_transform.angle_axis_to_quaternion(smpl_pose[..., :3]).view(-1, 4)
-        if self.motion_lib.smpl_y_up:
-            root_quat = self.smpl_root_ytoz_up(root_quat)
-        root_quat = rotations.remove_smpl_base_rot(root_quat, w_last=False)
-        return root_quat
+        return self.canonicalize_smpl_root_quat(root_quat)
 
     @property
     def smpl_root_quat_w_multi_future(self) -> torch.Tensor:
@@ -1600,9 +1608,7 @@ class TrackingCommand(CommandTerm):
             self.smpl_future_motion_ids, self.smpl_future_time_steps
         )
         root_quat = torch_transform.angle_axis_to_quaternion(smpl_pose[..., :3]).view(-1, 4)
-        if self.motion_lib.smpl_y_up:
-            root_quat = self.smpl_root_ytoz_up(root_quat)
-        root_quat = rotations.remove_smpl_base_rot(root_quat, w_last=False).view(
+        root_quat = self.canonicalize_smpl_root_quat(root_quat).view(
             self.num_envs, self.smpl_num_future_frames, 4
         )
         return root_quat
@@ -1621,9 +1627,7 @@ class TrackingCommand(CommandTerm):
             self.smpl_future_motion_ids, self.smpl_future_time_steps
         )
         root_quat = torch_transform.angle_axis_to_quaternion(smpl_pose[..., :3]).view(-1, 4)
-        if self.motion_lib.smpl_y_up:
-            root_quat = self.smpl_root_ytoz_up(root_quat)
-        root_quat = rotations.remove_smpl_base_rot(root_quat, w_last=False)
+        root_quat = self.canonicalize_smpl_root_quat(root_quat)
         root_rot_dif = quat_mul(
             quat_inv(
                 self.robot_anchor_quat_w.view(self.num_envs, 1, 4).repeat(
@@ -1651,9 +1655,7 @@ class TrackingCommand(CommandTerm):
             self.smpl_future_motion_ids, self.smpl_future_time_steps
         )
         smpl_root_quat = torch_transform.angle_axis_to_quaternion(smpl_pose[..., :3]).view(-1, 4)
-        if self.motion_lib.smpl_y_up:
-            smpl_root_quat = self.smpl_root_ytoz_up(smpl_root_quat)
-        smpl_root_quat = rotations.remove_smpl_base_rot(smpl_root_quat, w_last=False)
+        smpl_root_quat = self.canonicalize_smpl_root_quat(smpl_root_quat)
         smpl_root_quat = smpl_root_quat.view(self.num_envs, self.smpl_num_future_frames, 4)
         ref_first_heading = torch_transform.get_heading_q(smpl_root_quat[:, 0, :])
         root_rot_dif = quat_mul(
@@ -1682,9 +1684,7 @@ class TrackingCommand(CommandTerm):
             self.smpl_future_motion_ids, self.smpl_future_time_steps
         )
         root_quat = torch_transform.angle_axis_to_quaternion(smpl_pose[..., :3]).view(-1, 4)
-        if self.motion_lib.smpl_y_up:
-            root_quat = self.smpl_root_ytoz_up(root_quat)
-        root_quat = rotations.remove_smpl_base_rot(root_quat, w_last=False)
+        root_quat = self.canonicalize_smpl_root_quat(root_quat)
         root_rot_dif = quat_mul(
             quat_inv(
                 self.anchor_heading_quat.view(self.num_envs, 1, 4).expand(

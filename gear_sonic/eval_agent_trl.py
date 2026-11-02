@@ -766,6 +766,27 @@ def main(override_config: omegaconf.OmegaConf):
             if termination in config.manager_env.terminations:
                 config.manager_env.terminations.pop(termination)
 
+        # Teleop data-check: ckpt merge re-injects foot/ee terms. Keep only the
+        # fall detectors we want (standing-carrier height/tilt + time_out).
+        if bool(config.get("data_check_teleop_filter", False)):
+            keep = {"time_out", "anchor_pos", "anchor_ori_full", "_target_"}
+            for key in list(config.manager_env.terminations.keys()):
+                if key not in keep:
+                    config.manager_env.terminations.pop(key)
+            logger.info(
+                "data_check_teleop_filter=true — kept terminations: "
+                f"{list(config.manager_env.terminations.keys())}"
+            )
+        elif bool(config.get("data_check_loose_terminations", False)):
+            keep = {"time_out", "_target_"}
+            for key in list(config.manager_env.terminations.keys()):
+                if key not in keep:
+                    config.manager_env.terminations.pop(key)
+            logger.info(
+                "data_check_loose_terminations=true — kept terminations: "
+                f"{list(config.manager_env.terminations.keys())}"
+            )
+
     use_encoder = config.get("use_encoder", None)
     if use_encoder is not None:
         encoder_sample_probs = config.manager_env.commands.motion.encoder_sample_probs
@@ -863,7 +884,15 @@ def main(override_config: omegaconf.OmegaConf):
         if args_cli.headless:
             args_cli.kit_args = base_kit_args + " --no-window"
         else:
-            args_cli.kit_args = base_kit_args + f" --/renderer/activeGpu={render_gpu_idx}"
+            # MuJoCo-like: expand viewport; free-camera is enabled later via simple_viewer.
+            simple = bool(config.get("simple_viewer", False))
+            kit_extra = f" --/renderer/activeGpu={render_gpu_idx}"
+            if simple:
+                kit_extra += (
+                    " --/app/viewport/defaults/fillViewport=true"
+                    " --/app/viewport/camShowSpeedOnStart=false"
+                )
+            args_cli.kit_args = base_kit_args + kit_extra
 
         _lock_path = "/tmp/isaaclab_app_launcher.lock"  # noqa: S108
         with filelock.FileLock(_lock_path):
@@ -994,6 +1023,19 @@ def main(override_config: omegaconf.OmegaConf):
                         env_config.commands.motion.motion_lib_cfg.filter_motion_keys = filter_keys
 
     env = train_agent_trl.create_manager_env(config, device, args_cli)
+
+    # Dynamics GUI: unlock camera (Isaac Lab otherwise tracks robot every frame)
+    # and hide the side panel so the window feels closer to MuJoCo's viewer.
+    if (not config.headless) and bool(config.get("simple_viewer", False)):
+        try:
+            from datasets.data_check.simple_isaac_viewer import setup_simple_viewer
+
+            eye = env_config.config.get("viewer_eye", None)
+            lookat = env_config.config.get("viewer_lookat", None)
+            setup_simple_viewer(env, eye=eye, lookat=lookat)
+            logger.info("simple_viewer enabled (free camera + minimal UI)")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"simple_viewer setup failed: {exc}")
 
     module_dim_dict = getattr(config.algo.config, "module_dim", {})
     policy_backbone_kwargs = {}
@@ -1242,12 +1284,29 @@ def main(override_config: omegaconf.OmegaConf):
     for callback_name, callback in callbacks.items():  # noqa: B007
         callback.on_step_end(args, state, None, env=env, model=model, accelerator=accelerator)
 
+    # Optional per-env episode ID labels above robot heads (dynamics GUI check).
+    episode_labels = None
+    if (not config.headless) and bool(config.get("show_episode_labels", False)):
+        try:
+            from datasets.data_check.episode_head_labels import EpisodeHeadLabels
+
+            episode_labels = EpisodeHeadLabels(
+                env,
+                z_offset=float(config.get("episode_label_z_offset", 1.35)),
+            )
+            episode_labels.update()
+            logger.info("Episode head labels enabled")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Failed to enable episode head labels: {exc}")
+
     if config.get("run_eval_loop", True):
         env.set_is_evaluating(True)
         obs_dict = env.reset_all()
         model.eval()
         for obs_key in obs_dict:
             obs_dict[obs_key] = obs_dict[obs_key].to(device)
+        if episode_labels is not None:
+            episode_labels.update()
 
         eval_step_callbacks = {
             name: cb
@@ -1264,6 +1323,7 @@ def main(override_config: omegaconf.OmegaConf):
         ckpt_path = Path(config.checkpoint)
         debug_dump_path = config.get("eval_debug_dump_path", None)
         write_debug_dump = debug_dump_path is not None or config.get("eval_debug_dump", False)
+        # Default off for long GUI keep-alive sessions (data_check passes false).
         make_debug_plots = config.get("eval_debug_plot", True)
         if write_debug_dump and debug_dump_path is None:
             debug_dump_path = ckpt_path.parent / f"{ckpt_path.stem}_eval_debug.npz"
@@ -1313,6 +1373,8 @@ def main(override_config: omegaconf.OmegaConf):
                         results[2],
                         results[3],
                     )  # noqa: F841
+                    if episode_labels is not None:
+                        episode_labels.update()
                     if debug_dumper is not None:
                         debug_dumper.capture(step_count, env, actor_state, dones)
 
@@ -1343,6 +1405,17 @@ def main(override_config: omegaconf.OmegaConf):
                 debug_dumper.save()
 
     if simulator_type == "IsaacSim":
+        # Keep the Kit process alive for GUI dynamics inspection when requested.
+        if (not config.headless) and bool(config.get("keep_gui_process", False)):
+            logger.info("keep_gui_process=true — leaving Isaac Sim window open (close window to exit)")
+            try:
+                app = simulation_app
+                while app is not None and app.is_running():
+                    if episode_labels is not None:
+                        episode_labels.update()
+                    app.update()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"keep_gui_process loop ended: {exc}")
         os._exit(0)
 
 

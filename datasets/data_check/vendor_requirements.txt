@@ -1,0 +1,20 @@
+# Install with:
+#   pip install --target datasets/data_check/_vendor --no-deps -r datasets/data_check/vendor_requirements.txt
+# Do NOT pull filelock/packaging/pyyaml into _vendor (Isaac pins older versions).
+# wandb is a local stub under _vendor/wandb for offline eval (use_wandb=false).
+easydict
+loguru
+joblib
+cloudpickle
+hydra-core==1.3.8
+omegaconf==2.3.1
+antlr4-python3-runtime==4.9.3
+einops
+einx
+frozendict
+vector-quantize-pytorch==1.21.2
+accelerate>=1.3.0
+huggingface-hub
+safetensors
+tensorboard
+pandas

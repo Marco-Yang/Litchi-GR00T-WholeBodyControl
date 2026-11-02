@@ -1717,6 +1717,11 @@ def smpl_root_ori_heading_mf(
         return command.smpl_root_quat_w_dif_heading_multi_future.reshape(env.num_envs, -1)
 
 
+def _smpl_joints_already_local(command: commands.TrackingCommand) -> bool:
+    """Pico teleop stores root-local joints; C++ feeds them as-is (no second rotate)."""
+    return bool(getattr(command.motion_lib, "smpl_teleop_preprocessed", False))
+
+
 def smpl_joints_multi_future(
     env: ManagerBasedEnv, command_name: str, non_flatten=False
 ) -> torch.Tensor:
@@ -1733,10 +1738,13 @@ def smpl_joints_multi_future(
     """
     command: commands.TrackingCommand = env.command_manager.get_term(command_name)
     ref_joints = command.smpl_joints_multi_future
-    ref_root_quat = command.smpl_root_quat_w.view(env.num_envs, 1, 1, 4).repeat(
-        1, command.num_future_frames, ref_joints.shape[-2], 1
-    )
-    ref_joints_root = quat_apply(quat_inv(ref_root_quat), ref_joints)
+    if _smpl_joints_already_local(command):
+        ref_joints_root = ref_joints
+    else:
+        ref_root_quat = command.smpl_root_quat_w.view(env.num_envs, 1, 1, 4).repeat(
+            1, command.num_future_frames, ref_joints.shape[-2], 1
+        )
+        ref_joints_root = quat_apply(quat_inv(ref_root_quat), ref_joints)
     if non_flatten:
         return ref_joints_root.reshape(env.num_envs, command.smpl_num_future_frames, -1)
     else:
@@ -1763,10 +1771,13 @@ def smpl_joints_multi_future_local(
     command: commands.TrackingCommand = env.command_manager.get_term(command_name)
 
     ref_joints = command.smpl_joints_multi_future
-    ref_root_quat = command.smpl_root_quat_w_multi_future.unsqueeze(-2).repeat(
-        1, 1, ref_joints.shape[-2], 1
-    )
-    ref_joints_root = quat_apply(quat_inv(ref_root_quat), ref_joints)
+    if _smpl_joints_already_local(command):
+        ref_joints_root = ref_joints
+    else:
+        ref_root_quat = command.smpl_root_quat_w_multi_future.unsqueeze(-2).repeat(
+            1, 1, ref_joints.shape[-2], 1
+        )
+        ref_joints_root = quat_apply(quat_inv(ref_root_quat), ref_joints)
     if joints_idx is not None:
         ref_joints_root = ref_joints_root[..., joints_idx, :]
     if non_flatten:
@@ -1795,10 +1806,13 @@ def smpl_joints_lower_multi_future_local(
     ref_joints = command.smpl_joints_multi_future[
         :, :, [0, 1, 2, 4, 5, 7, 8, 10, 11], :
     ]  # only first 12 joints (lower body)
-    ref_root_quat = command.smpl_root_quat_w_multi_future.unsqueeze(-2).repeat(
-        1, 1, ref_joints.shape[-2], 1
-    )
-    ref_joints_root = quat_apply(quat_inv(ref_root_quat), ref_joints)
+    if _smpl_joints_already_local(command):
+        ref_joints_root = ref_joints
+    else:
+        ref_root_quat = command.smpl_root_quat_w_multi_future.unsqueeze(-2).repeat(
+            1, 1, ref_joints.shape[-2], 1
+        )
+        ref_joints_root = quat_apply(quat_inv(ref_root_quat), ref_joints)
     if non_flatten:
         return ref_joints_root.reshape(env.num_envs, command.smpl_num_future_frames, -1)
     else:

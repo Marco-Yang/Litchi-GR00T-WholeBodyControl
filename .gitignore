@@ -153,16 +153,11 @@ cython_debug/
 .idea/
 .vscode/
 
-# log
-outputs/
-
 # Ruff stuff:
 .ruff_cache/
 
 # PyPI configuration file
 .pypirc
-
-outputs/
 
 .DS_Store
 
@@ -302,3 +297,21 @@ gear_sonic/data/assets/robot_description/*
 # A3 (Litchi 035 contract) meshes referenced by the A3 MJCF/URDF (~20 MB, stored
 # via Git LFS per .gitattributes). A3 Ultra meshes and *.usd stay ignored.
 !gear_sonic/data/assets/robot_description/urdf/a3/**/*.STL
+
+# --- Local datasets / run outputs ---
+# Ignore all of datasets/ and outputs/; keep data_check source + datasets/__pycache__.
+# data_check/_vendor and data_check/runs stay local (vendored deps / eval artifacts).
+outputs/
+datasets/*
+!datasets/data_check/
+!datasets/data_check/**
+!datasets/__pycache__/
+!datasets/__pycache__/**
+datasets/data_check/_vendor/
+datasets/data_check/runs/
+datasets/data_check/log/
+# Broader __pycache__/ and *.py[cod] would still hide these; re-include source caches.
+!datasets/data_check/**/__pycache__/
+!datasets/data_check/**/__pycache__/**
+!datasets/data_check/**/*.py[cod]
+!datasets/__pycache__/**/*.py[cod]

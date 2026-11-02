@@ -317,6 +317,12 @@ class MotionLibBase:
                 self.smpl_data = [None] * len(self._motion_data_keys)
 
         self.smpl_y_up = motion_lib_cfg.get("smpl_y_up", False)
+        # Pico/ZMQ teleop already applied Y→Z + remove_smpl_base_rot and stores
+        # root-local smpl_joints. When True, Isaac must NOT apply those again
+        # (matches C++ deploy encode-mode-2 path).
+        self.smpl_teleop_preprocessed = bool(
+            motion_lib_cfg.get("smpl_teleop_preprocessed", False)
+        )
 
         # SOMA skeleton data loading (parallel to SMPL)
         self.soma_data = None

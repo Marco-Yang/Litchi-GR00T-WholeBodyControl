@@ -137,6 +137,7 @@ class ImEvalCallback(TrainerCallback):
         snapshot_dir=None,
         snapshot_every_n_batches=5,
         allow_partial=False,
+        exit_after_eval=True,
     ):
         super().__init__()
         self.eval_frequency = eval_frequency
@@ -157,6 +158,9 @@ class ImEvalCallback(TrainerCallback):
         self.snapshot_every_n_batches = int(snapshot_every_n_batches)
         self.allow_partial = bool(allow_partial)
         self.scalable_eval = batch_results_dir is not None
+        # When eval_frequency==1, historical behavior hard-exits after metrics.
+        # Set False so eval_agent_trl run_eval_loop / GUI can continue.
+        self.exit_after_eval = bool(exit_after_eval)
         if self.snapshot_every_n_batches < 1:
             raise ValueError("snapshot_every_n_batches must be at least 1")
         self._has_object = False
@@ -238,7 +242,8 @@ class ImEvalCallback(TrainerCallback):
                         actor_state["end_eval"] = True
                         break
 
-                    if step % self.empty_cache_freq == 0:
+                    # freq<=0 disables; GUI playback stutters hard on empty_cache.
+                    if self.empty_cache_freq > 0 and step % self.empty_cache_freq == 0:
                         gc.collect()
                         torch.cuda.empty_cache()
 
@@ -264,7 +269,9 @@ class ImEvalCallback(TrainerCallback):
         if not self.eval_only:
             gc.collect()
             torch.cuda.empty_cache()
-        if self.eval_frequency == 1:  # Exit if eval frequency is 1.
+        # Exit if eval frequency is 1 (one-shot eval entrypoints). Skip when the
+        # caller wants to keep the Isaac GUI / run_eval_loop alive.
+        if self.eval_frequency == 1 and self.exit_after_eval:
             os._exit(0)
         return metrics_eval
 
