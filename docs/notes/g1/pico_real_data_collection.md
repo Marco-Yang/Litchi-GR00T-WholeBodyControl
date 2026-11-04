@@ -6,6 +6,8 @@
 
 遥操按键见 [pico_real_teleop.md](pico_real_teleop.md)。上游：[`data_collection.md`](../../source/tutorials/data_collection.md)、[`vla_workflow.md`](../../source/tutorials/vla_workflow.md)。
 
+> **手部路径：** 下文 §0–§8 仍以 **Dex3** 数采为主。已换装 **强脑 Revo2** 时，Pico 扳机控手请直接看 **[§9 Pico 控强脑 Revo2](#9-pico-控强脑-revo2替代-dex3)**（逻辑与 Dex3 **相反**）。完整 Manus/Revo2 速查：[`../../../../Manus/命令速查.md`](../../../../Manus/命令速查.md)。
+
 ---
 
 ## 0. 与 GR00T G1 VLA 的对应关系
@@ -178,27 +180,53 @@ python gear_sonic/scripts/run_camera_viewer.py \
 
 ## 4. 真机数采启动顺序
 
-安全：吊带；物理急停有人盯；**已关掉** `run_sim_loop.py`；PC Service **WORKING + Send**。
+安全：吊带；物理急停有人盯；**已关掉** `run_sim_loop.py`。
 
-### 4.1 机器人 — Camera
+**Revo2 数采需要启动（按序）：**
 
-按 **§3.2** 一条命令：
+| 顺序 | 位置 | 进程 |
+|------|------|------|
+| 1 | Orin | Camera（§4.1） |
+| 2 | Orin | **`revo2_modbus_rx`**（§4.2） |
+| 3 | 工作站终端 1 | deploy SONIC v1.1（§4.3） |
+| 4 | 工作站终端 2 | pico_manager（§4.4） |
+| 5 | 工作站终端 3 | data exporter `--hand-type revo2`（§4.5） |
+
+### 4.1 机器人 — Camera（ego + head + **左右腕**）
+
+按 **§3.2**，Revo2 数采默认开四路：`ego_view`/`head` → `:5555`，`left_wrist`/`right_wrist`（Abham）→ `:5558`：
 
 ```bash
-# Orin
-bash gear_sonic_deploy/scripts/g1_camera_rgb_server.sh          # ego+head
-# 或
-bash gear_sonic_deploy/scripts/g1_camera_rgb_server.sh wrist    # 四路
+# Orin（需腕部 Abham HHW002/HHW001 在线）
+bash gear_sonic_deploy/scripts/g1_camera_rgb_server.sh wrist
 ```
 
-工作站确认画面（§3.3，有什么显示什么）：
+工作站确认四路画面（有什么显示什么）：
 
 ```bash
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 source .venv_data_collection/bin/activate
 python gear_sonic/scripts/run_camera_viewer.py --camera-host 192.168.123.164
+# viewer 会订 :5555 + :5558；应看到 ego_view / head / left_wrist / right_wrist
 ```
 
-### 4.2 工作站终端 1 — 部署（SONIC v1.1）
+### 4.2 机器人 — Revo2 Modbus 接收端（`revo2_modbus_rx`）
+
+手部 UDP→串口桥，**Revo2 数采必开**（Dex3 旧流程可跳过）。在**工作站**执行（脚本会 SSH 到 Orin）：
+
+```bash
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Manus
+bash scripts/start_orin_revo2_rx.sh
+
+# 确认日志
+ssh unitree@192.168.123.164 'tail -f /tmp/revo2_modbus_rx.log'
+```
+
+串口须为 `/dev/ttyCH343USB*`（左 `USB2@0x7E`，右 `USB1@0x7F`）。详见 §9.4 / [`../../../../Manus/命令速查.md`](../../../../Manus/命令速查.md)。
+
+> 数采时由 **data exporter** 经 UDP `:19500` 下发手指令；**不要**再并行 `run_real_revo2_pico.sh`。
+
+### 4.3 工作站终端 1 — 部署（SONIC v1.1）
 
 ```bash
 cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl/gear_sonic_deploy
@@ -212,12 +240,11 @@ source scripts/setup_env.sh
   --motor-kd-scale 4,10=1.5 \
   real
 # 提示 Proceed 时输入 y；等到 Init Done
-# 确认左右 Dex3 都张开，且 DDS 有 rt/dex3/*/state
 ```
 
-`real` 自动选本机 `192.168.123.x` 网卡。若脚本报找不到该网段，先查网线；仍不行把最后的 `real` 换成机器人实际 IP（例如 `192.168.123.164` 所在侧的本机地址对应接口，或直接传接口名）。
+`real` 自动选本机 `192.168.123.x` 网卡。若脚本报找不到该网段，先查网线；仍不行把最后的 `real` 换成机器人实际 IP。
 
-### 4.3 工作站终端 2 — Pico
+### 4.4 工作站终端 2 — Pico
 
 数采可关可视化减负；首次上真机建议先开可视化确认脚部跟踪：
 
@@ -228,30 +255,44 @@ source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manager_thread_server.py --robot g1 --manager
 ```
 
-头显 PC Service 填 **192.168.50.112**（变了就用 `ip -4 -br addr show wlp8s0` 重查）。缺 `human_joints_info.pkl` 时按 **A+X** 会直接崩。
+缺 `gear_sonic/data/human/human_joints_info.pkl` 时按 **A+X** 会直接崩。
 
-### 4.4 工作站终端 3 — Data exporter
+### 4.5 工作站终端 3 — Data exporter
+
+**Revo2（当前，需 §4.2 已起）：** Pico 扳机驱动录制 grasp 轨迹并 UDP 下发真手；落盘时 6D **pad 成 7D**（末维 0），匹配 GR00T `UNITREE_G1_SONIC`（action = 64 + 7 + 7）。
 
 ```bash
 cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 source .venv_data_collection/bin/activate
 python gear_sonic/scripts/run_data_exporter.py \
-  --task-prompt "把桌上的杯子拿起来放到盘子里" \
+  --task-prompt "走到绿色桌子前" \
   --camera-host 192.168.123.164 \
   --camera-port 5555 \
   --record-head-camera \
-  --root-output-dir outputs
+  --record-wrist-cameras \
+  --wrist-camera-port 5558 \
+  --root-output-dir outputs \
+  --hand-type revo2 \
+  --revo2-pose ../Manus/config/revo2_grasp_pose_02.json \
+  --revo2-orin-host 192.168.123.164 \
+  --revo2-send
 ```
 
-### 4.5 操作（含 Dex3）
+视频落盘键：`observation.images.ego_view` / `head` / **`left_wrist`** / **`right_wrist`**。
+
+**Dex3（旧）手：** 不需要 §4.2；命令去掉 `--hand-type revo2` 及相关参数即可（腕部同样加 `--record-wrist-cameras`）。
+
+> 腕部 Abham 未接 / `:5558` 起不来时：Orin 改用不带 `wrist` 的相机脚本，并去掉 exporter 的 `--record-wrist-cameras`。
+
+### 4.6 操作
 
 1. 标定姿态 → **A+B+X+Y** 启动（PLANNER）→ 身体对齐后再 **A+X** 进 **POSE**  
 2. **左 Grip + A**：开始/结束 episode  
 3. **左 Grip + B**：丢弃当前段  
-4. **开合 Dex3**：**只扣 Trigger**：默认闭合，扣下（>0.5）张开；写入 `teleop.*_hand_joints`。  
-   - **左 Grip + A / 左 Grip + B** 只做开始录制 / 丢弃，**不**驱动夹爪。  
-   - exporter 若收到的 Pico 手指令接近全 0，会回退写入 deploy 的 `last_*_hand_action`，再不行用实测 `*_hand_q`。  
-5. 抓取类任务请在 episode 内明确做「伸手 → 松开 Trigger 抓取 → 移动 → 扣 Trigger 放开」。  
+4. **开合手（Revo2）**：**松扳机 = 开掌（录制 START）**；**扣扳机 = 沿 grasp JSON 闭合并保持**；再松 = 短时回开。左右扳机各控左右手。  
+   - （Dex3 旧逻辑相反：默认闭合，扣扳机张开。）  
+   - **左 Grip + A / B** 只做录制起停/丢弃，**不**驱动手。  
+5. 抓取类任务在 episode 内明确做「伸手 → 扣扳机抓取 → 移动 → 松扳机放开」等。  
 6. 急停：物理急停；部署终端按 `O`（焦点必须在该终端）
 
 官方建议同一任务至少 **50–100** 条成功 episode 再微调。
@@ -264,10 +305,12 @@ python gear_sonic/scripts/run_data_exporter.py \
 outputs/<dataset>/
 ├── data/chunk-000/episode_*.parquet
 ├── videos/chunk-000/observation.images.ego_view/episode_*.mp4
-├── videos/chunk-000/observation.images.head/episode_*.mp4   # 可选
+├── videos/chunk-000/observation.images.head/episode_*.mp4
+├── videos/chunk-000/observation.images.left_wrist/episode_*.mp4   # Abham 左腕
+├── videos/chunk-000/observation.images.right_wrist/episode_*.mp4  # Abham 右腕
 └── meta/
     ├── info.json
-    ├── modality.json      # GR00T 需要
+    ├── modality.json      # GR00T 需要；含 video.left_wrist / right_wrist
     ├── episodes.jsonl
     ├── tasks.jsonl
     └── episodes_stats.jsonl
@@ -351,6 +394,8 @@ uv run python gr00t/experiment/launch_finetune.py \
 - [mujoco_pico_sim_teleop.md](mujoco_pico_sim_teleop.md)  
 - [../../source/tutorials/data_collection.md](../../source/tutorials/data_collection.md)  
 - [../../source/tutorials/vla_workflow.md](../../source/tutorials/vla_workflow.md)  
+- [§9 Pico 控强脑 Revo2](#9-pico-控强脑-revo2替代-dex3)  
+- [`../../../../Manus/命令速查.md`](../../../../Manus/命令速查.md)
 
 ---
 
@@ -397,3 +442,203 @@ python -m datasets.data_check pipeline \
 - 跳变不通过：`<work-dir>/joint_stability.json`（字段 `unstable_episode_indices`）
 - 汇总：`<work-dir>/failed_validation.txt`（若已生成）
 - Isaac 指标：`<work-dir>/isaac_eval/metrics/metrics_eval.json`
+
+---
+
+## 9. Pico 控强脑 Revo2（替代 Dex3）
+
+G1 已换 **Revo2** 后，手部不再走 Dex3 DDS / `pico_manager` 的 7D 夹爪映射；改为：
+
+1. **Manus 手套** 录一条开→合轨迹 → JSON  
+2. **Pico 左右扳机** 驱动该轨迹回放 → UDP → Orin Modbus → 真手  
+
+仓库根（本节命令均在此目录）：
+
+```text
+/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Manus
+```
+
+更细的跟踪 / 串口 / 排错见 [`../../../../Manus/命令速查.md`](../../../../Manus/命令速查.md)。
+
+### 9.1 扳机逻辑（与 Dex3 相反）
+
+| 状态 | Revo2 | Dex3（旧，§4.5） |
+|------|--------|------------------|
+| **默认 / 扳机松开** | 录制 **START** = 五指全开 `[0]*6` | 默认 **闭合** |
+| **扳机按下** | 沿录制轨迹播到 **STOP**（闭合）并保持 | 扣下 **张开** |
+| **扳机再松开** | **约 0.35s** 平滑回 START（非整段倒放） | 松开再闭合 |
+
+左右扳机各自控制左右手。回开过慢可加 `--release-blend-s 0.2`。
+
+### 9.2 硬件 / 网络前提
+
+| 项 | 要求 |
+|---|---|
+| 工作站 ↔ G1 | 有线 `192.168.123.x`，`ping 192.168.123.164` |
+| Orin 串口 | **`/dev/ttyCH343USB*`**（ch343）；左 `USB2@0x7E`，右 `USB1@0x7F` |
+| Manus（仅录制时） | Win **MANUS Core** `192.168.50.36`；本机 `ping` 通 |
+| Pico（仅回放时） | PC Service 运行；头显 **WORKING** + Controller + **Send**；Wi‑Fi IP 填 `wlp8s0`（现约 `192.168.50.112`） |
+
+```bash
+# 网络
+ip -4 -br addr | grep 192.168.123 || echo 'MISSING G1 control iface'
+ping -c 2 -W 2 192.168.123.164
+
+# PC Service（Pico 回放前）
+pgrep -af RoboticsServiceProcess || bash /opt/apps/roboticsservice/runService.sh
+```
+
+### 9.3 拓扑
+
+```text
+【录制】
+  Win MANUS Core 192.168.50.36
+          │ SDK Remote
+          ▼
+  本机  real_revo2_record.py   R=开始 / S=写 JSON
+          │ UDP :19500
+          ▼
+  Orin  revo2_modbus_rx.py → ttyCH343USB* → Revo2 L/R
+
+【Pico 回放】
+  PICO Trigger (XRoboToolkit)
+          │
+          ▼
+  本机  real_revo2_trigger.py --source pico  +  pose JSON
+          │ UDP :19500
+          ▼
+  Orin  同上 → Revo2
+```
+
+### 9.4 一次性 / 每次：Orin 接收端
+
+```bash
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Manus
+
+# 部署并启动 Orin Modbus UDP 接收（会停冲突的 brainco_hand.service）
+bash scripts/start_orin_revo2_rx.sh
+
+# 日志
+ssh unitree@192.168.123.164 'tail -f /tmp/revo2_modbus_rx.log'
+```
+
+后续命令若加 `--no-orin-start`，表示假设接收端已在跑。
+
+### 9.5 录制抓取轨迹（Manus）
+
+空闲时手保持 **Revo2 全开**。按 **R** 后从全开 smoothstep 接到当前手套，再跟踪；**S** 结束写盘。
+
+```bash
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Manus
+# Win 上 MANUS Core 已开
+bash scripts/run_real_revo2_record.sh --host 192.168.50.36 --no-orin-start
+
+# 指定输出文件（推荐按条编号，避免覆盖）
+bash scripts/run_real_revo2_record.sh --host 192.168.50.36 --no-orin-start \
+  --out config/revo2_grasp_pose_02.json
+```
+
+| 键 | 作用 |
+|----|------|
+| **R** | 开始录制（轨迹从全开起 → blend → 跟 Manus） |
+| **S** | 停止并写入 JSON |
+| **q** | 退出（手回全开） |
+
+默认不写 `--out` 时覆盖 `config/revo2_grasp_pose.json`。
+
+可选：先只做连续跟踪确认映射：
+
+```bash
+bash scripts/run_real_revo2_track.sh --host 192.168.50.36 --no-orin-start
+```
+
+### 9.6 Pico 扳机回放（真机）
+
+头显已 **WORKING + Controller + Send**，Orin 接收端已起：
+
+```bash
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Manus
+
+# 推荐：真机 + 真实 PICO 扳机
+bash scripts/run_real_revo2_pico.sh --no-orin-start \
+  --pose config/revo2_grasp_pose_02.json
+
+# 等价写法
+bash scripts/run_sim_revo2_trigger.sh --pico --no-orin-start \
+  --pose config/revo2_grasp_pose_02.json
+
+# 回开更快（可选）
+bash scripts/run_real_revo2_pico.sh --no-orin-start \
+  --pose config/revo2_grasp_pose_02.json \
+  --release-blend-s 0.2
+```
+
+| 输入 | 作用 |
+|------|------|
+| PICO **左 / 右扳机** | 左 / 右手：按下→播到 close；松开→短时回 open |
+| 终端 **`q`** | 退出（手回全开） |
+
+终端日志里扣扳机后应看到 `raw L/R` 升高、`L`/`R` 标志亮起；默认停在开掌全 0 是正常的。
+
+### 9.7 无 Pico 时的验录 / 键盘回放
+
+```bash
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Manus
+
+# MuJoCo 仿真（键盘当扳机）
+bash scripts/run_sim_revo2_trigger.sh --pose config/revo2_grasp_pose_02.json
+
+# 真机 + 键盘扳机
+bash scripts/run_sim_revo2_trigger.sh --real --no-orin-start \
+  --pose config/revo2_grasp_pose_02.json
+
+# 启动后立刻自动播一遍（不必扣扳机）
+bash scripts/run_sim_revo2_trigger.sh --real --no-orin-start --autoplay \
+  --pose config/revo2_grasp_pose_02.json
+```
+
+| 键 | 作用 |
+|----|------|
+| `1` / `2` / `b` | 左 / 右 / 双手扳机（切换） |
+| `p` | 双手自动播一遍 open→close |
+| `空格` | 清扳机并回开 |
+| `q` | 退出 |
+
+### 9.8 推荐现场顺序
+
+**A. 只验手（不数采）**
+
+1. 网线 + `ping 192.168.123.164`  
+2. Manus 目录：`bash scripts/start_orin_revo2_rx.sh`  
+3. （可选）录轨迹：`run_real_revo2_record.sh ... --out config/revo2_grasp_pose_XX.json`  
+4. Pico 回放：`run_real_revo2_pico.sh --no-orin-start --pose config/revo2_grasp_pose_XX.json`
+
+**B. 全身数采 + Revo2 手（推荐）**
+
+1. Orin：`g1_camera_rgb_server.sh`（无腕部则**不要** `wrist`）  
+2. Manus：`start_orin_revo2_rx.sh`  
+3. 工作站：PC Service + `deploy.sh ... real`（§4.2）+ `pico_manager_thread_server.py`（§4.3）  
+4. Data exporter 用 **§4.4 Revo2** 命令（`--hand-type revo2 --revo2-pose ...`）  
+5. 操作同 §4.5，但手部：**松扳机=开掌，扣扳机=沿录制轨迹闭合**（与 Dex3 相反）  
+
+落盘（对齐 GR00T N1.7 / `UNITREE_G1_SONIC`）：
+
+| 字段 | 维度 | Revo2 含义 |
+|------|------|------------|
+| `action.motion_token` | 64 | SONIC v1.1 latent（deploy 写入） |
+| `teleop.left/right_hand_joints` | **7**（前 6 = Revo2 0..1000，第 7 = 0） | 扳机轨迹指令 |
+| `observation.state` 手部切片 | 各 7 | 用 Revo2/1000 填入（无 Dex3 实测） |
+| `observation.images.ego_view` | 必选 | Orin `:5555` |
+| `meta/modality.json` | `left/right_hand_joints.end=7` | 与 Dex3 数采同 schema |
+
+`script_config.hand_type=revo2`。勿与旧 Dex3 数据混训同一 hand 统计（量纲不同）。
+
+### 9.9 排错（Revo2）
+
+| 现象 | 处理 |
+|---|---|
+| 回放一直全 0 | 未扣扳机；或键盘源未按 `p`/`b`。Pico 源看 `raw L/R` 是否 >0.45 |
+| 扣扳机手不动 | Orin rx 是否在跑；`tail /tmp/revo2_modbus_rx.log`；串口是否为 `ttyCH343USB*` |
+| 松开回开很慢 | 旧逻辑整段倒放；更新后默认 0.35s，可加 `--release-blend-s 0.2` 并**重启**脚本 |
+| Pico `raw` 一直 0 | PC Service / 头显未 WORKING 或未 Send；Wi‑Fi IP 是否填对 |
+| 与 Dex3 习惯反了 | Revo2：**松=开，扣=合**；Dex3：**松=合，扣=开** |

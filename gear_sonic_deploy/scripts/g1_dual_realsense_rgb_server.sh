@@ -37,9 +37,10 @@ cleanup_previous_camera_holders() {
     return 0
   fi
 
-  echo "[g1-cam] cleanup: stop prior publishers / videohub, free :$PORT and /dev/video10"
+  echo "[g1-cam] cleanup: stop prior RealSense publishers / videohub, free :$PORT"
 
   # Previous publishers only (do NOT pkill this .sh — would kill ourselves).
+  # Never pkill g1_wrist_abham* here — wrist is started before dual RealSense.
   pkill -9 -f 'g1_dual_realsense_rgb_zmq_server.py' 2>/dev/null || true
   pkill -9 -f 'gear_sonic.camera.composed_camera' 2>/dev/null || true
 
@@ -48,13 +49,13 @@ cleanup_previous_camera_holders() {
     return 0
   fi
 
-  # Unitree stock service respawns videohub_pc4_chest on /dev/video10 (head RGB).
-  # Stopping master_service then killing leftovers avoids Device busy on head.
+  # Unitree stock service respawns videohub on onboard RGB. Do NOT
+  # `fuser -k /dev/video10` blindly — after reboot Abham wrists often own
+  # video10/11/12/13; killing those leaves left/right_wrist offline.
   sudo systemctl stop master_service 2>/dev/null || true
   sleep 0.3
   sudo pkill -9 -f 'videohub_pc4_chest' 2>/dev/null || true
   sudo pkill -9 -f 'videohub_pc4' 2>/dev/null || true
-  sudo fuser -k /dev/video10 2>/dev/null || true
   sudo fuser -k "${PORT}/tcp" 2>/dev/null || true
   sleep 0.5
 

@@ -23,6 +23,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import os
 import time
 
 import numpy as np
@@ -43,6 +44,7 @@ from gear_sonic.data.features_sonic_vla import (
 from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
 from gear_sonic.utils.data_collection.keyboard_subscriber import ZMQKeyboardSubscriber
+from gear_sonic.utils.data_collection.revo2_teleop_hands import Revo2TeleopHands
 from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.text_to_speech import TextToSpeech
 from gear_sonic.utils.data_collection.transforms import compute_projected_gravity, quat_to_rot6d
@@ -100,13 +102,37 @@ class SonicDataExporterConfig:
     """Seconds to wait for the ZMQ robot_config message at startup (0 = wait forever)."""
 
     record_wrist_cameras: bool = False
-    """Record wrist camera streams (left_wrist, right_wrist). Requires cameras to be available."""
+    """Record wrist camera streams (left_wrist, right_wrist). Requires Orin Abham on :5558."""
+
+    wrist_camera_port: int = 5558
+    """ZMQ port for left_wrist + right_wrist (Orin Abham server)."""
 
     record_head_camera: bool = False
     """Record second head/neck RGB stream (head). Use with dual RealSense ego_view+head."""
 
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
+
+    # Hand embodiment: dex3 (default 7D) or revo2 (6D from recorded grasp JSON)
+    hand_type: str = "dex3"
+    """Hand action labels: ``dex3`` (7D) or ``revo2`` (6D Grasp traj + Pico trigger)."""
+
+    revo2_pose: str = (
+        "../Manus/config/revo2_grasp_pose.json"
+    )
+    """Path to Revo2 grasp JSON (relative to Litchi repo root or absolute)."""
+
+    revo2_orin_host: str = "192.168.123.164"
+    """Orin host for Revo2 UDP Modbus bridge during recording."""
+
+    revo2_udp_port: int = 19500
+    """UDP port of Orin revo2_modbus_rx."""
+
+    revo2_send: bool = True
+    """If True with hand_type=revo2, also stream cmds to real hands via UDP."""
+
+    revo2_release_blend_s: float = 0.35
+    """Seconds to blend back to open after trigger release."""
 
 
 # ---------------------------------------------------------------------------
@@ -232,17 +258,32 @@ class GrootDataCollector:
         sonic_data_zmq_port: int = 5556,
         state_zmq_host: str = "localhost",
         state_zmq_port: int = 5557,
+        revo2_hands: Revo2TeleopHands | None = None,
+        record_wrist_cameras: bool = False,
+        wrist_camera_port: int = 5558,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
         self.loop_period = 1.0 / frequency
         self.data_exporter = data_exporter
         self.robot_model = robot_model
+        self.revo2_hands = revo2_hands
+        self._latest_revo2_cmds = None
+        self.record_wrist_cameras = bool(record_wrist_cameras)
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
 
         self._image_subscriber = ComposedCameraClientSensor(server_ip=camera_host, port=camera_port)
+        self._wrist_image_subscriber = None
+        if self.record_wrist_cameras:
+            self._wrist_image_subscriber = ComposedCameraClientSensor(
+                server_ip=camera_host, port=wrist_camera_port
+            )
+            print(
+                f"[Camera] wrist subscribe {camera_host}:{wrist_camera_port} "
+                f"(left_wrist + right_wrist)"
+            )
 
         self.obs_act_buffer = deque(maxlen=100)
         self.latest_image_msg = None
@@ -309,6 +350,35 @@ class GrootDataCollector:
             msg["ros_timestamp"] = time.time()
 
         self.latest_proprio_msg = msg
+
+    def _poll_camera_messages(self) -> None:
+        """Merge ego/head (:5555) and optional wrist (:5558) image streams."""
+        images: dict = {}
+        timestamps: dict = {}
+
+        ego_msg = self._image_subscriber.read()
+        if ego_msg is not None:
+            if ego_msg.get("images"):
+                images.update(ego_msg["images"])
+            if ego_msg.get("timestamps"):
+                timestamps.update(ego_msg["timestamps"])
+
+        if self._wrist_image_subscriber is not None:
+            wrist_msg = self._wrist_image_subscriber.read()
+            if wrist_msg is not None:
+                if wrist_msg.get("images"):
+                    images.update(wrist_msg["images"])
+                if wrist_msg.get("timestamps"):
+                    timestamps.update(wrist_msg["timestamps"])
+
+        if not images:
+            return
+
+        if self.latest_image_msg is None:
+            self.latest_image_msg = {"images": {}, "timestamps": {}}
+        # Keep last-good frames per key so a lagging wrist port doesn't drop ego/head.
+        self.latest_image_msg["images"].update(images)
+        self.latest_image_msg.setdefault("timestamps", {}).update(timestamps)
 
     def _check_recording_commands(self):
         """Check keyboard + ZMQ toggle flags for recording commands."""
@@ -468,6 +538,11 @@ class GrootDataCollector:
             left_hand_joints = self._extract_hand_joints(pose_data, "left_hand_joints")
             right_hand_joints = self._extract_hand_joints(pose_data, "right_hand_joints")
 
+            def _trig(key: str) -> float:
+                if key not in pose_data or pose_data[key] is None:
+                    return 0.0
+                return float(np.asarray(pose_data[key]).flat[0])
+
             vr_3pt_position = None
             if "vr_position" in pose_data and pose_data["vr_position"].size == 9:
                 vr_3pt_position = pose_data["vr_position"].flatten().astype(np.float32)
@@ -483,6 +558,8 @@ class GrootDataCollector:
                 ),
                 "left_hand_joints": left_hand_joints,
                 "right_hand_joints": right_hand_joints,
+                "left_trigger": _trig("left_trigger"),
+                "right_trigger": _trig("right_trigger"),
                 "left_wrist_joints": left_wrist_joints,
                 "right_wrist_joints": right_wrist_joints,
                 "vr_3pt_position": vr_3pt_position,
@@ -608,15 +685,27 @@ class GrootDataCollector:
         assert self.latest_proprio_msg is not None
         proprio = self.latest_proprio_msg
 
+        left_hand_q = proprio["left_hand_q"]
+        right_hand_q = proprio["right_hand_q"]
+        left_hand_act = proprio["last_left_hand_action"]
+        right_hand_act = proprio["last_right_hand_action"]
+        # No Dex3 DDS with Revo2: fill 7D hand slots from commanded Revo2 (norm 0..1).
+        if self.revo2_hands is not None:
+            lh_s, rh_s = self.revo2_hands.state_hand_vectors(self._latest_revo2_cmds)
+            left_hand_q = lh_s
+            right_hand_q = rh_s
+            left_hand_act = lh_s.astype(np.float32)
+            right_hand_act = rh_s.astype(np.float32)
+
         whole_q = self.robot_model.get_configuration_from_actuated_joints(
             body_actuated_joint_values=proprio["body_q"],
-            left_hand_actuated_joint_values=proprio["left_hand_q"],
-            right_hand_actuated_joint_values=proprio["right_hand_q"],
+            left_hand_actuated_joint_values=left_hand_q,
+            right_hand_actuated_joint_values=right_hand_q,
         )
         whole_action_wbc = self.robot_model.get_configuration_from_actuated_joints(
             body_actuated_joint_values=proprio["last_action"],
-            left_hand_actuated_joint_values=proprio["last_left_hand_action"],
-            right_hand_actuated_joint_values=proprio["last_right_hand_action"],
+            left_hand_actuated_joint_values=left_hand_act,
+            right_hand_actuated_joint_values=right_hand_act,
         )
 
         self.robot_model.cache_forward_kinematics(whole_q)
@@ -786,16 +875,27 @@ class GrootDataCollector:
             else smpl_msg
         )
         # Dex3 7D action labels for GR00T UNITREE_G1_SONIC.
-        # Prefer Pico Trigger/Grip targets; if those are missing/zero, fall back to
-        # the command (then measured state) published on g1_debug so recording
-        # chords like Left Grip+A still yield non-empty teleop.*_hand_joints when
-        # the hand was actually driven.
-        frame_data["teleop.left_hand_joints"] = self._resolve_dex3_hand_joints(
-            hand_msg, "left_hand_joints", "last_left_hand_action", "left_hand_q"
-        )
-        frame_data["teleop.right_hand_joints"] = self._resolve_dex3_hand_joints(
-            hand_msg, "right_hand_joints", "last_right_hand_action", "right_hand_q"
-        )
+        # Hand action labels:
+        #   dex3  → Pico Dex3 7D (fallback deploy / measured)
+        #   revo2 → recorded grasp traj 6D driven by Pico triggers
+        if self.revo2_hands is not None:
+            # Pad 6D→7D so schema matches stock UNITREE_G1_SONIC (Dex3-sized).
+            left_h, right_h = self.revo2_hands.teleop_vectors(
+                self._latest_revo2_cmds, pad_to_dex3=True
+            )
+            frame_data["teleop.left_hand_joints"] = left_h
+            frame_data["teleop.right_hand_joints"] = right_h
+        else:
+            # Prefer Pico Trigger/Grip targets; if those are missing/zero, fall back to
+            # the command (then measured state) published on g1_debug so recording
+            # chords like Left Grip+A still yield non-empty teleop.*_hand_joints when
+            # the hand was actually driven.
+            frame_data["teleop.left_hand_joints"] = self._resolve_dex3_hand_joints(
+                hand_msg, "left_hand_joints", "last_left_hand_action", "left_hand_q"
+            )
+            frame_data["teleop.right_hand_joints"] = self._resolve_dex3_hand_joints(
+                hand_msg, "right_hand_joints", "last_right_hand_action", "right_hand_q"
+            )
 
         # Planner command fields
         frame_data["teleop.planner_mode"] = np.array(
@@ -887,6 +987,11 @@ class GrootDataCollector:
                     ctx.term()
                 except Exception:
                     pass
+        if self.revo2_hands is not None:
+            try:
+                self.revo2_hands.close()
+            except Exception:
+                pass
 
         self._print_and_say("Shutting down data exporter...", say=False)
 
@@ -901,10 +1006,13 @@ class GrootDataCollector:
                     with self.telemetry.timer("poll_sonic"):
                         self._poll_sonic_zmq_messages()
 
+                    if self.revo2_hands is not None:
+                        self._latest_revo2_cmds = self.revo2_hands.step(
+                            self.latest_sonic_msg
+                        )
+
                     with self.telemetry.timer("poll_image"):
-                        img_msg = self._image_subscriber.read()
-                        if img_msg is not None:
-                            self.latest_image_msg = img_msg
+                        self._poll_camera_messages()
 
                     with self.telemetry.timer("add_frame"):
                         self._add_data_frame()
@@ -942,8 +1050,15 @@ class GrootDataCollector:
 def main(config: SonicDataExporterConfig):
     g1_rm = get_g1_robot_model()
 
-    dataset_features = get_features_sonic_vla(g1_rm)
-    modality_config = get_modality_config_sonic_vla(g1_rm)
+    hand_type = (config.hand_type or "dex3").strip().lower()
+    if hand_type not in ("dex3", "revo2"):
+        raise ValueError(f"hand_type must be dex3|revo2, got {config.hand_type!r}")
+
+    # Always 7D teleop hand slots: stock GR00T UNITREE_G1_SONIC expects Dex3 7+7.
+    # Revo2 writes 6D cmds in [0..1000] into the first 6 dims and pads dim7=0.
+    hand_dim = 7
+    dataset_features = get_features_sonic_vla(g1_rm, hand_dim=hand_dim)
+    modality_config = get_modality_config_sonic_vla(g1_rm, hand_dim=hand_dim)
 
     if config.record_wrist_cameras:
         print("[Camera] Wrist cameras enabled — adding to dataset schema")
@@ -965,6 +1080,29 @@ def main(config: SonicDataExporterConfig):
             else:
                 modality_config[key] = value
 
+    revo2_hands = None
+    revo2_pose_resolved = None
+    if hand_type == "revo2":
+        pose_path = config.revo2_pose
+        if not os.path.isabs(pose_path):
+            # resolve relative to Litchi repo root (cwd when following docs)
+            pose_path = os.path.abspath(pose_path)
+        revo2_pose_resolved = pose_path
+        revo2_hands = Revo2TeleopHands(
+            pose_path=pose_path,
+            hz=float(config.data_collection_frequency),
+            release_blend_s=config.revo2_release_blend_s,
+            orin_host=config.revo2_orin_host if config.revo2_send else None,
+            udp_port=config.revo2_udp_port,
+            send=config.revo2_send,
+        )
+        print(
+            f"[Hand] Revo2 mode: cmds=6D(0..1000) → teleop.*_hand_joints padded to 7D "
+            f"(UNITREE_G1_SONIC) from {pose_path}"
+        )
+    else:
+        print("[Hand] Dex3 mode: teleop.*_hand_joints = 7D")
+
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 
     robot_config = poll_robot_config_zmq(
@@ -981,6 +1119,8 @@ def main(config: SonicDataExporterConfig):
             **robot_config,
             "record_wrist_cameras": config.record_wrist_cameras,
             "record_head_camera": config.record_head_camera,
+            "hand_type": hand_type,
+            "revo2_pose": revo2_pose_resolved,
         },
     )
 
@@ -995,6 +1135,9 @@ def main(config: SonicDataExporterConfig):
         sonic_data_zmq_port=config.sonic_zmq_port,
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
+        revo2_hands=revo2_hands,
+        record_wrist_cameras=config.record_wrist_cameras,
+        wrist_camera_port=config.wrist_camera_port,
     )
     data_collector.run()
 

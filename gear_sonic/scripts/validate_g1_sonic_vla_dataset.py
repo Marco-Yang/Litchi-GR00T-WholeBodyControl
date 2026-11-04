@@ -141,12 +141,19 @@ def main(config: Config) -> int:
         if "teleop.left_hand_joints" in cols:
             lh = np.stack(table.column("teleop.left_hand_joints").to_pylist())
             left_nz_frames += int(np.sum(np.any(np.abs(lh) > 1e-6, axis=1)))
-            if lh.shape[1] != 7:
-                print(f"[FAIL] left_hand_joints dim={lh.shape[1]} (Dex3 want 7)")
+            if lh.shape[1] == 6:
+                print("[info] left_hand_joints dim=6 (Revo2)")
+            elif lh.shape[1] == 7:
+                pass  # Dex3
+            else:
+                print(f"[FAIL] left_hand_joints dim={lh.shape[1]} (want Dex3=7 or Revo2=6)")
                 ok = False
         if "teleop.right_hand_joints" in cols:
             rh = np.stack(table.column("teleop.right_hand_joints").to_pylist())
             right_nz_frames += int(np.sum(np.any(np.abs(rh) > 1e-6, axis=1)))
+            if rh.shape[1] not in (6, 7):
+                print(f"[FAIL] right_hand_joints dim={rh.shape[1]} (want Dex3=7 or Revo2=6)")
+                ok = False
 
         if "observation.state" in cols:
             state = np.stack(table.column("observation.state").to_pylist())
