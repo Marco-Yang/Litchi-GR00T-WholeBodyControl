@@ -1,7 +1,8 @@
-"""Batch-validate walking episodes in Isaac Sim with SONIC encode-mode-2 (SMPL).
+"""Batch-validate walking episodes in Isaac Sim with SONIC encoders.
 
 - Spawns multiple G1 envs (each env = one episode / motion clip)
-- Forces ``use_encoder=smpl`` (encode mode 2)
+- ``encode_mode=2`` → ``use_encoder=smpl`` (SMPL / mode-2)
+- ``encode_mode=0`` → ``use_encoder=g1`` (qpos / mode-0)
 - **GUI on by default** so you can visually inspect tracking / balance
 - Writes eval metrics under ``--output``
 
@@ -29,7 +30,7 @@ def build_eval_command(
     python_exe: str,
     checkpoint: Path,
     robot_motion_dir: Path,
-    smpl_motion_dir: Path,
+    smpl_motion_dir: Path | None,
     output_dir: Path,
     num_envs: int,
     headless: bool,
@@ -37,10 +38,19 @@ def build_eval_command(
     max_steps_hint: int | None,
     keep_gui_alive: bool,
     fall_filter: bool = True,
+    save_videos: bool = False,
+    video_dir: Path | None = None,
+    encode_mode: int = 2,
 ) -> list[str]:
-    """Build ``gear_sonic/eval_agent_trl.py`` argv for SMPL mode-2 multi-G1 eval."""
+    """Build ``gear_sonic/eval_agent_trl.py`` argv for multi-G1 eval."""
+    if int(encode_mode) not in (0, 2):
+        raise ValueError(f"encode_mode must be 0 or 2, got {encode_mode}")
+    use_encoder = "g1" if int(encode_mode) == 0 else "smpl"
     metrics_dir = output_dir / "metrics"
     metrics_dir.mkdir(parents=True, exist_ok=True)
+    if save_videos:
+        video_dir = Path(video_dir or (output_dir / "videos"))
+        video_dir.mkdir(parents=True, exist_ok=True)
     # GUI dynamics check: keep stepping after metrics so the window does not
     # immediately os._exit. Headless metrics-only stays on the one-shot path.
     run_eval_loop = bool(keep_gui_alive and not headless)
@@ -59,6 +69,18 @@ def build_eval_command(
             "+manager_env/terminations=tracking/data_check_gui",
             "+data_check_loose_terminations=true",
         ]
+    if int(encode_mode) == 0:
+        # Joint-based g1 encoder; no SMPL stream required.
+        smpl_file_override = "dummy"
+        smpl_y_up = "false"
+        smpl_teleop = "false"
+    else:
+        if smpl_motion_dir is None:
+            raise ValueError("smpl_motion_dir required for encode_mode=2")
+        smpl_file_override = str(smpl_motion_dir)
+        # Pico stream already Y→Z + base_rot + local joints — match C++ deploy.
+        smpl_y_up = "false"
+        smpl_teleop = "true"
     cmd = [
         python_exe,
         "-u",
@@ -67,7 +89,7 @@ def build_eval_command(
         f"+headless={str(bool(headless)).lower()}",
         "++eval_callbacks=im_eval",
         f"++run_eval_loop={str(run_eval_loop).lower()}",
-        "++use_encoder=smpl",
+        f"++use_encoder={use_encoder}",
         f"++num_envs={int(num_envs)}",
         f"++env_spacing={float(env_spacing)}",
         f"++manager_env.config.env_spacing={float(env_spacing)}",
@@ -79,17 +101,17 @@ def build_eval_command(
         # Unitree G1 + Dex3 (SONIC v1.1 / walking teleop)
         "++manager_env.config.robot.type=g1_model_12_dex",
         *term_overrides,
-        # Snap standing carrier feet to ground (enum: 0=no, 1=full, 2=ankle).
+        # Snap feet to ground (enum: 0=no, 1=full, 2=ankle).
         "++manager_env.commands.motion.motion_lib_cfg.fix_height=1",
-        # Pico stream already Y→Z + base_rot + local joints — match C++ deploy.
-        "++manager_env.commands.motion.motion_lib_cfg.smpl_y_up=false",
-        "++manager_env.commands.motion.motion_lib_cfg.smpl_teleop_preprocessed=true",
+        f"++manager_env.commands.motion.motion_lib_cfg.smpl_y_up={smpl_y_up}",
+        "++manager_env.commands.motion.motion_lib_cfg.smpl_teleop_preprocessed="
+        f"{smpl_teleop}",
         "++manager_env.commands.motion.motion_lib_cfg.motion_file="
         f"{robot_motion_dir}",
         "++manager_env.commands.motion.motion_lib_cfg.smpl_motion_file="
-        f"{smpl_motion_dir}",
+        f"{smpl_file_override}",
         "++manager_env.commands.motion.motion_lib_cfg.multi_thread=true",
-        # Dex hands: 14 = 7+7 so dof[:,29:] is consumed as hand_dof_pos
+        # Dex/Revo2 hands: 14 = 7+7 so dof[:,29:] is consumed as hand_dof_pos
         "++manager_env.commands.motion.motion_lib_cfg.hand_dof_count=14",
         # GUI: disable periodic cuda empty_cache (was freq=10 → 1–2s collective stutter).
         # Headless metrics can afford occasional cleanup.
@@ -98,13 +120,28 @@ def build_eval_command(
             if not headless
             else "++callbacks.im_eval.empty_cache_freq=50"
         ),
-        # Keep GUI responsive; disable video dump by default
-        "++algo.config.eval.save_videos=false",
+        # Keep GUI responsive; video dump optional via save_videos=
+        f"++algo.config.eval.save_videos={str(bool(save_videos)).lower()}",
         "+eval_debug_plot=false",
         "+show_episode_labels=true",
         # MuJoCo-like viewport: free camera (no robot lock) + hide IsaacLab docks
         "+simple_viewer=true",
     ]
+    if save_videos:
+        # Per-env tiled eval_camera + RenderEnvsRecorder → <video_dir>/000000.mp4 …
+        assert video_dir is not None
+        cmd.extend(
+            [
+                "manager_env/recorders=render",
+                "++manager_env.config.render_results=true",
+                f"++manager_env.config.save_rendering_dir={video_dir}",
+                # Slightly smaller than 1080p to keep headless encode light.
+                "++manager_env.config.render_width=1280",
+                "++manager_env.config.render_height=720",
+                "++manager_env.config.render_frame_skip=2",
+                "++manager_env.config.eval_camera_offset=[3.5,3.5,1.6]",
+            ]
+        )
     if run_eval_loop:
         # im_eval otherwise os._exit(0) when eval_frequency==1
         cmd.append("++callbacks.im_eval.exit_after_eval=false")
@@ -131,20 +168,28 @@ def run_isaac_batch(
     keep_gui_alive: bool = True,
     max_steps_hint: int | None = None,
     fall_filter: bool | None = None,
+    save_videos: bool = False,
+    encode_mode: int = 2,
 ) -> int:
-    mode2_dir = mode2_dir.resolve()
-    robot_dir = mode2_dir / "robot_motions"
-    smpl_dir = mode2_dir / "smpl_motions"
-    if not robot_dir.is_dir() or not smpl_dir.is_dir():
+    motion_dir = mode2_dir.resolve()
+    robot_dir = motion_dir / "robot_motions"
+    smpl_dir = motion_dir / "smpl_motions"
+    encode_mode = int(encode_mode)
+    if not robot_dir.is_dir():
         raise FileNotFoundError(
-            f"Missing robot_motions/ or smpl_motions/ under {mode2_dir}. "
+            f"Missing robot_motions/ under {motion_dir}. "
+            "Run convert_to_mode0.py or convert_to_mode2.py first."
+        )
+    if encode_mode == 2 and not smpl_dir.is_dir():
+        raise FileNotFoundError(
+            f"Missing smpl_motions/ under {motion_dir}. "
             "Run convert_to_mode2.py first."
         )
     if not checkpoint.is_file():
         raise FileNotFoundError(checkpoint)
 
     n_motions = len(list(robot_dir.glob("*.pkl")))
-    # num_envs<=0 means "spawn one G1 per motion in this mode2 dir" (full range).
+    # num_envs<=0 means "spawn one G1 per motion in this dir" (full range).
     if int(num_envs) <= 0:
         num_envs = n_motions
     else:
@@ -152,6 +197,7 @@ def run_isaac_batch(
 
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    video_dir = output_dir / "videos" if save_videos else None
 
     # Match the GUI 0-19 data_check setup: time_out only.
     # Teleop standing-carrier + anchor_pos/ori fall filter false-positives at ~step 9.
@@ -159,11 +205,12 @@ def run_isaac_batch(
     if fall_filter is None:
         fall_filter = False
     py = python_exe or sys.executable
+    use_encoder = "g1" if encode_mode == 0 else "smpl"
     cmd = build_eval_command(
         python_exe=py,
         checkpoint=checkpoint,
         robot_motion_dir=robot_dir,
-        smpl_motion_dir=smpl_dir,
+        smpl_motion_dir=smpl_dir if encode_mode == 2 else None,
         output_dir=output_dir,
         num_envs=num_envs,
         headless=headless,
@@ -171,6 +218,9 @@ def run_isaac_batch(
         max_steps_hint=max_steps_hint,
         keep_gui_alive=keep_gui_alive,
         fall_filter=fall_filter,
+        save_videos=save_videos,
+        video_dir=video_dir,
+        encode_mode=encode_mode,
     )
 
     launch = {
@@ -183,20 +233,26 @@ def run_isaac_batch(
         "show_episode_labels": True,
         "simple_viewer": True,
         "keep_gui_alive": bool(keep_gui_alive and not headless),
-        "encode_mode": 2,
-        "use_encoder": "smpl",
+        "encode_mode": encode_mode,
+        "use_encoder": use_encoder,
         "checkpoint": str(checkpoint),
-        "mode2_dir": str(mode2_dir),
+        "motion_dir": str(motion_dir),
         "command": cmd,
     }
     with open(output_dir / "launch_command.json", "w", encoding="utf-8") as f:
         json.dump(launch, f, ensure_ascii=False, indent=2)
 
+    label = (
+        "SONIC encode-mode-0 / g1 (qpos)"
+        if encode_mode == 0
+        else "SONIC encode-mode-2 / SMPL"
+    )
     print("=" * 72)
-    print(" Isaac Sim batch validate (SONIC encode-mode-2 / SMPL)")
+    print(f" Isaac Sim batch validate ({label})")
     print("=" * 72)
     print(f"  motions:   {n_motions}")
     print(f"  num_envs:  {num_envs}  (1 G1 per episode; show full range at once)")
+    print(f"  encode:    mode {encode_mode} → use_encoder={use_encoder}")
     print(f"  headless:  {headless}  (False => GUI for visual inspection)")
     print(f"  spacing:   {env_spacing} m  (env grid; robots must not overlap)")
     print("  terrain:   plane  (no trimesh background)")
@@ -244,7 +300,17 @@ def main(argv: list[str] | None = None) -> int:
         "--mode2-dir",
         type=Path,
         required=True,
-        help="Directory from convert_to_mode2.py (contains robot_motions/ + smpl_motions/)",
+        help=(
+            "Motion bundle dir: mode2 has robot_motions/+smpl_motions/; "
+            "mode0 needs robot_motions/ only"
+        ),
+    )
+    p.add_argument(
+        "--encode-mode",
+        type=int,
+        default=2,
+        choices=(0, 2),
+        help="0=g1/qpos encoder, 2=smpl encoder (default)",
     )
     p.add_argument(
         "--checkpoint",
@@ -282,6 +348,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument(
+        "--save-videos",
+        action="store_true",
+        help="Write per-env overview mp4s under <output>/videos/",
+    )
+    p.add_argument(
         "--python",
         type=str,
         default="",
@@ -302,6 +373,8 @@ def main(argv: list[str] | None = None) -> int:
         dry_run=args.dry_run,
         python_exe=args.python or None,
         keep_gui_alive=not bool(args.exit_after_metrics),
+        save_videos=bool(args.save_videos),
+        encode_mode=int(args.encode_mode),
     )
 
 

@@ -25,7 +25,9 @@ from datetime import datetime
 import json
 import os
 import time
+from typing import Optional
 
+import msgpack
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 import tyro
@@ -101,14 +103,19 @@ class SonicDataExporterConfig:
     robot_config_timeout: float = 0
     """Seconds to wait for the ZMQ robot_config message at startup (0 = wait forever)."""
 
-    record_wrist_cameras: bool = False
-    """Record wrist camera streams (left_wrist, right_wrist). Requires Orin Abham on :5558."""
+    record_wrist_cameras: Optional[bool] = None
+    """Wrist video: ``None``/omit = auto-detect :5558; ``True`` force on; ``False`` force off
+    (``--no-record-wrist-cameras``)."""
 
     wrist_camera_port: int = 5558
     """ZMQ port for left_wrist + right_wrist (Orin Abham server)."""
 
-    record_head_camera: bool = False
-    """Record second head/neck RGB stream (head). Use with dual RealSense ego_view+head."""
+    record_head_camera: Optional[bool] = None
+    """Head video: ``None``/omit = auto-detect ``head`` on :5555; ``True`` force on;
+    ``False`` force off (``--no-record-head-camera``)."""
+
+    camera_probe_timeout_s: float = 2.0
+    """Seconds to wait for a camera ZMQ frame when auto-detecting streams."""
 
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
@@ -138,6 +145,96 @@ class SonicDataExporterConfig:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def probe_zmq_image_keys(host: str, port: int, timeout_s: float = 2.0) -> set[str]:
+    """Return image keys from one msgpack camera PUB frame, or empty if unavailable.
+
+    Does not JPEG-decode; only inspects ``images`` dict keys (Orin dual/wrist servers).
+    """
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.SUB)
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.setsockopt(zmq.RCVTIMEO, 300)
+    sock.setsockopt(zmq.RCVHWM, 2)
+    sock.setsockopt(zmq.CONFLATE, 1)
+    sock.setsockopt_string(zmq.SUBSCRIBE, "")
+    sock.connect(f"tcp://{host}:{int(port)}")
+    # PUB/SUB slow-joiner
+    time.sleep(0.35)
+    keys: set[str] = set()
+    deadline = time.monotonic() + max(0.2, float(timeout_s))
+    while time.monotonic() < deadline:
+        try:
+            packed = sock.recv()
+        except zmq.Again:
+            continue
+        try:
+            data = msgpack.unpackb(packed, raw=False)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        images = data.get("images")
+        if isinstance(images, dict) and images:
+            keys.update(str(k) for k in images.keys())
+            break
+    sock.close()
+    ctx.term()
+    return keys
+
+
+def resolve_camera_recording_flags(
+    config: "SonicDataExporterConfig",
+) -> tuple[bool, bool]:
+    """Resolve head/wrist recording with optional auto-detect against live ZMQ streams.
+
+    Returns ``(record_wrist, record_head)``.
+    """
+    timeout = float(config.camera_probe_timeout_s)
+    auto_head = config.record_head_camera is None
+    auto_wrist = config.record_wrist_cameras is None
+
+    ego_keys: set[str] = set()
+    wrist_keys: set[str] = set()
+    if auto_head or auto_wrist:
+        print(
+            f"[Camera] probing streams on {config.camera_host}:"
+            f"{config.camera_port} / :{config.wrist_camera_port} "
+            f"(timeout={timeout:.1f}s) ..."
+        )
+    if auto_head:
+        ego_keys = probe_zmq_image_keys(config.camera_host, config.camera_port, timeout)
+        print(f"[Camera] :{config.camera_port} keys={sorted(ego_keys) or '—'}")
+        if "ego_view" not in ego_keys:
+            print(
+                f"[Camera] WARNING: no ego_view on :{config.camera_port} — "
+                "start Orin dual RealSense before recording"
+            )
+    if auto_wrist:
+        wrist_keys = probe_zmq_image_keys(
+            config.camera_host, config.wrist_camera_port, timeout
+        )
+        print(f"[Camera] :{config.wrist_camera_port} keys={sorted(wrist_keys) or '—'}")
+
+    if auto_wrist:
+        record_wrist = {"left_wrist", "right_wrist"}.issubset(wrist_keys)
+    else:
+        record_wrist = bool(config.record_wrist_cameras)
+
+    if auto_head:
+        record_head = "head" in ego_keys
+    else:
+        record_head = bool(config.record_head_camera)
+
+    mode = []
+    mode.append("ego_view")
+    if record_head:
+        mode.append("head")
+    if record_wrist:
+        mode.append("left_wrist+right_wrist")
+    print(f"[Camera] recording → {', '.join(mode)}")
+    return record_wrist, record_head
 
 
 class TimeDeltaException(Exception):
@@ -295,6 +392,8 @@ class GrootDataCollector:
 
         self._manager_toggle_dc = False
         self._manager_toggle_da = False
+        self._toggle_dc_seen = False
+        self._toggle_da_seen = False
 
         self._state_subscriber = ZMQStateSubscriber(
             host=state_zmq_host,
@@ -309,7 +408,8 @@ class GrootDataCollector:
             self._sonic_zmq_socket.connect(f"tcp://{sonic_data_zmq_host}:{sonic_data_zmq_port}")
             self._sonic_zmq_socket.setsockopt(zmq.RCVTIMEO, 100)
             self._sonic_zmq_socket.setsockopt(zmq.CONFLATE, 0)
-            self._sonic_zmq_socket.setsockopt(zmq.RCVHWM, 20)
+            # High HWM: pose floods must not drop one-shot manager_state stop toggles.
+            self._sonic_zmq_socket.setsockopt(zmq.RCVHWM, 1000)
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "pose")
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "planner")
             self._sonic_zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "manager_state")
@@ -414,7 +514,8 @@ class GrootDataCollector:
         if self._sonic_zmq_socket is None:
             return
 
-        max_polls = 20
+        # Drain aggressively so a burst after a slow video put cannot bury stop toggles.
+        max_polls = 500
         for _ in range(max_polls):
             try:
                 raw = self._sonic_zmq_socket.recv(zmq.NOBLOCK)
@@ -437,10 +538,16 @@ class GrootDataCollector:
         if "stream_mode" in data:
             self.current_stream_mode = int(data["stream_mode"].flat[0])
 
-        if self._extract_bool(data, "toggle_data_collection"):
+        # Rising-edge latch: pico may sticky-repeat toggles so a stalled exporter
+        # still sees stop; only the first True after a False should fire once.
+        dc = self._extract_bool(data, "toggle_data_collection")
+        da = self._extract_bool(data, "toggle_data_abort")
+        if dc and not self._toggle_dc_seen:
             self._manager_toggle_dc = True
-        if self._extract_bool(data, "toggle_data_abort"):
+        if da and not self._toggle_da_seen:
             self._manager_toggle_da = True
+        self._toggle_dc_seen = dc
+        self._toggle_da_seen = da
 
     def _handle_planner_message(self, raw: bytes) -> None:
         try:
@@ -733,7 +840,15 @@ class GrootDataCollector:
 
         self._log_latency_periodic(sonic_latency_ms)
 
-        self.data_exporter.add_frame(frame_data)
+        def _interrupt() -> bool:
+            # Keep consuming ZMQ while video queues are full so Pico stop is not lost.
+            self._poll_sonic_zmq_messages()
+            return bool(self._manager_toggle_dc or self._manager_toggle_da)
+
+        accepted = self.data_exporter.add_frame(frame_data, interrupt_check=_interrupt)
+        if not accepted:
+            # Apply pending stop/abort on the same iteration.
+            self._check_recording_commands()
         return self._finalize_frame(t_start)
 
     def _add_cpp_state_features(self, frame_data: dict, proprio: dict) -> None:
@@ -1006,6 +1121,11 @@ class GrootDataCollector:
                     with self.telemetry.timer("poll_sonic"):
                         self._poll_sonic_zmq_messages()
 
+                    # Apply Pico start/stop BEFORE add_frame so a slow encode cannot
+                    # bury the edge-triggered toggle for a full queue.put stall.
+                    with self.telemetry.timer("check_recording_commands"):
+                        self._check_recording_commands()
+
                     if self.revo2_hands is not None:
                         self._latest_revo2_cmds = self.revo2_hands.step(
                             self.latest_sonic_msg
@@ -1016,9 +1136,6 @@ class GrootDataCollector:
 
                     with self.telemetry.timer("add_frame"):
                         self._add_data_frame()
-
-                    with self.telemetry.timer("check_recording_commands"):
-                        self._check_recording_commands()
 
                     end_time = time.monotonic()
 
@@ -1060,7 +1177,9 @@ def main(config: SonicDataExporterConfig):
     dataset_features = get_features_sonic_vla(g1_rm, hand_dim=hand_dim)
     modality_config = get_modality_config_sonic_vla(g1_rm, hand_dim=hand_dim)
 
-    if config.record_wrist_cameras:
+    record_wrist, record_head = resolve_camera_recording_flags(config)
+
+    if record_wrist:
         print("[Camera] Wrist cameras enabled — adding to dataset schema")
         dataset_features.update(get_wrist_camera_features())
         wrist_modality = get_wrist_camera_modality_config()
@@ -1070,7 +1189,7 @@ def main(config: SonicDataExporterConfig):
             else:
                 modality_config[key] = value
 
-    if config.record_head_camera:
+    if record_head:
         print("[Camera] Head camera enabled — adding to dataset schema")
         dataset_features.update(get_head_camera_features())
         head_modality = get_head_camera_modality_config()
@@ -1117,8 +1236,8 @@ def main(config: SonicDataExporterConfig):
         task=config.task_prompt,
         script_config={
             **robot_config,
-            "record_wrist_cameras": config.record_wrist_cameras,
-            "record_head_camera": config.record_head_camera,
+            "record_wrist_cameras": record_wrist,
+            "record_head_camera": record_head,
             "hand_type": hand_type,
             "revo2_pose": revo2_pose_resolved,
         },
@@ -1136,7 +1255,7 @@ def main(config: SonicDataExporterConfig):
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
         revo2_hands=revo2_hands,
-        record_wrist_cameras=config.record_wrist_cameras,
+        record_wrist_cameras=record_wrist,
         wrist_camera_port=config.wrist_camera_port,
     )
     data_collector.run()

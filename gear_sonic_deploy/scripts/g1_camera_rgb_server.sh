@@ -64,7 +64,7 @@ if [[ "$ENABLE_WRIST" -eq 1 ]]; then
   PYTHONUNBUFFERED=1 setsid nohup "$WRIST_PY" -u \
     "$REPO_ROOT/gear_sonic_deploy/scripts/g1_wrist_abham_rgb_zmq_server.py" \
     --port "$WRIST_PORT" \
-    --fps 30 \
+    --fps "${G1_WRIST_FPS:-20}" \
     --width 640 \
     --height 480 \
     >>"$WRIST_LOG" 2>&1 </dev/null &

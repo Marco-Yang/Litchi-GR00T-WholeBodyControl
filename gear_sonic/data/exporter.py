@@ -2,7 +2,6 @@
 Gr00t data exporter for LeRobot-format datasets.
 """
 
-import copy
 from dataclasses import asdict, dataclass
 from functools import partial
 import json
@@ -247,6 +246,7 @@ class Gr00tDataExporter(LeRobotDataset):
     def create_video_writer(self) -> dict[str, VideoWriter]:
         video_writers = {}
         for key in self.meta.video_keys:
+            # Larger in-flight queue absorbs H264 startup spikes without dropping frames.
             video_writers[key] = VideoWriter(
                 self.root
                 / self.meta.get_video_file_path(self.episode_buffer["episode_index"], key),
@@ -254,17 +254,29 @@ class Gr00tDataExporter(LeRobotDataset):
                 self.meta.shapes[key][0],
                 self.fps,
                 self.vcodec,
+                buffer_size=200,
             )
         return video_writers
 
-    def add_frame(self, frame: dict) -> None:
-        """Add a frame to the episode buffer. Videos are handled by the video_writer."""
-        frame = copy.deepcopy(frame)
-        frame["task"] = frame.get("task", self.task)
+    @staticmethod
+    def _own_value(value: Any) -> Any:
+        """Copy tensors/ndarrays once so ZMQ reuse cannot corrupt the episode buffer."""
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().numpy().copy()
+        if isinstance(value, np.ndarray):
+            return np.array(value, copy=True)
+        return value
 
-        for name in frame:
-            if isinstance(frame[name], torch.Tensor):
-                frame[name] = frame[name].numpy()
+    def add_frame(self, frame: dict, interrupt_check=None) -> bool:
+        """Add a frame to the episode buffer. Videos are handled by the video_writer.
+
+        ``interrupt_check``: optional zero-arg callable; when it returns True while a
+        video queue is full, framing aborts so the caller can handle stop/abort.
+        Returns False if interrupted before the frame was fully accepted.
+        """
+        # Shallow dict + per-array copy (avoids expensive recursive deepcopy of large images).
+        frame = {key: self._own_value(value) for key, value in frame.items()}
+        frame["task"] = frame.get("task", self.task)
 
         validate_frame(frame, self.features)
 
@@ -296,12 +308,30 @@ class Gr00tDataExporter(LeRobotDataset):
                 if frame_index == 0:
                     img_path.parent.mkdir(parents=True, exist_ok=True)
 
-                self.video_writers[key].add_frame(frame[key])
+                img = frame[key]
+                if not isinstance(img, np.ndarray):
+                    raise TypeError(f"Video feature '{key}' must be ndarray, got {type(img)}")
+                # Contiguous owned buffer for the async encoder thread.
+                ok = self.video_writers[key].add_frame(
+                    np.ascontiguousarray(img), interrupt_check=interrupt_check
+                )
+                if not ok:
+                    # Roll back this partial frame so parquet/video lengths stay aligned.
+                    self.episode_buffer["frame_index"].pop()
+                    self.episode_buffer["timestamp"].pop()
+                    for k in list(self.episode_buffer.keys()):
+                        if k in ("size", "episode_index"):
+                            continue
+                        buf = self.episode_buffer[k]
+                        if isinstance(buf, list) and len(buf) > frame_index:
+                            buf.pop()
+                    return False
                 self.episode_buffer[key].append(str(img_path))
             else:
                 self.episode_buffer[key].append(frame[key])
 
         self.episode_buffer["size"] += 1
+        return True
 
     def stop_video_writers(self):
         if not hasattr(self, "video_writers"):

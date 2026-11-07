@@ -173,23 +173,40 @@ def filter_video_frames(video_path: Path, valid_indices: np.ndarray, fps: int):
     if len(filtered) == 0:
         return
 
-    tmp_path = video_path.with_suffix(".tmp.mp4")
-    output_container = av.open(str(tmp_path), mode="w")
-    output_stream = output_container.add_stream("h264", rate=fps)
-    h, w = filtered[0].shape[:2]
-    output_stream.width = w
-    output_stream.height = h
-    output_stream.pix_fmt = "yuv420p"
+    # Unique tmp name: pathlib.with_suffix(".tmp.mp4") is fine, but keep the
+    # source copy if encode fails so cleaning does not abort mid-dataset.
+    tmp_path = video_path.parent / f".{video_path.stem}.filter.tmp.mp4"
+    if tmp_path.exists():
+        tmp_path.unlink()
 
-    for img in filtered:
-        frame = av.VideoFrame.from_ndarray(img, format="rgb24")
-        for packet in output_stream.encode(frame):
+    try:
+        output_container = av.open(str(tmp_path), mode="w")
+        output_stream = output_container.add_stream("libx264", rate=fps)
+        h, w = filtered[0].shape[:2]
+        # yuv420p requires even dimensions
+        output_stream.width = w - (w % 2)
+        output_stream.height = h - (h % 2)
+        output_stream.pix_fmt = "yuv420p"
+        output_stream.options = {"crf": "23", "preset": "veryfast"}
+
+        for img in filtered:
+            if img.shape[0] != output_stream.height or img.shape[1] != output_stream.width:
+                img = img[: output_stream.height, : output_stream.width]
+            frame = av.VideoFrame.from_ndarray(img, format="rgb24")
+            for packet in output_stream.encode(frame):
+                output_container.mux(packet)
+        for packet in output_stream.encode():
             output_container.mux(packet)
-    for packet in output_stream.encode():
-        output_container.mux(packet)
-    output_container.close()
+        output_container.close()
 
-    tmp_path.replace(video_path)
+        if not tmp_path.is_file() or tmp_path.stat().st_size <= 0:
+            raise FileNotFoundError(f"encoder produced empty file: {tmp_path}")
+        tmp_path.replace(video_path)
+    except Exception as exc:
+        print(f"  WARNING: video filter failed for {video_path.name}: {exc}")
+        if tmp_path.exists():
+            tmp_path.unlink()
+        # Keep the already-copied source video; frame count may exceed parquet.
 
 
 # ---------------------------------------------------------------------------

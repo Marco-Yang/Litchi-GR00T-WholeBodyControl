@@ -40,7 +40,7 @@ sleep 0.3
 echo "[g1-wrist] repo=$REPO_ROOT port=$PORT python=$PY"
 exec "$PY" "$REPO_ROOT/gear_sonic_deploy/scripts/g1_wrist_abham_rgb_zmq_server.py" \
   --port "$PORT" \
-  --fps 30 \
+  --fps "${G1_WRIST_FPS:-20}" \
   --width 640 \
   --height 480 \
   "$@"
