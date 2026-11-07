@@ -191,6 +191,7 @@ python gear_sonic/scripts/run_camera_viewer.py \
 | 3 | 工作站终端 1 | deploy SONIC v1.1（§4.3） |
 | 4 | 工作站终端 2 | pico_manager（§4.4） |
 | 5 | 工作站终端 3 | data exporter `--hand-type revo2`（§4.5） |
+| 6 | 工作站 | CPU 绑核（§4.6；三端起来后执行） |
 
 ### 4.1 机器人 — Camera（ego + head + **左右腕**）
 
@@ -261,6 +262,17 @@ python gear_sonic/scripts/pico_manager_thread_server.py --robot g1 --manager
 
 **Revo2（当前，需 §4.2 已起）：** Pico 扳机驱动录制 grasp 轨迹并 UDP 下发真手；落盘时 6D **pad 成 7D**（末维 0），匹配 GR00T `UNITREE_G1_SONIC`（action = 64 + 7 + 7）。
 
+**相机落盘自动探测（默认）：** 启动时探测 Orin `:5555` / `:5558`。有 `head` → 录 head；`:5558` 上同时有 `left_wrist`+`right_wrist` → 录腕部；否则只录已有流。`ego_view` 始终在 schema 中。
+
+| Orin | 探测结果（无需额外 exporter 相机参数） |
+|---|---|
+| `g1_camera_rgb_server.sh` | `ego_view` + `head` |
+| `g1_camera_rgb_server.sh wrist` | 上表 + `left_wrist` + `right_wrist` |
+
+强制开关（一般不用）：`--record-wrist-cameras` / `--no-record-wrist-cameras`，`--record-head-camera` / `--no-record-head-camera`。
+
+**推荐命令（Revo2；相机自动）：**
+
 ```bash
 cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 source .venv_data_collection/bin/activate
@@ -268,9 +280,6 @@ python gear_sonic/scripts/run_data_exporter.py \
   --task-prompt "走到绿色桌子前" \
   --camera-host 192.168.123.164 \
   --camera-port 5555 \
-  --record-head-camera \
-  --record-wrist-cameras \
-  --wrist-camera-port 5558 \
   --root-output-dir outputs \
   --hand-type revo2 \
   --revo2-pose ../Manus/config/revo2_grasp_pose_02.json \
@@ -278,16 +287,48 @@ python gear_sonic/scripts/run_data_exporter.py \
   --revo2-send
 ```
 
-视频落盘键：`observation.images.ego_view` / `head` / **`left_wrist`** / **`right_wrist`**。
+启动日志应出现 `[Camera] recording → ego_view, head` 或带腕部的四路。
 
-**Dex3（旧）手：** 不需要 §4.2；命令去掉 `--hand-type revo2` 及相关参数即可（腕部同样加 `--record-wrist-cameras`）。
+**Dex3（旧）手：** 不需要 §4.2；去掉 `--hand-type revo2` 及相关参数即可；相机同样自动探测。
 
-> 腕部 Abham 未接 / `:5558` 起不来时：Orin 改用不带 `wrist` 的相机脚本，并去掉 exporter 的 `--record-wrist-cameras`。
+### 4.6 工作站 — CPU 绑核 / 解绑（跟随优先）
 
-### 4.6 操作
+**deploy / pico_manager / exporter（及可选 camera_viewer）都起来之后**再绑，优先保证 Sonic 跟随核，避免 exporter/viewer 抢核。
+
+默认分配（32 逻辑核，如 9950X3D）：
+
+| 进程 | CPU | nice |
+|------|-----|------|
+| pico_manager | 0–11 | -10 |
+| deploy (`g1_deploy_onnx_ref`) | 12–23 | -10 |
+| exporter | 24–30 | +10 |
+| camera_viewer（若在跑） | **31**（单核） | +10 |
+
+**绑核：**
+
+```bash
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
+bash gear_sonic_deploy/scripts/pin_data_collection_cpus.sh
+```
+
+**解绑（恢复全核 0–31、nice=0）：**
+
+```bash
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
+bash gear_sonic_deploy/scripts/unpin_data_collection_cpus.sh
+```
+
+说明：
+
+- `renice -10` 若无效，可加 `sudo` 再跑 pin 脚本。
+- pico_manager 虽绑 12 核，Python/GIL 下有效负载仍接近单核；deploy 才是多核策略侧。
+- 进程重启后需重新执行 pin。viewer 单核可改：`VIEW_CPU=30 bash gear_sonic_deploy/scripts/pin_data_collection_cpus.sh`。
+
+### 4.7 操作
 
 1. 标定姿态 → **A+B+X+Y** 启动（PLANNER）→ 身体对齐后再 **A+X** 进 **POSE**  
 2. **左 Grip + A**：开始/结束 episode  
+   - **开录后先静止约 0.5–1s 再动手**，避开视频编码器起步尖峰，减少前期帧变稀。  
 3. **左 Grip + B**：丢弃当前段  
 4. **开合手（Revo2）**：**松扳机 = 开掌（录制 START）**；**扣扳机 = 沿 grasp JSON 闭合并保持**；再松 = 短时回开。左右扳机各控左右手。  
    - （Dex3 旧逻辑相反：默认闭合，扣扳机张开。）  
@@ -401,16 +442,35 @@ uv run python gr00t/experiment/launch_finetune.py \
 
 ## 8. 数据回放筛选（在数据电脑上）
 
-在装有 Isaac Lab 的**数据电脑**上做：关节/SMPL 跳变预筛 + Isaac mode-2 回放。仓库根目录：`Litchi-GR00T-WholeBodyControl`。
+在装有 Isaac Lab 的**数据电脑**上做：关节/SMPL 跳变预筛 → **重写 `action.motion_token`（SONIC v1.1 mode2）** → Isaac mode-2 回放。仓库根目录：`Litchi-GR00T-WholeBodyControl`。
 
 ```bash
 conda activate sikan
 cd /path/to/Litchi-GR00T-WholeBodyControl
 export OMNI_KIT_ACCEPT_EULA=YES
 export CUDA_VISIBLE_DEVICES=0
+# ORT CUDA（token 重填）需要 nvidia cu13 库；pipeline 内会自动补 LD_LIBRARY_PATH
 ```
 
-清洗后每个 session 是独立数据集，回放时把 `--dataset` 指到具体 session 目录：
+清洗后每个 session 是独立数据集，回放时把 `--dataset` 指到具体 session 目录。
+
+`pipeline` **默认**会在不稳定 episode 删除之后，用与 Isaac mode-2 screening 相同的输入（SMPL joints + Pico 腕部解析、开环 heading）经 `sonic_v1_1/model_encoder.onnx` 重填 `action.motion_token`（不再信任录制时的旧 token）。旧 token 备份在 `<work-dir>/motion_token_backup/`；摘要写在数据集 `meta/motion_token_mode2_refill.json`。
+
+可选参数：
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `--token-device` | `auto` | `cuda` / `cpu` / `auto`（优先 CUDA） |
+| `--token-workers` | `4` | 并行 episode 数（GPU 上可开到 8） |
+| `--skip-token-refill` | off | 跳过 token 重写 |
+
+只重填 token、不跑 Isaac 时：
+
+```bash
+python -m datasets.data_check refill-tokens \
+  --dataset datasets/walking \
+  --device cuda --workers 8
+```
 
 ### 8.1 GUI 抽查（推荐先看一小段）
 
@@ -421,6 +481,7 @@ python -m datasets.data_check pipeline \
   --start 0 --end 15 \
   --num-envs 0 \
   --env-spacing 6 \
+  --token-workers 8 \
   --python "$(which python)"
 ```
 
@@ -434,6 +495,7 @@ python -m datasets.data_check pipeline \
   --env-spacing 6 \
   --headless \
   --exit-after-metrics \
+  --token-workers 8 \
   --python "$(which python)"
 ```
 
@@ -442,6 +504,7 @@ python -m datasets.data_check pipeline \
 - 跳变不通过：`<work-dir>/joint_stability.json`（字段 `unstable_episode_indices`）
 - 汇总：`<work-dir>/failed_validation.txt`（若已生成）
 - Isaac 指标：`<work-dir>/isaac_eval/metrics/metrics_eval.json`
+- Token 重填：`<dataset>/meta/motion_token_mode2_refill.json`
 
 ---
 

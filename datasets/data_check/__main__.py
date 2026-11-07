@@ -17,20 +17,29 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "Usage:\n"
             "  python -m datasets.data_check convert ...\n"
+            "  python -m datasets.data_check convert-mode0 ...\n"
             "  python -m datasets.data_check analyze ...\n"
             "  python -m datasets.data_check isaac ...\n"
             "  python -m datasets.data_check pipeline ...\n"
+            "  python -m datasets.data_check refill-tokens ...\n"
+            "  python -m datasets.data_check drop --dataset ... --episodes 6\n"
         )
         return 0
     cmd, rest = argv[0], argv[1:]
     if cmd == "convert":
         from .convert_to_mode2 import main as m
+    elif cmd in {"convert-mode0", "convert0", "mode0"}:
+        from .convert_to_mode0 import main as m
     elif cmd == "analyze":
         from .analyze_joint_stability import main as m
     elif cmd == "isaac":
         from .isaac_batch_validate import main as m
     elif cmd in {"pipeline", "run"}:
         from .run_pipeline import main as m
+    elif cmd in {"refill-tokens", "refill_tokens", "tokens"}:
+        from .refill_motion_tokens_mode2 import main as m
+    elif cmd == "drop":
+        from .drop_unstable import main as m
     else:
         print(f"Unknown subcommand: {cmd}", file=sys.stderr)
         return 2

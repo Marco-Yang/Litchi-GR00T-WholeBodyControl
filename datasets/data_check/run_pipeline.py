@@ -1,4 +1,13 @@
-"""One-shot pipeline: convert → GPU jump analysis → Isaac GUI batch validate.
+"""One-shot pipeline: convert → stability screen → mode2 token refill → Isaac GUI.
+
+Steps:
+  1. Convert LeRobot episodes → mode-2 teleop bundles
+  2. GPU joint-stability analysis; drop unstable (optional)
+  3. Refill ``action.motion_token`` with SONIC **v1.1 encoder mode 2**
+     using the same inputs as Isaac mode-2 screening
+     (``convert_to_mode2``: SMPL joints + Pico wrist parse, open-loop heading;
+     matches ``isaac_mode2_walking_*``, not the recorded teleop token_state)
+  4. Isaac GUI batch replay for visual screening
 
 Example (GUI, all episodes in range, stay open):
 
@@ -9,6 +18,11 @@ Example (GUI, all episodes in range, stay open):
     --work-dir datasets/data_check/runs/walking_0_15 \\
     --start 0 --end 15 \\
     --env-spacing 6
+
+Token refill alone (no Isaac):
+
+  python -m datasets.data_check refill-tokens \\
+    --dataset datasets/pick_toy/2026-11-07-14-13-29
 """
 
 from __future__ import annotations
@@ -16,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import shutil
 import sys
 
 # Allow ``python datasets/data_check/run_pipeline.py`` as well as ``-m``.
@@ -32,6 +47,10 @@ from datasets.data_check.isaac_batch_validate import run_isaac_batch  # noqa: E4
 from datasets.data_check.lerobot_io import (  # noqa: E402
     add_episode_range_args,
     resolve_episode_indices,
+)
+from datasets.data_check.refill_motion_tokens_mode2 import (  # noqa: E402
+    DEFAULT_ENCODER,
+    refill_dataset,
 )
 
 
@@ -71,6 +90,35 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--skip-convert", action="store_true")
     p.add_argument("--skip-analyze", action="store_true")
     p.add_argument("--skip-isaac", action="store_true")
+    p.add_argument(
+        "--skip-token-refill",
+        action="store_true",
+        help="Skip SONIC v1.1 mode-2 motion_token rewrite on the LeRobot dataset",
+    )
+    p.add_argument(
+        "--encoder",
+        type=Path,
+        default=DEFAULT_ENCODER,
+        help="SONIC v1.1 model_encoder.onnx used for mode-2 token refill",
+    )
+    p.add_argument(
+        "--token-device",
+        type=str,
+        default="auto",
+        choices=["auto", "cuda", "cpu"],
+        help="ORT device for motion_token refill (auto prefers CUDA)",
+    )
+    p.add_argument(
+        "--token-workers",
+        type=int,
+        default=4,
+        help="Parallel episode workers for motion_token refill (default 4)",
+    )
+    p.add_argument(
+        "--keep-unstable",
+        action="store_true",
+        help="Keep episodes that fail the joint-stability screen (default: drop them)",
+    )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--cpu-analyze", action="store_true")
     p.add_argument("--python", type=str, default="")
@@ -85,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
     indices = resolve_episode_indices(
         args.dataset, episodes=args.episodes, start=args.start, end=args.end
     )
+    nothing_left = False
     if indices is not None:
         print(f"[pipeline] episodes {indices[0]}..{indices[-1]} (n={len(indices)})")
 
@@ -114,14 +163,86 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"[pipeline] unstable episodes: {report['unstable_episode_indices']}"
         )
+        if report["unstable_episode_indices"] and not args.keep_unstable and not args.dry_run:
+            from datasets.data_check.drop_unstable import drop_episodes
+
+            details = {
+                int(row["episode_index"]): {"flags": row.get("flags", [])}
+                for row in report["episodes"]
+                if row.get("unstable")
+            }
+            dropped = drop_episodes(
+                args.dataset,
+                report["unstable_episode_indices"],
+                details=details,
+            )
+            summary["dropped_episode_indices"] = dropped["dropped"]
+            if indices is not None:
+                indices = [
+                    dropped["old_to_new"][i]
+                    for i in indices
+                    if i not in set(dropped["dropped"])
+                ]
+            if mode2_dir.exists():
+                shutil.rmtree(mode2_dir)
+            if indices is not None and not indices:
+                summary["num_converted"] = 0
+                nothing_left = True
+                print("[pipeline] every selected episode was unstable; nothing left to replay")
+            else:
+                meta = convert_dataset(args.dataset, mode2_dir, indices)
+                summary["num_converted"] = len(meta["episodes"])
+        else:
+            summary["dropped_episode_indices"] = []
     else:
         summary["num_unstable"] = "skipped"
+        summary["dropped_episode_indices"] = []
+
+    # Rewrite action.motion_token with SONIC v1.1 mode-2 (SMPL + wrist qpos)
+    # after unstable drop so remaining parquet clips get fresh latents.
+    if not args.skip_token_refill and not nothing_left and not args.dry_run:
+        token_backup = work / "motion_token_backup"
+        token_summary = refill_dataset(
+            args.dataset,
+            episode_indices=indices,
+            encoder_path=args.encoder,
+            backup_dir=token_backup,
+            dry_run=False,
+            device=args.token_device,
+            workers=max(1, int(args.token_workers)),
+        )
+        n_tok = max(len(token_summary["episodes"]), 1)
+        mean_abs = sum(e["token_abs_mean"] for e in token_summary["episodes"]) / n_tok
+        summary["token_refill"] = {
+            "encode_mode": 2,
+            "sonic": "v1.1",
+            "encode_path": "isaac_mode2_openloop",
+            "encoder": str(Path(args.encoder).resolve()),
+            "num_episodes": token_summary["num_episodes"],
+            "backup_dir": str(token_backup),
+            "mean_token_abs": float(mean_abs),
+        }
+        summary_path = Path(args.dataset).resolve() / "meta" / "motion_token_mode2_refill.json"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(token_summary, f, ensure_ascii=False, indent=2)
+        print(
+            f"[pipeline] refilled motion_token (v1.1 mode2 isaac-openloop) for "
+            f"{token_summary['num_episodes']} episodes; "
+            f"|token|mean={mean_abs:.4f}"
+        )
+    elif args.skip_token_refill:
+        summary["token_refill"] = "skipped"
+    elif args.dry_run:
+        summary["token_refill"] = "skipped_dry_run"
+    else:
+        summary["token_refill"] = "skipped_empty"
 
     # GUI is the default; --headless turns it off.
     headless = bool(args.headless)
 
     rc = 0
-    if not args.skip_isaac:
+    if not args.skip_isaac and not nothing_left:
         ckpt = args.checkpoint or (_REPO / "sonic_v1_1" / "last.pt")
         rc = run_isaac_batch(
             mode2_dir=mode2_dir,
