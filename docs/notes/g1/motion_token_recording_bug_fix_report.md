@@ -88,6 +88,10 @@ PY
 | `outputs/2026-11-09-11-20-20` | `ENABLED` 有；`rewrite skipped: smpl_all_zero`（`stream_mode=2`，无 SMPL） |
 | `outputs/2026-11-09-11-21-04` | `stream_mode=1`、SMPL 正常；但日志 `supervised rewrite failed (No module named 'datasets.data_check')` → 仍落盘 live（L2≈0.59/0.65）。**已修**：`supervised_mode2_tokens._import_refill` 改为按文件路径加载，避开 HF `datasets` 占名。需**重启 exporter** 再采。 |
 
+### 2026-11-09 清洗管线
+- `datasets/data_check/run_pipeline.py`：**默认不再**清除/重写 `action.motion_token`（保留落盘监督 token）。
+- 旧盘若仍需事后 mode2：显式 `--token-refill` 或 `python -m datasets.data_check refill-tokens`。
+
 ---
 
 ## 文档更新

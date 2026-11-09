@@ -1,13 +1,14 @@
-"""One-shot pipeline: convert → stability screen → mode2 token refill → Isaac GUI.
+"""One-shot pipeline: convert → stability screen → Isaac replay → quality drop.
 
 Steps:
   1. Convert LeRobot episodes → mode-2 teleop bundles
   2. GPU joint-stability analysis; drop unstable (optional)
-  3. Refill ``action.motion_token`` with SONIC **v1.1 encoder mode 2**
-     using the same inputs as Isaac mode-2 screening
-     (``convert_to_mode2``: SMPL joints + Pico wrist parse, open-loop heading;
-     matches ``isaac_mode2_walking_*``, not the recorded teleop token_state)
-  4. Isaac GUI batch replay for visual screening
+  3. Isaac batch replay (GUI or headless) for dynamics metrics
+  4. Screen ``metrics_eval.json`` per-episode; drop low-quality clips
+
+``action.motion_token`` is **kept as recorded** (exporter already writes open-loop
+mode-2 supervised tokens). Token rewrite is **opt-in** via ``--token-refill``
+(or the standalone ``refill-tokens`` CLI) for legacy disks only.
 
 Example (GUI, all episodes in range, stay open):
 
@@ -19,7 +20,7 @@ Example (GUI, all episodes in range, stay open):
     --start 0 --end 15 \\
     --env-spacing 6
 
-Token refill alone (no Isaac):
+Legacy token refill alone (no Isaac; only if you must overwrite old disks):
 
   python -m datasets.data_check refill-tokens \\
     --dataset datasets/pick_toy/2026-11-07-14-13-29
@@ -91,33 +92,57 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--skip-analyze", action="store_true")
     p.add_argument("--skip-isaac", action="store_true")
     p.add_argument(
+        "--token-refill",
+        action="store_true",
+        help=(
+            "Opt-in: overwrite action.motion_token with open-loop SONIC v1.1 mode-2. "
+            "Default is to keep on-disk tokens from recording (exporter supervised rewrite)."
+        ),
+    )
+    p.add_argument(
         "--skip-token-refill",
         action="store_true",
-        help="Skip SONIC v1.1 mode-2 motion_token rewrite on the LeRobot dataset",
+        help=(
+            "Deprecated no-op: token refill is already skipped by default. "
+            "Kept so old scripts that pass --skip-token-refill still run."
+        ),
     )
     p.add_argument(
         "--encoder",
         type=Path,
         default=DEFAULT_ENCODER,
-        help="SONIC v1.1 model_encoder.onnx used for mode-2 token refill",
+        help="SONIC v1.1 model_encoder.onnx (only used with --token-refill)",
     )
     p.add_argument(
         "--token-device",
         type=str,
         default="auto",
         choices=["auto", "cuda", "cpu"],
-        help="ORT device for motion_token refill (auto prefers CUDA)",
+        help="ORT device for --token-refill (auto prefers CUDA)",
     )
     p.add_argument(
         "--token-workers",
         type=int,
         default=4,
-        help="Parallel episode workers for motion_token refill (default 4)",
+        help="Parallel episode workers for --token-refill (default 4)",
     )
     p.add_argument(
         "--keep-unstable",
         action="store_true",
         help="Keep episodes that fail the joint-stability screen (default: drop them)",
+    )
+    p.add_argument(
+        "--keep-isaac-fail",
+        action="store_true",
+        help=(
+            "Keep episodes that fail Isaac quality thresholds "
+            "(default: drop them after metrics_eval)"
+        ),
+    )
+    p.add_argument(
+        "--skip-isaac-screen",
+        action="store_true",
+        help="Skip post-Isaac metric screening / drop (metrics still written)",
     )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--cpu-analyze", action="store_true")
@@ -198,9 +223,9 @@ def main(argv: list[str] | None = None) -> int:
         summary["num_unstable"] = "skipped"
         summary["dropped_episode_indices"] = []
 
-    # Rewrite action.motion_token with SONIC v1.1 mode-2 (SMPL + wrist qpos)
-    # after unstable drop so remaining parquet clips get fresh latents.
-    if not args.skip_token_refill and not nothing_left and not args.dry_run:
+    # Default: keep on-disk action.motion_token (exporter supervised rewrite).
+    # Opt-in --token-refill only for legacy sessions that never got mode2 on save.
+    if args.token_refill and not nothing_left and not args.dry_run:
         token_backup = work / "motion_token_backup"
         token_summary = refill_dataset(
             args.dataset,
@@ -231,12 +256,16 @@ def main(argv: list[str] | None = None) -> int:
             f"{token_summary['num_episodes']} episodes; "
             f"|token|mean={mean_abs:.4f}"
         )
-    elif args.skip_token_refill:
-        summary["token_refill"] = "skipped"
-    elif args.dry_run:
+    elif args.dry_run and args.token_refill:
         summary["token_refill"] = "skipped_dry_run"
-    else:
+    elif args.token_refill and nothing_left:
         summary["token_refill"] = "skipped_empty"
+    else:
+        summary["token_refill"] = "skipped_keep_on_disk"
+        print(
+            "[pipeline] keeping on-disk action.motion_token "
+            "(pass --token-refill only for legacy disks)"
+        )
 
     # GUI is the default; --headless turns it off.
     headless = bool(args.headless)
@@ -256,8 +285,50 @@ def main(argv: list[str] | None = None) -> int:
             keep_gui_alive=not bool(args.exit_after_metrics),
         )
         summary["isaac_returncode"] = rc
+        # After metrics: drop poor Isaac-tracking episodes from the dataset.
+        if (
+            rc == 0
+            and not args.skip_isaac_screen
+            and not args.dry_run
+        ):
+            from datasets.data_check.screen_isaac_metrics import screen_and_drop
+
+            metrics_path = isaac_out / "metrics" / "metrics_eval.json"
+            if metrics_path.is_file():
+                isaac_screen = screen_and_drop(
+                    dataset=args.dataset,
+                    metrics_path=metrics_path,
+                    work_dir=work,
+                    keep_failed=bool(args.keep_isaac_fail),
+                    dry_run=False,
+                )
+                summary["isaac_quality"] = {
+                    "num_failed": isaac_screen["num_failed"],
+                    "failed_episode_indices": isaac_screen["failed_episode_indices"],
+                    "drop": isaac_screen["drop"],
+                    "dropped": isaac_screen.get("dropped", []),
+                    "num_episodes_kept": isaac_screen.get("num_episodes_kept"),
+                    "report_json": isaac_screen.get("report_json"),
+                    "report_txt": isaac_screen.get("report_txt"),
+                }
+            else:
+                summary["isaac_quality"] = {
+                    "drop": "skipped_missing_metrics",
+                    "metrics_path": str(metrics_path),
+                }
+                print(f"[pipeline] isaac screen skipped; missing {metrics_path}")
+        elif args.skip_isaac_screen:
+            summary["isaac_quality"] = "skipped_by_flag"
+        elif args.dry_run:
+            summary["isaac_quality"] = "skipped_dry_run"
+        else:
+            summary["isaac_quality"] = {
+                "drop": "skipped_isaac_nonzero_rc",
+                "isaac_returncode": rc,
+            }
     else:
         summary["isaac_returncode"] = "skipped"
+        summary["isaac_quality"] = "skipped"
 
     with open(work / "pipeline_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)

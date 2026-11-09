@@ -9,7 +9,7 @@
 | `convert_to_mode2.py` | LeRobot → `robot_motions/` + `smpl_motions/` |
 | `analyze_joint_stability.py` | GPU 检测 state/SMPL/手/重力跳变 |
 | `isaac_batch_validate.py` | Isaac 多 G1 批量回放（**默认开 GUI**） |
-| `run_pipeline.py` | 一键：转换 → 分析 → Isaac |
+| `run_pipeline.py` | 一键：转换 → 分析 → Isaac（**默认不重写** `action.motion_token`；旧盘才加 `--token-refill`） |
 
 ## 环境
 

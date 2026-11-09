@@ -442,31 +442,31 @@ uv run python gr00t/experiment/launch_finetune.py \
 
 ## 8. 数据回放筛选（在数据电脑上）
 
-在装有 Isaac Lab 的**数据电脑**上做：关节/SMPL 跳变预筛 → **重写 `action.motion_token`（SONIC v1.1 mode2）** → Isaac mode-2 回放。仓库根目录：`Litchi-GR00T-WholeBodyControl`。
+在装有 Isaac Lab 的**数据电脑**上做：关节/SMPL 跳变预筛 → Isaac mode-2 回放。仓库根目录：`Litchi-GR00T-WholeBodyControl`。
 
 ```bash
 conda activate sikan
 cd /path/to/Litchi-GR00T-WholeBodyControl
 export OMNI_KIT_ACCEPT_EULA=YES
 export CUDA_VISIBLE_DEVICES=0
-# ORT CUDA（token 重填）需要 nvidia cu13 库；pipeline 内会自动补 LD_LIBRARY_PATH
 ```
 
 清洗后每个 session 是独立数据集，回放时把 `--dataset` 指到具体 session 目录。
 
-**2026-11-09 起（本树 Direction-1）：** `run_data_exporter.py` 默认在 **episode 落盘前** 已用同一套开环 mode-2 规则重写 `action.motion_token`（见 `gear_sonic/utils/data_collection/supervised_mode2_tokens.py`）。对新采数据，§8 refill **变为可选校验**，不再是「必须 refill 才能训」。摘要：`meta/motion_token_supervised_rewrite.jsonl`；live 控机 token：`meta/motion_token_live/episode_XXXXXX_motion_token_live.npy`。
+**`action.motion_token`：清洗默认不再清除/重写。**  
+录制时 `run_data_exporter.py` 已在落盘前写入开环 mode-2 监督 token（见 `supervised_mode2_tokens.py`）。`pipeline` **默认保留盘上 token**，日志会打印 `keeping on-disk action.motion_token`。
 
-`pipeline` **仍默认**会在不稳定 episode 删除之后再跑一遍 mode-2 refill（与 Isaac screening 同输入），用于：旧盘 / 关闭了 exporter rewrite 的 session / 二次校验。旧 token 备份在 `<work-dir>/motion_token_backup/`；摘要写在数据集 `meta/motion_token_mode2_refill.json`。若落盘已是 supervised rewrite，refill 应与盘上 token 逐步接近（理想 mean L2 ≪ 0.25）。
-
-可选参数：
+仅当处理**从未做过 exporter rewrite 的旧盘**时，才显式加 `--token-refill`（或单独跑 `refill-tokens`）。旧 token 备份在 `<work-dir>/motion_token_backup/`；摘要：`meta/motion_token_mode2_refill.json`。
 
 | 参数 | 默认 | 含义 |
 |---|---|---|
-| `--token-device` | `auto` | `cuda` / `cpu` / `auto`（优先 CUDA） |
-| `--token-workers` | `4` | 并行 episode 数（GPU 上可开到 8） |
-| `--skip-token-refill` | off | 跳过 token 重写 |
+| （无） | — | **默认不重写 token** |
+| `--token-refill` | off | **可选**：用开环 mode2 覆盖盘上 `action.motion_token`（旧数据） |
+| `--token-device` | `auto` | 仅配合 `--token-refill`：`cuda` / `cpu` / `auto` |
+| `--token-workers` | `4` | 仅配合 `--token-refill`：并行 episode 数 |
+| `--skip-token-refill` | — | 已废弃（默认就是跳过）；旧脚本带着也不影响 |
 
-只重填 token、不跑 Isaac 时：
+旧盘单独重填 token（不跑 Isaac）：
 
 ```bash
 python -m datasets.data_check refill-tokens \
@@ -483,7 +483,6 @@ python -m datasets.data_check pipeline \
   --start 0 --end 15 \
   --num-envs 0 \
   --env-spacing 6 \
-  --token-workers 8 \
   --python "$(which python)"
 ```
 
@@ -497,7 +496,6 @@ python -m datasets.data_check pipeline \
   --env-spacing 6 \
   --headless \
   --exit-after-metrics \
-  --token-workers 8 \
   --python "$(which python)"
 ```
 
@@ -506,7 +504,7 @@ python -m datasets.data_check pipeline \
 - 跳变不通过：`<work-dir>/joint_stability.json`（字段 `unstable_episode_indices`）
 - 汇总：`<work-dir>/failed_validation.txt`（若已生成）
 - Isaac 指标：`<work-dir>/isaac_eval/metrics/metrics_eval.json`
-- Token 重填：`<dataset>/meta/motion_token_mode2_refill.json`
+- （仅在使用了 `--token-refill` 时）Token 重填：`<dataset>/meta/motion_token_mode2_refill.json`
 
 ---
 

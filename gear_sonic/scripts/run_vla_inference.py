@@ -12,10 +12,10 @@ Uses the Isaac-GR00T PolicyClient (ZMQ REQ/REP) to communicate with a
 running PolicyServer.
 
 Keyboard commands (received via ZMQ from the standalone keyboard publisher):
-  p  -> pause / resume the policy loop
+  p  -> pause / resume the policy loop (pause also drops the RTC prefix)
   k  -> start / stop the C++ control loop
-  i  -> blend smoothly to initial pose (or snap if no prior token) and switch to POSE mode
-  t  -> change prompt at runtime (publisher sends ``prompt:<text>``)
+  i  -> blend smoothly to initial pose (or snap if no prior token), switch to POSE mode, and drop the RTC prefix
+  t  -> change prompt at runtime (publisher sends ``prompt:<text>``; also drops the RTC prefix)
   [  -> toggle left hand open/closed for initial pose
   ]  -> toggle right hand open/closed for initial pose
   c  -> start recording (handled by data exporter if running)
@@ -46,7 +46,9 @@ from gear_sonic.utils.inference.vla_utils import (
     calculate_latency_compensated_index,
     concat_action,
     prepare_observation_for_eval,
+    rtc_execution_index,
     should_trigger_new_inference,
+    should_trigger_rtc_inference,
 )
 from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
     G1GripperInverseKinematicsSolver,
@@ -75,8 +77,29 @@ class InferenceConfig:
     action_horizon: int = 40
     """Action horizon of the VLA policy (number of future actions per inference)."""
 
+    rtc: bool = True
+    """Condition each new chunk on the unexecuted tail of the previous chunk.
+
+    The first chunk, and the first chunk after initial pose, pause, or a prompt
+    change, is predicted without RTC. Requires a policy server that caches the
+    previous normalized action.
+    """
+
+    rtc_overlap_steps: int = 16
+    """Steps from the previous chunk that are inpainted into the new chunk."""
+
+    rtc_frozen_steps: int = 8
+    """Leading inpainted steps that stay frozen (no denoising)."""
+
+    rtc_ramp_rate: float = 5.0
+    """Exponential ramp from the frozen prefix to the freely denoised tail."""
+
     rate: float = 1 / 0.4
-    """Rate at which we run the forward pass of the VLA policy (Hz)."""
+    """Rate at which we run the forward pass of the VLA policy (Hz).
+
+    Used only when RTC is off. With RTC, the next chunk starts when
+    ``action_horizon - rtc_overlap_steps`` actions have been executed.
+    """
 
     # Camera
     camera_host: str = "localhost"
@@ -275,14 +298,15 @@ def prepare_observation_from_sensors(
     return observation
 
 
-def run_policy_inference_and_process(policy, observation, robot_model):
+def run_policy_inference_and_process(policy, observation, robot_model, options=None):
     """Run policy inference via Isaac-GR00T PolicyClient and process results.
 
     Returns:
-        processed_action dict or None on error.
+        ``(processed_action, rtc_applied)`` or None on error. ``rtc_applied`` is
+        true only when the server inpainted the previous chunk.
     """
     try:
-        action, _info = policy.get_action(observation)
+        action, info = policy.get_action(observation, options)
 
         action.pop("task_progress", None)
         action.pop("action.task_progress", None)
@@ -297,7 +321,8 @@ def run_policy_inference_and_process(policy, observation, robot_model):
             return None
 
         processed_action = concat_action(robot_model, action)
-        return processed_action
+        rtc_applied = bool(info.get("rtc", False)) if isinstance(info, dict) else False
+        return processed_action, rtc_applied
     except Exception as e:
         print(f"Error in inference: {e}")
         import traceback
@@ -306,43 +331,63 @@ def run_policy_inference_and_process(policy, observation, robot_model):
         return None
 
 
+def _drain_queue(pending: queue.Queue) -> None:
+    try:
+        while True:
+            pending.get_nowait()
+    except queue.Empty:
+        return
+
+
 def _inference_worker_loop(
     inference_queue: queue.Queue,
     result_queue: queue.Queue,
     stop_event: threading.Event,
     busy_event: threading.Event,
+    policy_lock: threading.Lock,
+    rtc_epoch: list[int],
     prepare_obs_fn,
     inference_fn,
 ):
-    """Persistent worker thread for async inference."""
+    """Persistent worker thread for async inference.
+
+    Queue items are ``(epoch, rtc_options)``. A reset bumps ``rtc_epoch`` under
+    ``policy_lock``; requests from an older epoch never touch the policy, so they
+    cannot repopulate the RTC cache after it was cleared.
+    """
     while not stop_event.is_set():
         try:
             try:
-                inference_queue.get(timeout=0.1)
+                epoch, rtc_options = inference_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
-            busy_event.set()
-            try:
-                observation = prepare_obs_fn()
-                if observation is None:
-                    print("[DEBUG] Worker thread: Observation is None, skipping", flush=True)
+            observation = prepare_obs_fn()
+            if observation is None:
+                print("[DEBUG] Worker thread: Observation is None, skipping", flush=True)
+                continue
+
+            inference_start_time = time.monotonic()
+            with policy_lock:
+                if epoch != rtc_epoch[0]:
                     continue
-
-                inference_start_time = time.monotonic()
-                processed_action = inference_fn(observation)
-
-                if processed_action is not None:
+                busy_event.set()
+                try:
+                    result = inference_fn(observation, rtc_options)
+                    if result is None:
+                        continue
+                    processed_action, rtc_applied = result
+                    payload = (processed_action, inference_start_time, rtc_applied, epoch)
                     try:
-                        result_queue.put_nowait((processed_action, inference_start_time))
+                        result_queue.put_nowait(payload)
                     except queue.Full:
                         try:
                             result_queue.get_nowait()
-                            result_queue.put_nowait((processed_action, inference_start_time))
                         except queue.Empty:
-                            result_queue.put_nowait((processed_action, inference_start_time))
-            finally:
-                busy_event.clear()
+                            pass
+                        result_queue.put_nowait(payload)
+                finally:
+                    busy_event.clear()
         except Exception as e:
             print(f"Error in inference worker thread: {e}")
             import traceback
@@ -362,7 +407,23 @@ def _compute_closed_hand_joints(side: str) -> np.ndarray:
     return solver._get_middle_close_q_desired().astype(np.float32)
 
 
+def _validate_rtc_config(config: InferenceConfig) -> None:
+    if not config.rtc:
+        return
+    if not (
+        0 <= config.rtc_frozen_steps < config.rtc_overlap_steps <= config.action_horizon
+        and config.rtc_ramp_rate > 0
+    ):
+        raise ValueError(
+            "RTC requires 0 <= rtc_frozen_steps < rtc_overlap_steps <= action_horizon "
+            "and rtc_ramp_rate > 0, got "
+            f"frozen={config.rtc_frozen_steps}, overlap={config.rtc_overlap_steps}, "
+            f"horizon={config.action_horizon}, ramp={config.rtc_ramp_rate}"
+        )
+
+
 def main(config: InferenceConfig):
+    _validate_rtc_config(config)
     pause_loop = True
 
     robot_model = instantiate_g1_robot_model(waist_location="lower_and_upper_body")
@@ -395,6 +456,14 @@ def main(config: InferenceConfig):
         f"ZMQ action socket bound to tcp://{config.action_zmq_host}:{config.action_zmq_port}"
     )
     print_green(f"Using embodiment tag: {config.embodiment_tag}")
+    if config.rtc:
+        print_green(
+            "RTC on: "
+            f"horizon={config.action_horizon}, overlap={config.rtc_overlap_steps}, "
+            f"frozen={config.rtc_frozen_steps}, ramp={config.rtc_ramp_rate}"
+        )
+    else:
+        print_green("RTC off")
 
     keyboard_listener = ZMQKeyboardSubscriber(
         port=config.keyboard_zmq_port, host=config.keyboard_zmq_host
@@ -520,6 +589,10 @@ def main(config: InferenceConfig):
     action_chunk_index = 0
     last_inference_time = 0.0
     inference_interval = 1.0 / config.rate
+    reset_requested = False
+    # Bumped under policy_lock. In-flight requests carry the old value and are dropped.
+    rtc_epoch = [0]
+    policy_lock = threading.Lock()
 
     zmq_frame_counter = 0
     last_sent_motion_token: np.ndarray | None = None
@@ -530,7 +603,7 @@ def main(config: InferenceConfig):
         nonlocal pause_loop, cpp_loop_running, cpp_mode
         nonlocal initial_pose_left_hand_closed, initial_pose_right_hand_closed
         nonlocal cached_action_chunk, action_chunk_index, last_inference_time
-        nonlocal zmq_frame_counter, last_sent_motion_token
+        nonlocal zmq_frame_counter, last_sent_motion_token, reset_requested
 
         key = keyboard_listener.read_msg()
         if key is None:
@@ -541,7 +614,13 @@ def main(config: InferenceConfig):
             if new_prompt:
                 old_prompt = language_prompt_ref[0]
                 language_prompt_ref[0] = new_prompt
-                print_green(f'Inference prompt changed: "{old_prompt}" -> "{new_prompt}"')
+                cached_action_chunk = None
+                action_chunk_index = 0
+                reset_requested = True
+                print_green(
+                    f'Inference prompt changed: "{old_prompt}" -> "{new_prompt}". '
+                    "Cleared RTC prefix."
+                )
             else:
                 print("Received empty prompt change -- ignoring.")
             return
@@ -570,12 +649,19 @@ def main(config: InferenceConfig):
             zmq_frame_counter = 0
             cached_action_chunk = None
             action_chunk_index = 0
-            print("Cleared cached action chunk, reset frame counter")
+            reset_requested = True
+            print("Cleared cached action chunk and RTC prefix, reset frame counter")
         elif key == "p":
             pause_loop = not pause_loop
             print(f"{'Paused' if pause_loop else 'Resumed'} policy loop")
             if pause_loop:
-                print("Policy loop paused (C++ loop still running - press 'k' to stop)")
+                cached_action_chunk = None
+                action_chunk_index = 0
+                reset_requested = True
+                print(
+                    "Policy loop paused and RTC prefix cleared "
+                    "(C++ loop still running - press 'k' to stop)"
+                )
             else:
                 print("Policy loop resumed")
         elif key == "k":
@@ -619,6 +705,8 @@ def main(config: InferenceConfig):
             result_queue,
             inference_stop_event,
             inference_busy_event,
+            policy_lock,
+            rtc_epoch,
             lambda: prepare_observation_from_sensors(
                 camera_subscriber=camera_subscriber,
                 state_subscriber=state_subscriber,
@@ -626,10 +714,11 @@ def main(config: InferenceConfig):
                 language_prompt=language_prompt_ref[0],
                 log_errors=True,
             ),
-            lambda obs: run_policy_inference_and_process(
+            lambda obs, rtc_options: run_policy_inference_and_process(
                 policy=n1_policy,
                 observation=obs,
                 robot_model=robot_model,
+                options=rtc_options,
             ),
         ),
         daemon=True,
@@ -641,41 +730,85 @@ def main(config: InferenceConfig):
             t_start = time.monotonic()
             check_keyboard_input()
 
-            # Consume result first so last_inference_time is fresh before trigger check
-            try:
-                processed_action, inference_start_time = result_queue.get_nowait()
-                inference_delay = time.monotonic() - inference_start_time
-                action_chunk_index = calculate_latency_compensated_index(
-                    inference_delay, config.action_publish_rate, config.action_horizon
-                )
-                cached_action_chunk = processed_action
-                last_inference_time = time.monotonic()
-                print_green(
-                    f'New action chunk (prompt: "{language_prompt_ref[0]}", '
-                    f"latency: {inference_delay:.3f}s)"
-                )
-            except queue.Empty:
-                pass
-
-            worker_is_busy = inference_busy_event.is_set()
-            should_start = should_trigger_new_inference(
-                cached_chunk_exists=(cached_action_chunk is not None),
-                inference_thread_running=worker_is_busy,
-                time_since_last_inference=(time.monotonic() - last_inference_time),
-                inference_interval=inference_interval,
-            )
-
-            if should_start:
-                try:
-                    inference_queue.put_nowait(None)
-                except queue.Full:
-                    pass
+            if reset_requested:
+                # Block until any in-flight get_action finishes, then drop its result.
+                # The server cache is cleared only after that call returns.
+                with policy_lock:
+                    rtc_epoch[0] += 1
+                    _drain_queue(inference_queue)
+                    _drain_queue(result_queue)
+                    try:
+                        n1_policy.reset()
+                        print_green("Policy RTC cache cleared")
+                    except Exception as e:
+                        print(f"Warning: policy reset failed: {e}")
+                reset_requested = False
 
             if pause_loop:
                 print("Pausing...", end="", flush=True)
                 time.sleep(0.2)
                 print(".", end="", flush=True)
                 continue
+
+            # Consume result first so last_inference_time is fresh before trigger check
+            try:
+                processed_action, inference_start_time, rtc_applied, result_epoch = (
+                    result_queue.get_nowait()
+                )
+                if result_epoch != rtc_epoch[0]:
+                    processed_action = None
+                else:
+                    inference_delay = time.monotonic() - inference_start_time
+                    if rtc_applied:
+                        action_chunk_index = rtc_execution_index(
+                            action_chunk_index,
+                            config.action_horizon,
+                            config.rtc_overlap_steps,
+                        )
+                    else:
+                        action_chunk_index = calculate_latency_compensated_index(
+                            inference_delay, config.action_publish_rate, config.action_horizon
+                        )
+                    cached_action_chunk = processed_action
+                    last_inference_time = time.monotonic()
+                    print_green(
+                        f'New action chunk ({"RTC" if rtc_applied else "no RTC"}, '
+                        f'prompt: "{language_prompt_ref[0]}", '
+                        f"start: {action_chunk_index}, latency: {inference_delay:.3f}s)"
+                    )
+            except queue.Empty:
+                pass
+
+            worker_is_busy = inference_busy_event.is_set()
+            if config.rtc:
+                should_start = should_trigger_rtc_inference(
+                    cached_chunk_exists=(cached_action_chunk is not None),
+                    inference_thread_running=worker_is_busy,
+                    action_chunk_index=action_chunk_index,
+                    action_horizon=config.action_horizon,
+                    overlap_steps=config.rtc_overlap_steps,
+                )
+            else:
+                should_start = should_trigger_new_inference(
+                    cached_chunk_exists=(cached_action_chunk is not None),
+                    inference_thread_running=worker_is_busy,
+                    time_since_last_inference=(time.monotonic() - last_inference_time),
+                    inference_interval=inference_interval,
+                )
+
+            if should_start:
+                rtc_options = None
+                if config.rtc and cached_action_chunk is not None:
+                    rtc_options = {
+                        "action_horizon": config.action_horizon,
+                        "rtc_overlap_steps": config.rtc_overlap_steps,
+                        "rtc_frozen_steps": config.rtc_frozen_steps,
+                        "rtc_ramp_rate": config.rtc_ramp_rate,
+                    }
+                try:
+                    inference_queue.put_nowait((rtc_epoch[0], rtc_options))
+                except queue.Full:
+                    pass
 
             with telemetry.timer("total_loop"):
                 if cached_action_chunk is None:

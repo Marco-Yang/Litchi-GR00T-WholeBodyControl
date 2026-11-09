@@ -53,9 +53,25 @@ class DefaultEnv:
         self.camera_configs = camera_configs
 
         if not camera_configs and offscreen and enable_image_publish:
-            self.camera_configs = {
-                "ego_view": {"height": 480, "width": 640, "mjcf_name": "head_camera"},
-            }
+            # G1_SIM_CAMERA=overview → third-person tracking (matches onscreen viewer).
+            # Default remains robot head_camera (ego_view) for data-collection compatibility.
+            cam_mode = os.environ.get("G1_SIM_CAMERA", "ego_view").strip().lower()
+            if cam_mode in ("overview", "track", "viewer"):
+                self.camera_configs = {
+                    "overview": {
+                        # Keep within default MJCF offscreen FB unless init_renderers bumps it.
+                        "height": int(os.environ.get("G1_SIM_CAM_HEIGHT", "480")),
+                        "width": int(os.environ.get("G1_SIM_CAM_WIDTH", "640")),
+                        "track_body": os.environ.get("G1_SIM_CAM_TRACK_BODY", "pelvis"),
+                        "distance": float(os.environ.get("G1_SIM_CAM_DISTANCE", "3.0")),
+                        "azimuth": float(os.environ.get("G1_SIM_CAM_AZIMUTH", "120")),
+                        "elevation": float(os.environ.get("G1_SIM_CAM_ELEVATION", "-25")),
+                    }
+                }
+            else:
+                self.camera_configs = {
+                    "ego_view": {"height": 480, "width": 640, "mjcf_name": "head_camera"},
+                }
 
         self.reward_lock = Lock()
         self.unitree_bridge = None
@@ -182,8 +198,20 @@ class DefaultEnv:
                 )
 
         # Enable the elastic band
+        self.elastic_band = None
+        self.band_release_s = None
+        self._band_auto_released = False
         if self.config["ENABLE_ELASTIC_BAND"] and self.use_floating_root_link:
             self.elastic_band = ElasticBand()
+            # Headless/unattended runs cannot press key 9: G1_SIM_BAND_RELEASE_S
+            # releases the band after N sim seconds (same idea as A3_SIM_BAND_RELEASE_S).
+            rel = os.environ.get("G1_SIM_BAND_RELEASE_S")
+            if rel:
+                self.band_release_s = float(rel)
+                print(
+                    f"[g1-sim] elastic band will auto-release at t={self.band_release_s:.1f}s "
+                    "(G1_SIM_BAND_RELEASE_S)"
+                )
             if "g1" in self.config["ROBOT_TYPE"]:
                 if self.config["enable_waist"]:
                     self.band_attached_link = self.mj_model.body("pelvis").id
@@ -249,6 +277,13 @@ class DefaultEnv:
 
     def init_renderers(self):
         self.renderers = {}
+        # Enlarge offscreen framebuffer if any camera asks for a larger image.
+        max_w = max((int(c.get("width", 0)) for c in self.camera_configs.values()), default=0)
+        max_h = max((int(c.get("height", 0)) for c in self.camera_configs.values()), default=0)
+        if max_w > 0:
+            self.mj_model.vis.global_.offwidth = max(int(self.mj_model.vis.global_.offwidth), max_w)
+        if max_h > 0:
+            self.mj_model.vis.global_.offheight = max(int(self.mj_model.vis.global_.offheight), max_h)
         for camera_name, camera_config in self.camera_configs.items():
             renderer = mujoco.Renderer(
                 self.mj_model, height=camera_config["height"], width=camera_config["width"]
@@ -391,6 +426,18 @@ class DefaultEnv:
         self.unitree_bridge.PublishLowState(self.obs)
         if self.unitree_bridge.joystick:
             self.unitree_bridge.PublishWirelessController()
+        if (
+            self.elastic_band
+            and self.band_release_s is not None
+            and not self._band_auto_released
+            and self.mj_data.time >= self.band_release_s
+        ):
+            self.elastic_band.enable = False
+            self._band_auto_released = True
+            print(
+                f"[g1-sim] elastic band released at t={self.mj_data.time:.1f}s "
+                "(G1_SIM_BAND_RELEASE_S)"
+            )
         if self.elastic_band:
             if self.elastic_band.enable and self.use_floating_root_link:
                 pose = np.concatenate(
@@ -483,6 +530,18 @@ class DefaultEnv:
             renderer = self.renderers[camera_name]
             if "params" in camera_config:
                 renderer.update_scene(self.mj_data, camera=camera_config["params"])
+            elif "track_body" in camera_config:
+                cam = camera_config.get("_mjv_cam")
+                if cam is None:
+                    cam = mujoco.MjvCamera()
+                    mujoco.mjv_defaultCamera(cam)
+                    camera_config["_mjv_cam"] = cam
+                cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+                cam.trackbodyid = int(self.mj_model.body(camera_config["track_body"]).id)
+                cam.distance = float(camera_config.get("distance", 3.0))
+                cam.azimuth = float(camera_config.get("azimuth", 120.0))
+                cam.elevation = float(camera_config.get("elevation", -25.0))
+                renderer.update_scene(self.mj_data, camera=cam)
             elif "mjcf_name" in camera_config:
                 renderer.update_scene(self.mj_data, camera=camera_config["mjcf_name"])
             else:
@@ -513,6 +572,12 @@ class DefaultEnv:
 
         if self.fall:
             self.reset()
+            # mj_resetData zeroes time; re-hang the band so unattended replays can
+            # stand again instead of looping fall→reset→fall with band permanently off.
+            if self.elastic_band is not None:
+                self.elastic_band.enable = True
+                self._band_auto_released = False
+                print("[g1-sim] elastic band re-enabled after fall reset")
 
     def check_self_collision(self):
         robot_bodies = get_subtree_body_names(self.mj_model, self.mj_model.body(self.root_body).id)
@@ -599,12 +664,18 @@ class BaseSimulator:
         """Main simulation loop"""
         sim_cnt = 0
         ts = time.time()
+        # Cooperative shutdown for headless/orchestrated runs (no kill required).
+        stop_file = os.environ.get("G1_SIM_STOP_FILE", "").strip()
 
         try:
             while self._running and (
                 (self.sim_env.viewer and self.sim_env.viewer.is_running())
                 or (self.sim_env.viewer is None)
             ):
+                if stop_file and os.path.exists(stop_file):
+                    print(f"[g1-sim] stop file hit: {stop_file}")
+                    break
+
                 step_start = time.monotonic()
 
                 self.sim_env.sim_step()

@@ -128,3 +128,18 @@ THRESHOLDS = {
     # --- stumble / fall proxy on recorded robot (strict; do not loosen) ---
     "gravity_tilt": 0.35,  # |Δ projected_gravity|; large tilt / stumble
 }
+
+# Isaac im_eval quality screen (per-episode, from metrics_eval.json
+# ``eval/all_metrics_dict``). Tuned for cleaner training sets: prefer cutting
+# high accel/vel (jitter / jump proxies) and the tracking tail, not just falls.
+# Anchored on walking_new teleop mode-2 (newer sessions mpjpe_l≈160–190 /
+# joint_mse_l≈0.04; older ≈230–246 / 0.07). Any hit → drop from LeRobot.
+ISAAC_QUALITY_THRESHOLDS = {
+    "drop_if_terminated": True,
+    "min_progress": 0.99,
+    "max_mpjpe_l": 250.0,  # mm local MPJPE (was 320)
+    "max_mpjpe_pa": 96.0,  # mm PA (was 130)
+    "max_joint_mse_l": 0.078,  # rad^2 (was 0.12)
+    "max_accel_dist": 1.75,  # jump / jitter proxy (was 3.5)
+    "max_vel_dist": 11.0,  # jump / jitter proxy (was 18)
+}

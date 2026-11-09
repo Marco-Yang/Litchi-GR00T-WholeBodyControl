@@ -22,6 +22,8 @@ def main(argv: list[str] | None = None) -> int:
             "  python -m datasets.data_check isaac ...\n"
             "  python -m datasets.data_check pipeline ...\n"
             "  python -m datasets.data_check refill-tokens ...\n"
+            "  python -m datasets.data_check isaac-token-replay ...\n"
+            "  python -m datasets.data_check isaac-screen --dataset ... --metrics ... --work-dir ...\n"
             "  python -m datasets.data_check drop --dataset ... --episodes 6\n"
         )
         return 0
@@ -38,6 +40,10 @@ def main(argv: list[str] | None = None) -> int:
         from .run_pipeline import main as m
     elif cmd in {"refill-tokens", "refill_tokens", "tokens"}:
         from .refill_motion_tokens_mode2 import main as m
+    elif cmd in {"isaac-token-replay", "token-replay", "isaac_token"}:
+        from .isaac_token_replay import main as m
+    elif cmd in {"isaac-screen", "screen-isaac", "isaac_screen"}:
+        from .screen_isaac_metrics import main as m
     elif cmd == "drop":
         from .drop_unstable import main as m
     else:

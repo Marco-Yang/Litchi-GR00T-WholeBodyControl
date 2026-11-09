@@ -82,6 +82,36 @@ def calculate_latency_compensated_index(
     return int(np.clip(raw_index, 0, action_horizon - 1))
 
 
+def rtc_execution_index(chunk_index: int, action_horizon: int, overlap_steps: int) -> int:
+    """Index in a new RTC chunk that matches the action about to be executed.
+
+    The action head pins ``new[:, :overlap]`` to ``previous[:, horizon - overlap : horizon]``.
+    ``chunk_index`` is the index that would have been executed in the previous chunk.
+    """
+    origin = action_horizon - overlap_steps
+    return int(np.clip(chunk_index - origin, 0, action_horizon - 1))
+
+
+def should_trigger_rtc_inference(
+    cached_chunk_exists: bool,
+    inference_thread_running: bool,
+    action_chunk_index: int,
+    action_horizon: int,
+    overlap_steps: int,
+) -> bool:
+    """Start a new RTC chunk once fewer than ``overlap_steps`` actions remain.
+
+    The first chunk has no prefix to inpaint, so it is requested immediately.
+    A fixed time interval is not used: it would request the next chunk before the
+    overlap window the model was trained to condition on.
+    """
+    if not cached_chunk_exists:
+        return True
+    if inference_thread_running:
+        return False
+    return action_chunk_index >= action_horizon - overlap_steps
+
+
 def should_trigger_new_inference(
     cached_chunk_exists: bool,
     inference_thread_running: bool,

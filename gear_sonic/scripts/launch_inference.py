@@ -138,6 +138,18 @@ class InferenceLaunchConfig:
     action_horizon: int = 40
     """Action horizon of the VLA policy."""
 
+    rtc: bool = True
+    """Inpaint the previous chunk's tail into each new chunk."""
+
+    rtc_overlap_steps: int = 16
+    """Steps from the previous chunk inpainted into the new chunk."""
+
+    rtc_frozen_steps: int = 8
+    """Leading inpainted steps that stay frozen."""
+
+    rtc_ramp_rate: float = 5.0
+    """Exponential ramp from the frozen prefix to the freely denoised tail."""
+
     # Camera
     camera_host: str = "localhost"
     """Camera server host."""
@@ -274,6 +286,14 @@ def main(config: InferenceLaunchConfig):
     print(f"  Prompt:          {config.prompt}")
     print(f"  Action rate:     {config.action_publish_rate} Hz")
     print(f"  Action horizon:  {config.action_horizon}")
+    if config.rtc:
+        print(
+            "  RTC:             "
+            f"overlap={config.rtc_overlap_steps}, frozen={config.rtc_frozen_steps}, "
+            f"ramp={config.rtc_ramp_rate}"
+        )
+    else:
+        print("  RTC:             off")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
     print(f"  Data exporter:   {'Yes' if config.data_exporter else 'No'}")
     if config.data_exporter:
@@ -393,6 +413,10 @@ def main(config: InferenceLaunchConfig):
         f"--prompt '{config.prompt}' "
         f"--action-publish-rate {config.action_publish_rate} "
         f"--action-horizon {config.action_horizon} "
+        f"{'--rtc' if config.rtc else '--no-rtc'} "
+        f"--rtc-overlap-steps {config.rtc_overlap_steps} "
+        f"--rtc-frozen-steps {config.rtc_frozen_steps} "
+        f"--rtc-ramp-rate {config.rtc_ramp_rate} "
         f"--camera-host {config.camera_host} "
         f"--camera-port {config.camera_port}"
     )
