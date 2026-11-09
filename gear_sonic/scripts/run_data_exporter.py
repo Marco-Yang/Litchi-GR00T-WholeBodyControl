@@ -1334,11 +1334,38 @@ def main(config: SonicDataExporterConfig):
         supervised_token_device=config.supervised_token_device,
     )
     if config.rewrite_motion_token_supervised:
-        print(
-            "[motion_token] episode-end rewrite ENABLED "
-            f"(device={config.supervised_token_device}): disk tokens = open-loop mode2; "
-            "live deploy tokens backed up under meta/motion_token_live/"
-        )
+        # Fail fast: HF ``datasets`` name clash / missing ORT / missing encoder must not
+        # silently leave live tokens on disk for a whole session.
+        try:
+            import onnxruntime  # noqa: F401
+            from pathlib import Path as _Path
+
+            from gear_sonic.utils.data_collection import supervised_mode2_tokens as _sm2
+
+            _enc = (
+                _Path(__file__).resolve().parents[2]
+                / "gear_sonic_deploy"
+                / "policy"
+                / "sonic_v1_1"
+                / "model_encoder.onnx"
+            )
+            if not _enc.is_file():
+                raise FileNotFoundError(f"missing encoder onnx: {_enc}")
+            # Resolve refill helpers now (HF ``datasets`` name clash fails here, not mid-episode).
+            _sm2._import_refill()
+            print(
+                "[motion_token] episode-end rewrite ENABLED "
+                f"(device={config.supervised_token_device}): disk tokens = open-loop mode2; "
+                "live deploy tokens backed up under meta/motion_token_live/; "
+                f"encoder={_enc}"
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "[motion_token] supervised rewrite preflight failed — refusing to record "
+                "with rewrite enabled (would silently keep live tokens). "
+                "Fix ORT/encoder/import, or pass --no-rewrite-motion-token-supervised. "
+                f"Cause: {exc}"
+            ) from exc
     else:
         print("[motion_token] episode-end rewrite DISABLED — disk keeps live token_state")
     data_collector.run()

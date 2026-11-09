@@ -17,7 +17,7 @@
 | GR00T 模态 | 本数采落盘字段 | 说明 |
 |---|---|---|
 | video `ego_view` | `videos/.../observation.images.ego_view/*.mp4` | **必须**；颈部 D435I |
-| video `head` | `.../observation.images.head/*.mp4` | 可选；默认 GR00T 配置**不读** |
+| video `head` | `.../observation.images.head/*.mp4` | 与 Litchi-Isaac-GR00T `unitree_g1_sonic` 一致：**ego_view + head** 双相机训练 |
 | video `left/right_wrist` | `.../observation.images.left_wrist` / `right_wrist` | 可选；腕部 Abham UVC（需 `--record-wrist-cameras` + Orin `:5558`） |
 | state 腿/腰/臂/手 | `observation.state` 切片（含 Dex3 左右各 7D） | Dex3 **实测状态** |
 | state `projected_gravity` | `observation.projected_gravity` | |
