@@ -21,7 +21,7 @@
 | video `left/right_wrist` | `.../observation.images.left_wrist` / `right_wrist` | 可选；腕部 Abham UVC（需 `--record-wrist-cameras` + Orin `:5558`） |
 | state 腿/腰/臂/手 | `observation.state` 切片（含 Dex3 左右各 7D） | Dex3 **实测状态** |
 | state `projected_gravity` | `observation.projected_gravity` | |
-| action `motion_token` | `action.motion_token` (64D) | SONIC latent；录制时由 deploy 的 `token_state` 写入 |
+| action `motion_token` | `action.motion_token` (64D) | **监督用** SONIC v1.1 mode-2 latent：episode 落盘前用缓冲的 `teleop.smpl_*` + Pico 腕解析 + **开环 heading** 经 `model_encoder.onnx` 重写（与 §8 / Isaac screening 同规则）。录制过程中帧缓冲仍抄 deploy `token_state`（闭环控机），但**不作为落盘监督**；live 备份在 `meta/motion_token_live/`。关闭：`--no-rewrite-motion-token-supervised` |
 | action `left/right_hand_joints` | `teleop.left_hand_joints` / `teleop.right_hand_joints`（各 **7D = Dex3**） | **夹爪动作标签**；仅 Pico **Trigger**（默认闭合，扣下张开）；exporter 可回退到 deploy 手指令/状态 |
 | language | `meta/tasks.jsonl` + `task_index` | `--task-prompt` |
 
@@ -454,7 +454,9 @@ export CUDA_VISIBLE_DEVICES=0
 
 清洗后每个 session 是独立数据集，回放时把 `--dataset` 指到具体 session 目录。
 
-`pipeline` **默认**会在不稳定 episode 删除之后，用与 Isaac mode-2 screening 相同的输入（SMPL joints + Pico 腕部解析、开环 heading）经 `sonic_v1_1/model_encoder.onnx` 重填 `action.motion_token`（不再信任录制时的旧 token）。旧 token 备份在 `<work-dir>/motion_token_backup/`；摘要写在数据集 `meta/motion_token_mode2_refill.json`。
+**2026-11-09 起（本树 Direction-1）：** `run_data_exporter.py` 默认在 **episode 落盘前** 已用同一套开环 mode-2 规则重写 `action.motion_token`（见 `gear_sonic/utils/data_collection/supervised_mode2_tokens.py`）。对新采数据，§8 refill **变为可选校验**，不再是「必须 refill 才能训」。摘要：`meta/motion_token_supervised_rewrite.jsonl`；live 控机 token：`meta/motion_token_live/episode_XXXXXX_motion_token_live.npy`。
+
+`pipeline` **仍默认**会在不稳定 episode 删除之后再跑一遍 mode-2 refill（与 Isaac screening 同输入），用于：旧盘 / 关闭了 exporter rewrite 的 session / 二次校验。旧 token 备份在 `<work-dir>/motion_token_backup/`；摘要写在数据集 `meta/motion_token_mode2_refill.json`。若落盘已是 supervised rewrite，refill 应与盘上 token 逐步接近（理想 mean L2 ≪ 0.25）。
 
 可选参数：
 
@@ -688,7 +690,7 @@ bash scripts/run_sim_revo2_trigger.sh --real --no-orin-start --autoplay \
 
 | 字段 | 维度 | Revo2 含义 |
 |------|------|------------|
-| `action.motion_token` | 64 | SONIC v1.1 latent（deploy 写入） |
+| `action.motion_token` | 64 | SONIC v1.1 mode-2 **监督** latent（落盘前开环重写；非裸 `token_state`） |
 | `teleop.left/right_hand_joints` | **7**（前 6 = Revo2 0..1000，第 7 = 0） | 扳机轨迹指令 |
 | `observation.state` 手部切片 | 各 7 | 用 Revo2/1000 填入（无 Dex3 实测） |
 | `observation.images.ego_view` | 必选 | Orin `:5555` |

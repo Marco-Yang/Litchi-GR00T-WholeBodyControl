@@ -62,6 +62,7 @@ data_collection = [
     "pyttsx3==2.90",
     "av>=14.2",
     "opencv-python",
+    "onnxruntime>=1.16",
     "lerobot @ git+https://github.com/huggingface/lerobot.git@a445d9c9da6bea99a8972daa4fe1fdd053d711d2",
     "datasets==3.6.0",
 ]

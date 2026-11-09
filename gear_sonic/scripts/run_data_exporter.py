@@ -141,6 +141,17 @@ class SonicDataExporterConfig:
     revo2_release_blend_s: float = 0.35
     """Seconds to blend back to open after trigger release."""
 
+    # Supervised motion_token rewrite (Direction-1 dual-track)
+    rewrite_motion_token_supervised: bool = True
+    """Before parquet save, rewrite ``action.motion_token`` with open-loop SONIC
+    v1.1 mode-2 encode from buffered ``teleop.smpl_*`` (same rules as §8 refill).
+    Live deploy ``token_state`` is still copied frame-by-frame for teleop safety;
+    it is backed up under ``meta/motion_token_live/`` when rewrite succeeds.
+    Use ``--no-rewrite-motion-token-supervised`` to keep raw live tokens on disk."""
+
+    supervised_token_device: str = "cpu"
+    """ORT device for episode-end supervised encode: ``cpu`` / ``cuda`` / ``auto``."""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -358,6 +369,8 @@ class GrootDataCollector:
         revo2_hands: Revo2TeleopHands | None = None,
         record_wrist_cameras: bool = False,
         wrist_camera_port: int = 5558,
+        rewrite_motion_token_supervised: bool = True,
+        supervised_token_device: str = "cpu",
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
@@ -367,6 +380,8 @@ class GrootDataCollector:
         self.revo2_hands = revo2_hands
         self._latest_revo2_cmds = None
         self.record_wrist_cameras = bool(record_wrist_cameras)
+        self.rewrite_motion_token_supervised = bool(rewrite_motion_token_supervised)
+        self.supervised_token_device = str(supervised_token_device or "cpu")
 
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
@@ -761,6 +776,7 @@ class GrootDataCollector:
         if self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
+                self._rewrite_supervised_motion_tokens()
                 self.data_exporter.save_episode()
                 self.sonic_timing_monitor.reset()
                 self._initial_yaw = None
@@ -895,10 +911,66 @@ class GrootDataCollector:
         else:
             frame_data["teleop.delta_heading"] = np.zeros(1, dtype=np.float64)
 
+        # Live deploy latent (closed-loop heading). Disk supervision is rewritten
+        # to open-loop mode-2 at episode save — see ``_rewrite_supervised_motion_tokens``.
         if "token_state" in proprio:
             frame_data["action.motion_token"] = np.asarray(proprio["token_state"], dtype=np.float64)
         else:
             frame_data["action.motion_token"] = np.zeros(64, dtype=np.float64)
+
+    def _rewrite_supervised_motion_tokens(self) -> None:
+        """Replace buffered live tokens with §8-identical open-loop mode-2 tokens."""
+        if not self.rewrite_motion_token_supervised:
+            return
+        buf = self.data_exporter.episode_buffer
+        if buf is None or int(buf.get("size", 0)) <= 0:
+            return
+        try:
+            from gear_sonic.utils.data_collection.supervised_mode2_tokens import (
+                append_rewrite_record,
+                rewrite_episode_buffer_motion_tokens,
+            )
+        except Exception as exc:
+            self._print_and_say(
+                f"[motion_token] supervised rewrite unavailable ({exc}); keeping live tokens",
+                say=False,
+            )
+            return
+
+        root = self.data_exporter.meta.root
+        live_dir = root / "meta" / "motion_token_live"
+        try:
+            meta = rewrite_episode_buffer_motion_tokens(
+                buf,
+                device=self.supervised_token_device,
+                live_backup_dir=live_dir,
+                episode_index=int(buf.get("episode_index", -1)),
+            )
+        except Exception as exc:
+            self._print_and_say(
+                f"[motion_token] supervised rewrite failed ({exc}); keeping live tokens",
+                say=False,
+            )
+            return
+
+        try:
+            append_rewrite_record(root, meta)
+        except Exception as exc:
+            print(f"[motion_token] warning: could not append rewrite record: {exc}")
+
+        if meta.get("rewrote"):
+            l2 = meta.get("l2_vs_live_mean")
+            l2_s = f"{l2:.3f}" if isinstance(l2, (int, float)) else "?"
+            self._print_and_say(
+                f"[motion_token] ep{meta.get('episode_index')} rewritten "
+                f"mode2 open-loop (L2 vs live mean={l2_s})",
+                say=False,
+            )
+        elif meta.get("skipped"):
+            self._print_and_say(
+                f"[motion_token] rewrite skipped: {meta.get('reason')}",
+                say=False,
+            )
 
     def _add_sonic_pose_features(self, frame_data: dict) -> float | None:
         """Add teleop features based on current stream mode."""
@@ -1079,6 +1151,7 @@ class GrootDataCollector:
             self._print_and_say("saving episode done", blocking=False)
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
+                self._rewrite_supervised_motion_tokens()
                 self.data_exporter.save_episode()
             self._print_and_say(
                 f"Recording complete: {self.data_exporter.meta.root}", say=False, blocking=True
@@ -1257,7 +1330,17 @@ def main(config: SonicDataExporterConfig):
         revo2_hands=revo2_hands,
         record_wrist_cameras=record_wrist,
         wrist_camera_port=config.wrist_camera_port,
+        rewrite_motion_token_supervised=config.rewrite_motion_token_supervised,
+        supervised_token_device=config.supervised_token_device,
     )
+    if config.rewrite_motion_token_supervised:
+        print(
+            "[motion_token] episode-end rewrite ENABLED "
+            f"(device={config.supervised_token_device}): disk tokens = open-loop mode2; "
+            "live deploy tokens backed up under meta/motion_token_live/"
+        )
+    else:
+        print("[motion_token] episode-end rewrite DISABLED — disk keeps live token_state")
     data_collector.run()
 
 

@@ -1427,6 +1427,12 @@ class PoseStreamer:
         N = len(self.frame_buffer["frame_index"])
 
         ##### From @Jiefeng for directly setting the joint position ######
+        # INTENTIONAL: joint_pos[29] is wrist-only for SONIC mode-2.
+        # Non-wrist DOFs stay 0 — mode-2 encoder only gathers wrists6
+        # (observation_config: motion_joint_positions_wrists_10frame_step1).
+        # Formulas MUST stay identical to
+        # ``datasets.data_check.convert_to_mode2.compute_wrist_joint_pos_il``
+        # (used by §8 refill / episode-end supervised token rewrite).
         joint_pos = np.zeros(29)
         body_pose = use_pose.reshape(-1, 21, 3)
 
@@ -1435,6 +1441,8 @@ class PoseStreamer:
         SMPL_R_ELBOW_IDX = 18
         SMPL_R_WRIST_IDX = 20
 
+        # Elbow DOFs intentionally unused (commented historically): elbow swing
+        # is folded into wrist euler below; mode-2 does not take shoulder/elbow q.
         # G1_L_ELBOW_IDX = 0
         G1_L_WRIST_ROLL_IDX = 23
         G1_L_WRIST_PITCH_IDX = 25
