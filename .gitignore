@@ -212,6 +212,17 @@ logs_eval/
 models/
 videos/
 
+# MuJoCo / VLA validate tree: track scripts + empty videos/runs markers;
+# ignore run artifacts and generated mp4s (global `videos/` would hide
+# validates/videos/ entirely — un-ignore the dir, then re-ignore contents).
+!validates/videos/
+validates/videos/**
+!validates/videos/.gitkeep
+validates/runs/
+!validates/runs/
+validates/runs/**
+!validates/runs/.gitkeep
+
 # Local robot model data (generated or downloaded)
 decoupled_wbc/control/robot_model/model_data/
 
@@ -251,6 +262,7 @@ docs/superpowers/
 tests/local/
 # Local C++ build trees for the A3 deploy stack
 gear_sonic_deploy/build_verify_*/
+gear_sonic_deploy/build_g1_tokenfix/
 gear_sonic_deploy/dist/
 gear_sonic_deploy/thirdparty/rockchip_sysroot/*.tar.gz
 
@@ -299,19 +311,16 @@ gear_sonic/data/assets/robot_description/*
 !gear_sonic/data/assets/robot_description/urdf/a3/**/*.STL
 
 # --- Local datasets / run outputs ---
-# Ignore all of datasets/ and outputs/; keep data_check source + datasets/__pycache__.
+# Ignore all of datasets/ and outputs/; keep data_check *source* only.
 # data_check/_vendor and data_check/runs stay local (vendored deps / eval artifacts).
+# Do NOT track __pycache__ / *.pyc under datasets/ (negation below re-ignores them).
 outputs/
 datasets/*
 !datasets/data_check/
 !datasets/data_check/**
-!datasets/__pycache__/
-!datasets/__pycache__/**
 datasets/data_check/_vendor/
 datasets/data_check/runs/
 datasets/data_check/log/
-# Broader __pycache__/ and *.py[cod] would still hide these; re-include source caches.
-!datasets/data_check/**/__pycache__/
-!datasets/data_check/**/__pycache__/**
-!datasets/data_check/**/*.py[cod]
-!datasets/__pycache__/**/*.py[cod]
+datasets/data_check/**/__pycache__/
+datasets/**/__pycache__/
+datasets/**/*.py[cod]

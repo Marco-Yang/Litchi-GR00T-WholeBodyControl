@@ -53,25 +53,9 @@ class DefaultEnv:
         self.camera_configs = camera_configs
 
         if not camera_configs and offscreen and enable_image_publish:
-            # G1_SIM_CAMERA=overview → third-person tracking (matches onscreen viewer).
-            # Default remains robot head_camera (ego_view) for data-collection compatibility.
-            cam_mode = os.environ.get("G1_SIM_CAMERA", "ego_view").strip().lower()
-            if cam_mode in ("overview", "track", "viewer"):
-                self.camera_configs = {
-                    "overview": {
-                        # Keep within default MJCF offscreen FB unless init_renderers bumps it.
-                        "height": int(os.environ.get("G1_SIM_CAM_HEIGHT", "480")),
-                        "width": int(os.environ.get("G1_SIM_CAM_WIDTH", "640")),
-                        "track_body": os.environ.get("G1_SIM_CAM_TRACK_BODY", "pelvis"),
-                        "distance": float(os.environ.get("G1_SIM_CAM_DISTANCE", "3.0")),
-                        "azimuth": float(os.environ.get("G1_SIM_CAM_AZIMUTH", "120")),
-                        "elevation": float(os.environ.get("G1_SIM_CAM_ELEVATION", "-25")),
-                    }
-                }
-            else:
-                self.camera_configs = {
-                    "ego_view": {"height": 480, "width": 640, "mjcf_name": "head_camera"},
-                }
+            self.camera_configs = {
+                "ego_view": {"height": 480, "width": 640, "mjcf_name": "head_camera"},
+            }
 
         self.reward_lock = Lock()
         self.unitree_bridge = None
@@ -198,20 +182,8 @@ class DefaultEnv:
                 )
 
         # Enable the elastic band
-        self.elastic_band = None
-        self.band_release_s = None
-        self._band_auto_released = False
         if self.config["ENABLE_ELASTIC_BAND"] and self.use_floating_root_link:
             self.elastic_band = ElasticBand()
-            # Headless/unattended runs cannot press key 9: G1_SIM_BAND_RELEASE_S
-            # releases the band after N sim seconds (same idea as A3_SIM_BAND_RELEASE_S).
-            rel = os.environ.get("G1_SIM_BAND_RELEASE_S")
-            if rel:
-                self.band_release_s = float(rel)
-                print(
-                    f"[g1-sim] elastic band will auto-release at t={self.band_release_s:.1f}s "
-                    "(G1_SIM_BAND_RELEASE_S)"
-                )
             if "g1" in self.config["ROBOT_TYPE"]:
                 if self.config["enable_waist"]:
                     self.band_attached_link = self.mj_model.body("pelvis").id
@@ -234,6 +206,8 @@ class DefaultEnv:
                 mujoco.mj_forward(self.mj_model, self.mj_data)
                 self.viewer = None
         else:
+            # Must exist: sim loop / recorder gate on truthiness of elastic_band.
+            self.elastic_band = None
             if self.onscreen:
                 self.viewer = mujoco.viewer.launch_passive(
                     self.mj_model, self.mj_data, show_left_ui=False, show_right_ui=False
@@ -267,6 +241,21 @@ class DefaultEnv:
             elif "right_hand" in name:
                 self.right_hand_index.append(i)
 
+        # Revo2 joints are left_thumb_*/left_index_* (no "left_hand" substring).
+        # Prefer explicit command order from config when provided.
+        if self.config.get("LEFT_HAND_JOINT_NAMES"):
+            self.left_hand_index = [
+                mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, name)
+                for name in self.config["LEFT_HAND_JOINT_NAMES"]
+            ]
+        if self.config.get("RIGHT_HAND_JOINT_NAMES"):
+            self.right_hand_index = [
+                mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, name)
+                for name in self.config["RIGHT_HAND_JOINT_NAMES"]
+            ]
+        if any(i < 0 for i in self.left_hand_index + self.right_hand_index):
+            raise ValueError("configured hand joint name not found in MuJoCo model")
+
         assert len(self.body_joint_index) == self.robot.NUM_JOINTS
         assert len(self.left_hand_index) == self.robot.NUM_HAND_JOINTS
         assert len(self.right_hand_index) == self.robot.NUM_HAND_JOINTS
@@ -275,15 +264,45 @@ class DefaultEnv:
         self.left_hand_index = np.array(self.left_hand_index)
         self.right_hand_index = np.array(self.right_hand_index)
 
+        # Joint id ≠ actuator id for Revo2 (distal mimics / non-contiguous names).
+        self.body_qpos_index = self.mj_model.jnt_qposadr[self.body_joint_index]
+        self.body_qvel_index = self.mj_model.jnt_dofadr[self.body_joint_index]
+        self.left_hand_qpos_index = self.mj_model.jnt_qposadr[self.left_hand_index]
+        self.left_hand_qvel_index = self.mj_model.jnt_dofadr[self.left_hand_index]
+        self.right_hand_qpos_index = self.mj_model.jnt_qposadr[self.right_hand_index]
+        self.right_hand_qvel_index = self.mj_model.jnt_dofadr[self.right_hand_index]
+
+        joint_to_actuator = {
+            int(self.mj_model.actuator_trnid[i, 0]): i for i in range(self.mj_model.nu)
+        }
+
+        def _actuator_indices(joint_indices: np.ndarray, label: str) -> np.ndarray:
+            missing = [int(j) for j in joint_indices if int(j) not in joint_to_actuator]
+            if missing:
+                names = [self.mj_model.joint(j).name for j in missing]
+                raise ValueError(f"{label} joints have no actuator: {names}")
+            return np.asarray([joint_to_actuator[int(j)] for j in joint_indices], dtype=np.int64)
+
+        self.body_actuator_index = _actuator_indices(self.body_joint_index, "body")
+        if self.num_hand_dof > 0:
+            self.left_hand_actuator_index = _actuator_indices(self.left_hand_index, "left hand")
+            self.right_hand_actuator_index = _actuator_indices(self.right_hand_index, "right hand")
+        else:
+            self.left_hand_actuator_index = np.zeros(0, dtype=np.int64)
+            self.right_hand_actuator_index = np.zeros(0, dtype=np.int64)
+
+        self.torques = np.zeros(self.mj_model.nu, dtype=np.float64)
+        if self.torque_limit.shape != (self.mj_model.nu,):
+            # Fall back to per-actuator clip from effort list if lengths diverge.
+            lim = np.asarray(self.torque_limit, dtype=np.float64).reshape(-1)
+            if lim.size >= self.mj_model.nu:
+                self.torque_limit = lim[: self.mj_model.nu]
+            else:
+                pad = np.full(self.mj_model.nu - lim.size, float(lim[-1]) if lim.size else 100.0)
+                self.torque_limit = np.concatenate([lim, pad])
+
     def init_renderers(self):
         self.renderers = {}
-        # Enlarge offscreen framebuffer if any camera asks for a larger image.
-        max_w = max((int(c.get("width", 0)) for c in self.camera_configs.values()), default=0)
-        max_h = max((int(c.get("height", 0)) for c in self.camera_configs.values()), default=0)
-        if max_w > 0:
-            self.mj_model.vis.global_.offwidth = max(int(self.mj_model.vis.global_.offwidth), max_w)
-        if max_h > 0:
-            self.mj_model.vis.global_.offheight = max(int(self.mj_model.vis.global_.offheight), max_h)
         for camera_name, camera_config in self.camera_configs.items():
             renderer = mujoco.Renderer(
                 self.mj_model, height=camera_config["height"], width=camera_config["width"]
@@ -312,12 +331,12 @@ class DefaultEnv:
                         + self.unitree_bridge.low_cmd.motor_cmd[i].kp
                         * (
                             self.unitree_bridge.low_cmd.motor_cmd[i].q
-                            - self.mj_data.qpos[self.body_joint_index[i] + self.qpos_offset - 1]
+                            - self.mj_data.qpos[int(self.body_qpos_index[i])]
                         )
                         + self.unitree_bridge.low_cmd.motor_cmd[i].kd
                         * (
                             self.unitree_bridge.low_cmd.motor_cmd[i].dq
-                            - self.mj_data.qvel[self.body_joint_index[i] + self.qvel_offset - 1]
+                            - self.mj_data.qvel[int(self.body_qvel_index[i])]
                         )
                     )
         return body_torques
@@ -342,12 +361,12 @@ class DefaultEnv:
                     + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kp
                     * (
                         self.unitree_bridge.left_hand_cmd.motor_cmd[i].q
-                        - self.mj_data.qpos[self.left_hand_index[i] + self.qpos_offset - 1]
+                        - self.mj_data.qpos[int(self.left_hand_qpos_index[i])]
                     )
                     + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kd
                     * (
                         self.unitree_bridge.left_hand_cmd.motor_cmd[i].dq
-                        - self.mj_data.qvel[self.left_hand_index[i] + self.qvel_offset - 1]
+                        - self.mj_data.qvel[int(self.left_hand_qvel_index[i])]
                     )
                 )
                 right_hand_torques[i] = (
@@ -355,12 +374,12 @@ class DefaultEnv:
                     + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kp
                     * (
                         self.unitree_bridge.right_hand_cmd.motor_cmd[i].q
-                        - self.mj_data.qpos[self.right_hand_index[i] + self.qpos_offset - 1]
+                        - self.mj_data.qpos[int(self.right_hand_qpos_index[i])]
                     )
                     + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kd
                     * (
                         self.unitree_bridge.right_hand_cmd.motor_cmd[i].dq
-                        - self.mj_data.qvel[self.right_hand_index[i] + self.qvel_offset - 1]
+                        - self.mj_data.qvel[int(self.right_hand_qvel_index[i])]
                     )
                 )
         return np.concatenate((left_hand_torques, right_hand_torques))
@@ -405,19 +424,19 @@ class DefaultEnv:
         )
         obs["secondary_imu_vel"] = pose[7:13]
 
-        obs["body_q"] = self.mj_data.qpos[self.body_joint_index + 7 - 1]
-        obs["body_dq"] = self.mj_data.qvel[self.body_joint_index + 6 - 1]
-        obs["body_ddq"] = self.mj_data.qacc[self.body_joint_index + 6 - 1]
-        obs["body_tau_est"] = self.mj_data.actuator_force[self.body_joint_index - 1]
+        obs["body_q"] = self.mj_data.qpos[self.body_qpos_index]
+        obs["body_dq"] = self.mj_data.qvel[self.body_qvel_index]
+        obs["body_ddq"] = self.mj_data.qacc[self.body_qvel_index]
+        obs["body_tau_est"] = self.mj_data.actuator_force[self.body_actuator_index]
         if self.num_hand_dof > 0:
-            obs["left_hand_q"] = self.mj_data.qpos[self.left_hand_index + self.qpos_offset - 1]
-            obs["left_hand_dq"] = self.mj_data.qvel[self.left_hand_index + self.qvel_offset - 1]
-            obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_index + self.qvel_offset - 1]
-            obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_index - 1]
-            obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_index + self.qpos_offset - 1]
-            obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_index + self.qvel_offset - 1]
-            obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_index + self.qvel_offset - 1]
-            obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_index - 1]
+            obs["left_hand_q"] = self.mj_data.qpos[self.left_hand_qpos_index]
+            obs["left_hand_dq"] = self.mj_data.qvel[self.left_hand_qvel_index]
+            obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_qvel_index]
+            obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_actuator_index]
+            obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_qpos_index]
+            obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_qvel_index]
+            obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_qvel_index]
+            obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_actuator_index]
         obs["time"] = self.mj_data.time
         return obs
 
@@ -426,18 +445,6 @@ class DefaultEnv:
         self.unitree_bridge.PublishLowState(self.obs)
         if self.unitree_bridge.joystick:
             self.unitree_bridge.PublishWirelessController()
-        if (
-            self.elastic_band
-            and self.band_release_s is not None
-            and not self._band_auto_released
-            and self.mj_data.time >= self.band_release_s
-        ):
-            self.elastic_band.enable = False
-            self._band_auto_released = True
-            print(
-                f"[g1-sim] elastic band released at t={self.mj_data.time:.1f}s "
-                "(G1_SIM_BAND_RELEASE_S)"
-            )
         if self.elastic_band:
             if self.elastic_band.enable and self.use_floating_root_link:
                 pose = np.concatenate(
@@ -461,11 +468,11 @@ class DefaultEnv:
                 self.mj_data.xfrc_applied[self.band_attached_link] = np.zeros(6)
         body_torques = self.compute_body_torques()
         hand_torques = self.compute_hand_torques()
-        # -1: actuator array is 0-based while joint indices from the model are 1-based
-        self.torques[self.body_joint_index - 1] = body_torques
+        self.torques[:] = 0.0
+        self.torques[self.body_actuator_index] = body_torques
         if self.num_hand_dof > 0:
-            self.torques[self.left_hand_index - 1] = hand_torques[: self.num_hand_dof]
-            self.torques[self.right_hand_index - 1] = hand_torques[self.num_hand_dof :]
+            self.torques[self.left_hand_actuator_index] = hand_torques[: self.num_hand_dof]
+            self.torques[self.right_hand_actuator_index] = hand_torques[self.num_hand_dof :]
 
         self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
 
@@ -530,18 +537,6 @@ class DefaultEnv:
             renderer = self.renderers[camera_name]
             if "params" in camera_config:
                 renderer.update_scene(self.mj_data, camera=camera_config["params"])
-            elif "track_body" in camera_config:
-                cam = camera_config.get("_mjv_cam")
-                if cam is None:
-                    cam = mujoco.MjvCamera()
-                    mujoco.mjv_defaultCamera(cam)
-                    camera_config["_mjv_cam"] = cam
-                cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-                cam.trackbodyid = int(self.mj_model.body(camera_config["track_body"]).id)
-                cam.distance = float(camera_config.get("distance", 3.0))
-                cam.azimuth = float(camera_config.get("azimuth", 120.0))
-                cam.elevation = float(camera_config.get("elevation", -25.0))
-                renderer.update_scene(self.mj_data, camera=cam)
             elif "mjcf_name" in camera_config:
                 renderer.update_scene(self.mj_data, camera=camera_config["mjcf_name"])
             else:
@@ -566,18 +561,56 @@ class DefaultEnv:
 
     def check_fall(self):
         self.fall = False
+        if self.config.get("DISABLE_FALL_RESET", False):
+            return
         if self.mj_data.qpos[2] < 0.2:
             self.fall = True
             print(f"Warning: Robot has fallen, height: {self.mj_data.qpos[2]:.3f} m")
 
         if self.fall:
             self.reset()
-            # mj_resetData zeroes time; re-hang the band so unattended replays can
-            # stand again instead of looping fall→reset→fall with band permanently off.
-            if self.elastic_band is not None:
-                self.elastic_band.enable = True
-                self._band_auto_released = False
-                print("[g1-sim] elastic band re-enabled after fall reset")
+
+    def set_standing_pose_on_ground(self, root_pos=None, root_quat=None, body_q=None) -> None:
+        """Optional teleport to a standing pose (used by SimMp4Recorder on record start)."""
+        if not self.use_floating_root_link:
+            return
+        if root_pos is None and root_quat is None and body_q is None:
+            # Keep current pose; only clear rates so releasing the elastic band is stable.
+            self.mj_data.qvel[:] = 0.0
+            self.mj_data.qacc[:] = 0.0
+            mujoco.mj_forward(self.mj_model, self.mj_data)
+            return
+        if root_pos is None:
+            root_pos = self.config.get("STANDING_ROOT_POS", [0.0, 0.0, 0.793])
+        if root_quat is None:
+            root_quat = [1.0, 0.0, 0.0, 0.0]
+        if body_q is None:
+            body_q = self.config.get("DEFAULT_MOTOR_ANGLES", self.config.get("DEFAULT_DOF_ANGLES"))
+        body_q = np.asarray(body_q, dtype=np.float64).reshape(-1)
+        self.mj_data.qpos[0:3] = np.asarray(root_pos, dtype=np.float64)[:3]
+        self.mj_data.qpos[3:7] = np.asarray(root_quat, dtype=np.float64)[:4]
+        n = min(len(body_q), len(self.body_joint_index))
+        if hasattr(self, "body_qpos_index"):
+            self.mj_data.qpos[self.body_qpos_index[:n]] = body_q[:n]
+        else:
+            for i in range(n):
+                adr = int(self.body_joint_index[i]) + self.qpos_offset - 1
+                self.mj_data.qpos[adr] = body_q[i]
+        self.mj_data.qvel[:] = 0.0
+        self.mj_data.qacc[:] = 0.0
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+
+    def apply_record_snap_to_ground(
+        self, root_pos, root_quat, body_q, *, release_elastic_band: bool = True
+    ) -> None:
+        self.set_standing_pose_on_ground(root_pos, root_quat, body_q)
+        if release_elastic_band and self.elastic_band is not None:
+            self.elastic_band.enable = False
+        print(
+            f"[sim_health] record snap root_z={float(self.mj_data.qpos[2]):.3f} "
+            f"(band released={release_elastic_band})",
+            flush=True,
+        )
 
     def check_self_collision(self):
         robot_bodies = get_subtree_body_names(self.mj_model, self.mj_model.body(self.root_body).id)
@@ -664,21 +697,20 @@ class BaseSimulator:
         """Main simulation loop"""
         sim_cnt = 0
         ts = time.time()
-        # Cooperative shutdown for headless/orchestrated runs (no kill required).
-        stop_file = os.environ.get("G1_SIM_STOP_FILE", "").strip()
 
         try:
             while self._running and (
                 (self.sim_env.viewer and self.sim_env.viewer.is_running())
                 or (self.sim_env.viewer is None)
             ):
-                if stop_file and os.path.exists(stop_file):
-                    print(f"[g1-sim] stop file hit: {stop_file}")
-                    break
-
                 step_start = time.monotonic()
 
+                recorder = getattr(self.sim_env, "mp4_recorder", None)
+                if recorder is not None:
+                    recorder.sim_tick(self.sim_env.mj_data, phase="pre")
                 self.sim_env.sim_step()
+                if recorder is not None:
+                    recorder.sim_tick(self.sim_env.mj_data, phase="post")
                 now = time.time()
                 if now - ts > 1 / 10.0 and self.redis_client is not None:
                     head_pose = self.sim_env.get_head_pose()
@@ -694,6 +726,11 @@ class BaseSimulator:
 
                 if sim_cnt % int(self.image_dt / self.sim_dt) == 0:
                     self.sim_env.update_render_caches()
+
+                recorder = getattr(self.sim_env, "mp4_recorder", None)
+                if recorder is not None:
+                    if not recorder.maybe_capture(self.sim_env.mj_data):
+                        self._running = False
 
                 # Simple rate limiter (replaces ROS rate)
                 elapsed = time.monotonic() - step_start
@@ -716,6 +753,12 @@ class BaseSimulator:
     def close(self):
         self._running = False
         try:
+            recorder = getattr(self.sim_env, "mp4_recorder", None)
+            if recorder is not None:
+                try:
+                    recorder.close()
+                except Exception as e:
+                    print(f"Warning closing mp4_recorder: {e}")
             if self.sim_env.image_publish_process is not None:
                 self.sim_env.image_publish_process.stop()
             if self.sim_env.viewer is not None:

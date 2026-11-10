@@ -24,14 +24,14 @@ A3_SIM_ENV = "a3_deploy_verify"  # conda env that has rclpy + joint_msgs (setup_
 
 class SimWrapper:
     def __init__(self, robot_model, env_name: str, config: Dict[str, any], **kwargs):
-        from gear_sonic.utils.mujoco_sim.simulator_factory import SimulatorFactory
+        from gear_sonic.utils.mujoco_sim.simulator_factory import SimulatorFactory, init_channel
 
         self.robot_model = robot_model
         self.config = config
 
-        # ChannelFactoryInitialize is done once inside BaseSimulator.
-        # Do not call init_channel here: a second Init on the same process fails with
-        # "create domain error" / "channel factory init error" (Unitree SDK singleton).
+        init_channel(config=self.config)
+
+        # Create simulator using factory
         self.sim = SimulatorFactory.create_simulator(
             config=self.config,
             env_name=env_name,
