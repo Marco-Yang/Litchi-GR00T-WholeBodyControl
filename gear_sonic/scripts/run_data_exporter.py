@@ -141,13 +141,16 @@ class SonicDataExporterConfig:
     revo2_release_blend_s: float = 0.35
     """Seconds to blend back to open after trigger release."""
 
-    # Supervised motion_token rewrite (Direction-1 dual-track)
-    rewrite_motion_token_supervised: bool = True
-    """Before parquet save, rewrite ``action.motion_token`` with open-loop SONIC
-    v1.1 mode-2 encode from buffered ``teleop.smpl_*`` (same rules as §8 refill).
-    Live deploy ``token_state`` is still copied frame-by-frame for teleop safety;
-    it is backed up under ``meta/motion_token_live/`` when rewrite succeeds.
-    Use ``--no-rewrite-motion-token-supervised`` to keep raw live tokens on disk."""
+    # Supervised motion_token rewrite (Direction-1 dual-track).
+    # Default OFF = Origin / live route: disk keeps deploy ``token_state`` (matches
+    # successful VLA→decoder closed-loop training). Opt in to open-loop mode-2
+    # rewrite with ``--rewrite-motion-token-supervised``.
+    rewrite_motion_token_supervised: bool = False
+    """If True, before parquet save rewrite ``action.motion_token`` with open-loop
+    SONIC v1.1 mode-2 encode from buffered ``teleop.smpl_*`` (same rules as §8
+    refill); live ``token_state`` is backed up under ``meta/motion_token_live/``.
+    Default False: disk keeps raw live tokens (Origin route). Enable with
+    ``--rewrite-motion-token-supervised``."""
 
     supervised_token_device: str = "cpu"
     """ORT device for episode-end supervised encode: ``cpu`` / ``cuda`` / ``auto``."""
@@ -369,7 +372,7 @@ class GrootDataCollector:
         revo2_hands: Revo2TeleopHands | None = None,
         record_wrist_cameras: bool = False,
         wrist_camera_port: int = 5558,
-        rewrite_motion_token_supervised: bool = True,
+        rewrite_motion_token_supervised: bool = False,
         supervised_token_device: str = "cpu",
     ):
         self.text_to_speech = text_to_speech

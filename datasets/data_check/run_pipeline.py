@@ -6,9 +6,11 @@ Steps:
   3. Isaac batch replay (GUI or headless) for dynamics metrics
   4. Screen ``metrics_eval.json`` per-episode; drop low-quality clips
 
-``action.motion_token`` is **kept as recorded** (exporter already writes open-loop
-mode-2 supervised tokens). Token rewrite is **opt-in** via ``--token-refill``
-(or the standalone ``refill-tokens`` CLI) for legacy disks only.
+``action.motion_token`` is **kept as recorded**. Exporter default is Origin/live
+``token_state``; open-loop mode-2 rewrite is opt-in at record time
+(``--rewrite-motion-token-supervised``). Pipeline token overwrite is separately
+opt-in via ``--token-refill`` (or ``refill-tokens``) — do not refill live-origin
+disks unless you intentionally want open-loop mode-2 supervision.
 
 Example (GUI, all episodes in range, stay open):
 
@@ -223,8 +225,9 @@ def main(argv: list[str] | None = None) -> int:
         summary["num_unstable"] = "skipped"
         summary["dropped_episode_indices"] = []
 
-    # Default: keep on-disk action.motion_token (exporter supervised rewrite).
-    # Opt-in --token-refill only for legacy sessions that never got mode2 on save.
+    # Default: keep on-disk action.motion_token (live by exporter default, or
+    # whatever was recorded). Opt-in --token-refill only when you intentionally
+    # want open-loop mode-2 overwrite (legacy / non-origin experiments).
     if args.token_refill and not nothing_left and not args.dry_run:
         token_backup = work / "motion_token_backup"
         token_summary = refill_dataset(

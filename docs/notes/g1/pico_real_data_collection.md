@@ -21,7 +21,7 @@
 | video `left/right_wrist` | `.../observation.images.left_wrist` / `right_wrist` | 可选；腕部 Abham UVC（需 `--record-wrist-cameras` + Orin `:5558`） |
 | state 腿/腰/臂/手 | `observation.state` 切片（含 Dex3 左右各 7D） | Dex3 **实测状态** |
 | state `projected_gravity` | `observation.projected_gravity` | |
-| action `motion_token` | `action.motion_token` (64D) | **监督用** SONIC v1.1 mode-2 latent：episode 落盘前用缓冲的 `teleop.smpl_*` + Pico 腕解析 + **开环 heading** 经 `model_encoder.onnx` 重写（与 §8 / Isaac screening 同规则）。录制过程中帧缓冲仍抄 deploy `token_state`（闭环控机），但**不作为落盘监督**；live 备份在 `meta/motion_token_live/`。关闭：`--no-rewrite-motion-token-supervised` |
+| action `motion_token` | `action.motion_token` (64D) | SONIC v1.1 **64D latent 监督**。**默认 = Origin / live**：盘上直接保留 deploy 闭环 `token_state`（与 `dataset/origin/...` 同流形）。可选开环 rewrite：加 `--rewrite-motion-token-supervised`，落盘前用 `teleop.smpl_*` + 腕解析 + **开环 heading** 经 `model_encoder.onnx` 重写（与 §8 同规则），live 备份到 `meta/motion_token_live/`。详见 [§4.5.1](#451-actionmotion_token-落盘两种路线) |
 | action `left/right_hand_joints` | `teleop.left_hand_joints` / `teleop.right_hand_joints`（各 **7D = Dex3**） | **夹爪动作标签**；仅 Pico **Trigger**（默认闭合，扣下张开）；exporter 可回退到 deploy 手指令/状态 |
 | language | `meta/tasks.jsonl` + `task_index` | `--task-prompt` |
 
@@ -271,7 +271,7 @@ python gear_sonic/scripts/pico_manager_thread_server.py --robot g1 --manager
 
 强制开关（一般不用）：`--record-wrist-cameras` / `--no-record-wrist-cameras`，`--record-head-camera` / `--no-record-head-camera`。
 
-**推荐命令（Revo2；相机自动）：**
+**推荐命令（Revo2；相机自动；默认 Origin / live token）：**
 
 ```bash
 cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
@@ -287,9 +287,32 @@ python gear_sonic/scripts/run_data_exporter.py \
   --revo2-send
 ```
 
-启动日志应出现 `[Camera] recording → ego_view, head` 或带腕部的四路。
+启动日志应出现：
 
-**Dex3（旧）手：** 不需要 §4.2；去掉 `--hand-type revo2` 及相关参数即可；相机同样自动探测。
+- `[Camera] recording → ego_view, head`（或带腕部的四路）
+- **`[motion_token] episode-end rewrite DISABLED — disk keeps live token_state`**（默认 live；必看）
+
+若要开环 mode-2 监督，显式加 `--rewrite-motion-token-supervised`，日志变为 `rewrite ENABLED ... disk tokens = open-loop mode2`。
+
+**Dex3（旧）手：** 不需要 §4.2；去掉 `--hand-type revo2` 及相关参数即可；相机同样自动探测。默认同样是 live。
+
+#### 4.5.1 `action.motion_token` 落盘：三条相关路径
+
+帧循环里 exporter **始终**先抄 deploy 的 `token_state` 进 buffer。落盘/清洗时还有三条互不混淆的路径：
+
+| # | 路径 | 何时发生 | 参数 / 入口 | 盘上 `action.motion_token` | 启动/日志关键字 |
+|---|---|---|---|---|---|
+| **1** | **Origin / live（默认）** | 数采落盘 | 默认；或显式 `--no-rewrite-motion-token-supervised` | 闭环控机 live `token_state` | `rewrite DISABLED — disk keeps live token_state` |
+| **2** | **开环 supervised rewrite** | 数采 episode 落盘前 | `--rewrite-motion-token-supervised` | 开环 mode-2 重写；live → `meta/motion_token_live/` | `rewrite ENABLED ... disk tokens = open-loop mode2` |
+| **3** | **事后 `--token-refill`** | 清洗 `pipeline` / `refill-tokens` | `--token-refill`（默认关） | 用开环 mode-2 **覆盖已落盘** token | `[pipeline] refilled motion_token ...`；默认则是 `keeping on-disk` |
+
+要点：
+
+1. **默认已是 live**（路径 1）。`launch_data_collection.py` 不传该 flag 时也会走 live，无需再手动加 `--no-rewrite-...`。
+2. **tyro 布尔开关**：关 rewrite = 默认 / `--no-rewrite-motion-token-supervised`；开 = `--rewrite-motion-token-supervised`。不要写 `=False`。
+3. 控机不受影响：C++ deploy 始终用 live `token_state`；flag / refill 只改**盘上监督列**。
+4. **路径 3 不要拿来「修正」live-origin 盘**：训 VLA 请保留 live；只有明确要开环 mode-2 监督时才 `--token-refill` 或数采时走路径 2。
+5. 采完抽查（路径 1）：**不应**出现 `meta/motion_token_live/` backup，也不应有 `meta/motion_token_supervised_rewrite.jsonl` 的 `rewrote: true`；启动日志必须是 `DISABLED`。
 
 ### 4.6 工作站 — CPU 绑核 / 解绑（跟随优先）
 
@@ -416,6 +439,9 @@ uv run python gr00t/experiment/launch_finetune.py \
 | `teleop.*_hand_joints` 全 0 | 松开 **Trigger** 闭合 / 扣下张开（Grip 不驱动手）；确认 Dex3 DDS；重启 pico_manager；跑校验脚本 |
 | `observation.state` 手有值但 teleop 手为 0 | 更新后的 exporter 会回退填 hand action/state；仍全 0 则手根本没被驱动 |
 | `motion_token` 全 0 | deploy 未跑 v1.1 / 策略未启动；需有 `token_state` |
+| 想采 live 却变成开环 token | exporter 带了 `--rewrite-motion-token-supervised`；去掉后重启，确认日志 `rewrite DISABLED` |
+| live 路线却有 `meta/motion_token_live/` | 说明该 session 实际跑过 rewrite；不要当 origin 用 |
+| live 盘被 pipeline 冲成开环 | 清洗时误加了 `--token-refill`；live-origin 训 VLA 不要 refill |
 | 红物体变蓝 | 工作站用已修的 `ImageUtils.decode_image`；重录 |
 | `cv2.imshow` GUI not implemented | 卸掉 `opencv-python-headless`；若重装 opencv 把 numpy 升到 2.x，再执行 `uv pip install 'numpy>=1.26,<2' --python .venv_data_collection/bin/python`（pinocchio 需 numpy 1.x） |
 | pinocchio / NumPy 2.x ImportError 或 segfault | 同上，把 `.venv_data_collection` 的 numpy 钉回 `<2` |
@@ -454,9 +480,12 @@ export CUDA_VISIBLE_DEVICES=0
 清洗后每个 session 是独立数据集，回放时把 `--dataset` 指到具体 session 目录。
 
 **`action.motion_token`：清洗默认不再清除/重写。**  
-录制时 `run_data_exporter.py` 已在落盘前写入开环 mode-2 监督 token（见 `supervised_mode2_tokens.py`）。`pipeline` **默认保留盘上 token**，日志会打印 `keeping on-disk action.motion_token`。
+`pipeline` **默认保留盘上 token**，日志会打印 `keeping on-disk action.motion_token`。盘上内容取决于录制时的 exporter 路线（见 [§4.5.1](#451-actionmotion_token-落盘三条相关路径)）：
 
-仅当处理**从未做过 exporter rewrite 的旧盘**时，才显式加 `--token-refill`（或单独跑 `refill-tokens`）。旧 token 备份在 `<work-dir>/motion_token_backup/`；摘要：`meta/motion_token_mode2_refill.json`。
+- **Origin / live（数采默认）**：盘上是 live `token_state`，训 VLA 请**直接用**，**不要** `--token-refill`。
+- **开环 rewrite 采的数据**（录制时加了 `--rewrite-motion-token-supervised`）：盘上已是开环 mode-2，一般也**不必**再 refill。
+
+仅当你明确要把某盘改成开环 mode-2 监督时，才加 `--token-refill`（或单独跑 `refill-tokens`）。旧 token 备份在 `<work-dir>/motion_token_backup/`；摘要：`meta/motion_token_mode2_refill.json`。
 
 | 参数 | 默认 | 含义 |
 |---|---|---|
@@ -688,7 +717,7 @@ bash scripts/run_sim_revo2_trigger.sh --real --no-orin-start --autoplay \
 
 | 字段 | 维度 | Revo2 含义 |
 |------|------|------------|
-| `action.motion_token` | 64 | SONIC v1.1 mode-2 **监督** latent（落盘前开环重写；非裸 `token_state`） |
+| `action.motion_token` | 64 | 默认：live `token_state`；可选 `--rewrite-motion-token-supervised` 写开环 mode-2（见 §4.5.1） |
 | `teleop.left/right_hand_joints` | **7**（前 6 = Revo2 0..1000，第 7 = 0） | 扳机轨迹指令 |
 | `observation.state` 手部切片 | 各 7 | 用 Revo2/1000 填入（无 Dex3 实测） |
 | `observation.images.ego_view` | 必选 | Orin `:5555` |
