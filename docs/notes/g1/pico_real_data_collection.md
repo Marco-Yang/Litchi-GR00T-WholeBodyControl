@@ -21,7 +21,7 @@
 | video `left/right_wrist` | `.../observation.images.left_wrist` / `right_wrist` | 可选；腕部 Abham UVC（需 `--record-wrist-cameras` + Orin `:5558`） |
 | state 腿/腰/臂/手 | `observation.state` 切片（含 Dex3 左右各 7D） | Dex3 **实测状态** |
 | state `projected_gravity` | `observation.projected_gravity` | |
-| action `motion_token` | `action.motion_token` (64D) | SONIC v1.1 **64D latent 监督**。**默认 = Origin / live**：盘上直接保留 deploy 闭环 `token_state`（与 `dataset/origin/...` 同流形）。可选开环 rewrite：加 `--rewrite-motion-token-supervised`，落盘前用 `teleop.smpl_*` + 腕解析 + **开环 heading** 经 `model_encoder.onnx` 重写（与 §8 同规则），live 备份到 `meta/motion_token_live/`。详见 [§4.5.1](#451-actionmotion_token-落盘两种路线) |
+| action `motion_token` | `action.motion_token` (64D) | SONIC v1.1 **64D latent 监督**。**默认 = Origin / live**：盘上直接保留 deploy 闭环 `token_state`（与 `dataset/origin/...` 同流形）。可选开环 rewrite：加 `--rewrite-motion-token-supervised`，落盘前用 `teleop.smpl_*` + 腕解析 + **开环 heading** 经 `model_encoder.onnx` 重写（与 §8 同规则），live 备份到 `meta/motion_token_live/`。详见 [§4.5.1](#451-actionmotion_token-落盘三条相关路径) |
 | action `left/right_hand_joints` | `teleop.left_hand_joints` / `teleop.right_hand_joints`（各 **7D = Dex3**） | **夹爪动作标签**；仅 Pico **Trigger**（默认闭合，扣下张开）；exporter 可回退到 deploy 手指令/状态 |
 | language | `meta/tasks.jsonl` + `task_index` | `--task-prompt` |
 
