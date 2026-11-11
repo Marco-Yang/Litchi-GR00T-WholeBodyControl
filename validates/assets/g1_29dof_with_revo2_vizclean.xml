@@ -1,5 +1,5 @@
 <mujoco model="g1_29dof_with_revo2">
-  <compiler angle="radian" meshdir="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl/gear_sonic_deploy/g1/meshes" />
+  <compiler angle="radian" meshdir="../../gear_sonic/data/robot_model/model_data/g1/meshes" />
   <!-- sonic G1 body + BrainCo Revo2 hands (brainco_left/right.urdf joint names). -->
 
   <default>
