@@ -21,11 +21,45 @@ import numpy as np
 import pyarrow.parquet as pq
 import zmq
 
-WBC = Path("/home/zhenyu/workspace/code/HumanoidWBM/demo/RL_controller/Litchi-GR00T-WholeBodyControl")
-LITCHI = Path("/home/zhenyu/workspace/code/HumanoidWBM/demo/VLA/Litchi-Isaac-GR00T")
-for p in (str(LITCHI), str(WBC)):
-    if p not in sys.path:
-        sys.path.insert(0, p)
+# Prefer env overrides; else resolve from this file / common local layouts.
+_VALIDATE_LIB = Path(__file__).resolve().parent
+_WBC_DEFAULT = _VALIDATE_LIB.parents[1]  # .../Litchi-GR00T-WholeBodyControl
+_LITCHI_CANDIDATES = [
+    Path(__import__("os").environ[k])
+    for k in ("LITCHI_ROOT", "ISAAC_GR00T_ROOT", "GR00T_ROOT")
+    if __import__("os").environ.get(k)
+] + [
+    Path("/home/zhenyu/workspace/code/HumanoidWBM/demo/VLA/Litchi-Isaac-GR00T"),
+    _WBC_DEFAULT.parent / "Gr00T",
+]
+WBC = Path(__import__("os").environ.get("WBC_ROOT", str(_WBC_DEFAULT))).resolve()
+
+
+def _is_isaac_gr00t_root(p: Path) -> bool:
+    # Require data/ so a stub Deploy/Gr00T/gr00t/policy tree is not selected.
+    return (p / "gr00t" / "data").is_dir() and (p / "gr00t" / "policy").is_dir()
+
+
+LITCHI = next(
+    (p.resolve() for p in _LITCHI_CANDIDATES if _is_isaac_gr00t_root(p)),
+    None,
+)
+# If already importable (editable / venv), keep that root on path; else insert LITCHI.
+try:
+    import gr00t as _gr00t_probe  # noqa: F401
+except ImportError:
+    if LITCHI is not None and str(LITCHI) not in sys.path:
+        sys.path.insert(0, str(LITCHI))
+if str(WBC) not in sys.path:
+    sys.path.insert(0, str(WBC))
+if LITCHI is None:
+    try:
+        import gr00t as _g
+        from pathlib import Path as _P
+
+        LITCHI = _P(_g.__file__).resolve().parents[1]
+    except Exception:
+        LITCHI = _WBC_DEFAULT
 
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (  # noqa: E402
     build_command_message,

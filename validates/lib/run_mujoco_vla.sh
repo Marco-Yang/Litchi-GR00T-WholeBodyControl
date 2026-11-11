@@ -27,7 +27,13 @@ EXEC_HORIZON="${EXEC_HORIZON:-12}"
 ACTION_HORIZON="${ACTION_HORIZON:-40}"
 DEPLOY_CUDA="${DEPLOY_CUDA_VISIBLE_DEVICES:-1}"
 VLA_DEVICE="${VLA_DEVICE:-cuda:0}"
-NET_IFACE="${NET_IFACE:-eth1}"
+# DDS NIC for MuJoCo validates MUST stay on loopback.
+# Never default to enp11s0 / robot LAN — deploy LowCmd on that NIC reaches the real G1.
+# Override only for intentional bring-up: NET_IFACE=enp11s0 (real) or a dedicated sim NIC.
+NET_IFACE="${NET_IFACE:-lo}"
+if [[ "${NET_IFACE}" == "enp11s0" || "${NET_IFACE}" == "eth0" ]]; then
+  echo "WARNING: NET_IFACE=${NET_IFACE} is a robot/control NIC — real G1 may receive LowCmd" >&2
+fi
 CKPT_TAG="${CKPT_TAG:-$(basename "${CKPT}" | tr -cd 'A-Za-z0-9._-')}"
 if [[ "${GT_PROPRIO_ONLY}" == "1" ]]; then
   PROPRIO_TAG="openloop"
@@ -81,25 +87,56 @@ DEPLOY_FIFO="${WORK_DIR}/.deploy_fifo"
 rm -f "${RECORD_START}" "${RECORD_STOP}" "${ARM_FLAG}" "${STREAM_FLAG}" \
   "${READY_FLAG}" "${GO_FLAG}" "${DEPLOY_FIFO}"
 
-ORT="/home/zhenyu/workspace/code/HumanoidWBM/demo/VLA/deps/onnxruntime-linux-x64-1.16.3/lib"
+# Local ORT / ZMQ (override with ORT= / ZMQ_LIB=). Fall back to zhenyu demo tree if present.
+ORT="${ORT:-}"
+if [[ -z "${ORT}" ]]; then
+  if [[ -d "${ORT_LIB:-${HOME}/.local/onnxruntime/lib}" ]]; then
+    ORT="${ORT_LIB:-${HOME}/.local/onnxruntime/lib}"
+  elif [[ -d "/home/zhenyu/workspace/code/HumanoidWBM/demo/VLA/deps/onnxruntime-linux-x64-1.16.3/lib" ]]; then
+    ORT="/home/zhenyu/workspace/code/HumanoidWBM/demo/VLA/deps/onnxruntime-linux-x64-1.16.3/lib"
+  fi
+fi
+ZMQ_LIB="${ZMQ_LIB:-}"
+if [[ -z "${ZMQ_LIB}" ]]; then
+  if [[ -d "${GROOT_VENV_SP}/pyzmq.libs" ]]; then
+    ZMQ_LIB="${GROOT_VENV_SP}/pyzmq.libs"
+  elif [[ -d "/home/zhenyu/workspace/code/HumanoidWBM/demo/VLA/deps/libzmq" ]]; then
+    ZMQ_LIB="/home/zhenyu/workspace/code/HumanoidWBM/demo/VLA/deps/libzmq"
+  else
+    ZMQ_LIB="/lib/x86_64-linux-gnu"
+  fi
+fi
 DDS="${DEPLOY}/thirdparty/unitree_sdk2/thirdparty/lib/x86_64"
+# Deploy binary links system TensorRT (e.g. 10.13.x). Do NOT prepend pip/conda
+# tensorrt_libs (10.15.x) — that breaks deserialize / version checks.
+# ROS2 libs are required by g1_deploy_onnx_ref (librcl_*), keep them early.
+ROS_LIB="${ROS_LIB:-/opt/ros/jazzy/lib}"
+ROS_LIB64="${ROS_LIB64:-/opt/ros/jazzy/lib/x86_64-linux-gnu}"
+if [[ -f /opt/ros/jazzy/setup.bash ]]; then
+  # shellcheck disable=SC1091
+  set +u
+  # Keep current LD; setup.bash prepends ROS paths.
+  source /opt/ros/jazzy/setup.bash
+  set -u
+fi
 export LD_LIBRARY_PATH="\
 ${ORT}:\
+${ROS_LIB}:\
+${ROS_LIB64}:\
+/usr/local/cuda/lib64:\
 ${GROOT_VENV_SP}/nvidia/cuda_runtime/lib:\
-${GROOT_VENV_SP}/tensorrt_libs:\
 ${GROOT_VENV_SP}/nvidia/cublas/lib:\
 ${GROOT_VENV_SP}/nvidia/cudnn/lib:\
 ${GROOT_VENV_SP}/nvidia/cuda_nvrtc/lib:\
-${GROOT_VENV_SP}/pyzmq.libs:\
-/home/zhenyu/workspace/code/HumanoidWBM/demo/VLA/deps/libzmq:\
+${ZMQ_LIB}:\
 ${DDS}:\
 ${TOOLS}/lib:\
 ${LD_LIBRARY_PATH:-}"
-export PATH="${TOOLS}/bin:${PATH}"
+export PATH="$(dirname "${FFMPEG_BIN}"):${TOOLS}/bin:${PATH}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${LITCHI_ROOT}:${WBC_ROOT}:${PYTHONPATH:-}"
-export HF_HOME="${HF_HOME:-/home/zhenyu/.cache/huggingface}"
+export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export NO_ALBUMENTATIONS_UPDATE=1
@@ -159,11 +196,17 @@ PY
 log "start WBC sim (ground walk, no elastic band, GT RSI)..."
 (
   cd "${WBC_ROOT}"
+  # Prefer validates viz-clean scene (unified Revo2 hand meshes, no dual hand collision draw).
+  REVO2_SCENE="${REVO2_SCENE:-${VALIDATE_ROOT}/assets/scene_43dof_revo2_vizclean.xml}"
+  if [[ ! -f "${REVO2_SCENE}" ]]; then
+    REVO2_SCENE="${DEPLOY}/g1/scene_43dof_revo2.xml"
+  fi
   "${SIM_PY}" -u "${VALIDATE_LIB}/run_sim_record.py" \
     --interface "${NET_IFACE}" \
     --no-enable-onscreen \
     --enable-offscreen \
     --revo2-hand \
+    --revo2-scene "${REVO2_SCENE}" \
     --disable-elastic-band \
     --disable-fall-reset \
     --gt-rsi-npz "${GT_RSI_NPZ}" \

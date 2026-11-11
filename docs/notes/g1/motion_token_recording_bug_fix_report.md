@@ -79,13 +79,7 @@ PY
 - 真机短采 + 解码观感对比：**待上机**。
 - episode 末尾 encode 在 CPU 上对长 episode 有短暂阻塞（默认 device=`cpu`）；可用 `--supervised-token-device cuda`（需 GPU ORT）。
 - 若 `teleop.smpl_*` 因 latency gate 整段为零，rewrite **跳过**并保留 live（记录 `smpl_all_zero`）。
-- 未改 C++ / ONNX / obs 维数；控机链路未回退。
-
-### 2026-11-09 真机验收补充
-| session | 结果 |
-|---|---|
-| `outputs/2026-11-09-10-33-39` | 无 rewrite 产物；live vs mode2 L2≈0.68（进程未带新逻辑或未生效） |
-| `outputs/2026-11-09-11-20-20` | `ENABLED` 有；`rewrite skipped: smpl_all_zero`（`stream_mode=2`，无 SMPL） |
+- 未改 C++ / ONNX / obs 维数；控机链路未回退。episode 末尾 encode 在 CPU 上对长 episode 有短暂阻塞（默认 device=`cpu`）；可用 `--supervised-token-deviceo`（`stream_mode=2`，无 SMPL） |
 | `outputs/2026-11-09-11-21-04` | `stream_mode=1`、SMPL 正常；但日志 `supervised rewrite failed (No module named 'datasets.data_check')` → 仍落盘 live（L2≈0.59/0.65）。**已修**：`supervised_mode2_tokens._import_refill` 改为按文件路径加载，避开 HF `datasets` 占名。需**重启 exporter** 再采。 |
 
 ### 2026-11-09 清洗管线

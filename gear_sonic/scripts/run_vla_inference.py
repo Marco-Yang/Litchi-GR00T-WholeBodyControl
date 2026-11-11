@@ -12,12 +12,16 @@ Uses the Isaac-GR00T PolicyClient (ZMQ REQ/REP) to communicate with a
 running PolicyServer.
 
 Keyboard commands (received via ZMQ from the standalone keyboard publisher):
-  p  -> pause / resume the policy loop (pause also drops the RTC prefix)
-  k  -> start / stop the C++ control loop
-  i  -> blend smoothly to initial pose (or snap if no prior token), switch to POSE mode, and drop the RTC prefix
+  p  -> pause / resume the policy loop (pause also drops the RTC prefix).
+       On resume, switches PLANNER→POSE only when the first policy action is ready
+       (avoids the old latent init pose that bent the arms).
+  k  -> start / stop the C++ control loop (starts in PLANNER = PD/planner stand)
+  i  -> arm-safe ready: stay in / return to PLANNER stand, pause, clear RTC.
+       Does NOT send LATENT_INITIAL_MOTION_TOKEN (that token bends the arms and
+       then slamming into the first VLA action on ``p`` shocks the motors).
   t  -> change prompt at runtime (publisher sends ``prompt:<text>``; also drops the RTC prefix)
-  [  -> toggle left hand open/closed for initial pose
-  ]  -> toggle right hand open/closed for initial pose
+  [  -> toggle left hand open/closed (only used if explicitly publishing init pose)
+  ]  -> toggle right hand open/closed (only used if explicitly publishing init pose)
   c  -> start recording (handled by data exporter if running)
   s  -> stop recording success (handled by data exporter)
   f  -> stop recording failure (handled by data exporter)
@@ -269,6 +273,9 @@ def prepare_observation_from_sensors(
     )
 
     video = {"ego_view": cam_img[np.newaxis, np.newaxis]}
+    # 2cam origin checkpoint (unitree_g1_sonic) requires video.head alongside ego_view.
+    if "head" in camera_msg["images"]:
+        video["head"] = camera_msg["images"]["head"][np.newaxis, np.newaxis]
     if "left_wrist" in camera_msg["images"]:
         video["left_wrist"] = camera_msg["images"]["left_wrist"][np.newaxis, np.newaxis]
     if "right_wrist" in camera_msg["images"]:
@@ -477,13 +484,21 @@ def main(config: InferenceConfig):
     # Track C++ control loop state
     cpp_loop_running = False
     cpp_mode = "OFF"  # "OFF", "PLANNER", or "POSE"
+    # Set on ``p`` resume while still in PLANNER; cleared after first POSE switch.
+    pending_pose_on_first_action = False
 
     # Track initial pose hand states
     initial_pose_left_hand_closed = False
     initial_pose_right_hand_closed = False
 
     def publish_initial_pose():
-        """Publish initial pose command to move robot to starting position."""
+        """Publish initial pose command to move robot to starting position.
+
+        C++ mode switch (PLANNER→POSE) does safety reset then re-enables ZMQ
+        streaming and clears ``has_new_data_``. A single pose frame sent right
+        after the command is often wiped; resend for ~1s so the token lands
+        after streaming is actually enabled.
+        """
         print("Moving to initial pose")
         left_hand = (
             _compute_closed_hand_joints("L")
@@ -501,9 +516,18 @@ def main(config: InferenceConfig):
             left_hand_joints=left_hand,
             right_hand_joints=right_hand,
         )
-        zmq_socket.send(zmq_message)
-        print_green("Sent latent initial pose via ZMQ")
-        time.sleep(1.0)
+        # Let C++ consume the mode-switch command + finish reset/toggle first.
+        time.sleep(0.15)
+        num_sends = max(1, int(round(config.action_publish_rate * 1.0)))
+        step_period = 1.0 / config.action_publish_rate
+        for step in range(num_sends):
+            t0 = time.monotonic()
+            zmq_socket.send(zmq_message)
+            if step == 0:
+                print_green("Sent latent initial pose via ZMQ (repeating for 1s)")
+            remaining = step_period - (time.monotonic() - t0)
+            if remaining > 0:
+                time.sleep(remaining)
         print("Initial pose done.")
 
     def blend_to_initial_pose(duration_s: float) -> bool:
@@ -600,7 +624,7 @@ def main(config: InferenceConfig):
     PROMPT_MSG_PREFIX = "prompt:"
 
     def check_keyboard_input():
-        nonlocal pause_loop, cpp_loop_running, cpp_mode
+        nonlocal pause_loop, cpp_loop_running, cpp_mode, pending_pose_on_first_action
         nonlocal initial_pose_left_hand_closed, initial_pose_right_hand_closed
         nonlocal cached_action_chunk, action_chunk_index, last_inference_time
         nonlocal zmq_frame_counter, last_sent_motion_token, reset_requested
@@ -632,23 +656,25 @@ def main(config: InferenceConfig):
         elif key == "f":
             print("Keyboard: 'f' (stop recording failure -- handled by data exporter)")
         elif key == "i":
-            if cpp_loop_running and cpp_mode == "PLANNER":
-                if send_cpp_control_command(start=True, planner=False):
-                    print("Switched to POSE mode (from PLANNER mode)")
-                else:
-                    print("Warning: Failed to switch to POSE mode")
-            elif not cpp_loop_running:
+            # Arm-safe ready: keep planner/PD stand. Do NOT send the latent init
+            # token (it bends the arms) and do NOT enter POSE until ``p`` has a
+            # real policy action ready to stream.
+            if not cpp_loop_running:
                 print("Note: C++ loop not running - press 'k' to start")
+            elif cpp_mode == "POSE":
+                if send_cpp_control_command(start=True, planner=True):
+                    print("Returned to PLANNER stand (no latent init pose / no arm bend)")
+                else:
+                    print("Warning: Failed to return to PLANNER mode")
+            else:
+                print("Ready in PLANNER stand — press 'p' to resume VLA (POSE starts with first action)")
 
             pause_loop = True
-            if config.initial_pose_blend_duration > 0 and last_sent_motion_token is not None:
-                blend_to_initial_pose(config.initial_pose_blend_duration)
-            else:
-                publish_initial_pose()
-
+            pending_pose_on_first_action = False
             zmq_frame_counter = 0
             cached_action_chunk = None
             action_chunk_index = 0
+            last_sent_motion_token = None
             reset_requested = True
             print("Cleared cached action chunk and RTC prefix, reset frame counter")
         elif key == "p":
@@ -658,11 +684,18 @@ def main(config: InferenceConfig):
                 cached_action_chunk = None
                 action_chunk_index = 0
                 reset_requested = True
+                pending_pose_on_first_action = False
                 print(
                     "Policy loop paused and RTC prefix cleared "
                     "(C++ loop still running - press 'k' to stop)"
                 )
             else:
+                if cpp_loop_running and cpp_mode == "PLANNER":
+                    pending_pose_on_first_action = True
+                    print(
+                        "Will switch to POSE when the first policy action is ready "
+                        "(staying in PLANNER stand until then)"
+                    )
                 print("Policy loop resumed")
         elif key == "k":
             if cpp_loop_running:
@@ -670,11 +703,12 @@ def main(config: InferenceConfig):
                 print(f"Stopping C++ control loop (from {cpp_mode} mode)...")
                 if send_cpp_control_command(start=False, planner=current_planner):
                     print("Stopped C++ control loop")
+                    pending_pose_on_first_action = False
             else:
                 print("Starting C++ control loop in PLANNER mode...")
                 if send_cpp_control_command(start=True, planner=True):
                     print("Started C++ control loop in PLANNER mode")
-                    print("Press 'i' to send initial pose and switch to POSE mode")
+                    print("Press 'i' to arm-safe ready (stay standing), then 'p' to run VLA")
                     if pause_loop:
                         print("Note: Policy loop is paused - press 'p' to resume")
         elif key == "[":
@@ -855,6 +889,19 @@ def main(config: InferenceConfig):
 
                     frame_index = np.array([zmq_frame_counter], dtype=np.int64)
                     zmq_frame_counter += 1
+
+                    # Enter POSE only with a real action in hand so C++ never sits
+                    # in STREAMED_MOTION on the bent latent init token / empty buffer.
+                    if pending_pose_on_first_action and cpp_loop_running and cpp_mode == "PLANNER":
+                        if send_cpp_control_command(start=True, planner=False):
+                            print_green(
+                                "Switched to POSE for first policy action "
+                                "(skipped latent init arm-bend)"
+                            )
+                            time.sleep(0.15)
+                        else:
+                            print("Warning: Failed to switch to POSE for first action")
+                        pending_pose_on_first_action = False
 
                     zmq_message = pack_latent_action_message(
                         motion_token,

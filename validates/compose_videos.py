@@ -18,6 +18,8 @@ Example:
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,7 +27,21 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 _VIDEOS_ROOT = _HERE / "videos"
-_DEFAULT_FFMPEG = Path("/home/zhenyu/workspace/code/HumanoidWBM/demo/VLA/.tools/bin/ffmpeg")
+
+
+def _default_ffmpeg() -> Path:
+    for cand in (
+        Path(os.environ["FFMPEG_BIN"]) if os.environ.get("FFMPEG_BIN") else None,
+        Path.home() / "miniconda3/envs/gr00t/bin/ffmpeg",
+        Path("/home/zhenyu/workspace/code/HumanoidWBM/demo/VLA/.tools/bin/ffmpeg"),
+    ):
+        if cand is not None and cand.is_file():
+            return cand
+    which = shutil.which("ffmpeg")
+    return Path(which) if which else Path("ffmpeg")
+
+
+_DEFAULT_FFMPEG = _default_ffmpeg()
 _DEFAULT_FFPROBE = _DEFAULT_FFMPEG.with_name("ffprobe")
 
 sys.path.insert(0, str(_HERE / "lib"))
