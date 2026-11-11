@@ -176,6 +176,18 @@ def main() -> None:
     ap.add_argument("--gt-proprio-only", action="store_true",
                     help="Always use dataset proprio (fully offline open-loop).")
     ap.add_argument(
+        "--dump-tokens-npz",
+        type=Path,
+        default=None,
+        help="After open-loop precompute, save plan tokens (+ GT) to this npz and continue "
+        "(or exit if --dump-only).",
+    )
+    ap.add_argument(
+        "--dump-only",
+        action="store_true",
+        help="With --gt-proprio-only: precompute + dump tokens, then exit (no ZMQ GO stream).",
+    )
+    ap.add_argument(
         "--closed-loop-sequential",
         action="store_true",
         help=(
@@ -327,16 +339,23 @@ def main() -> None:
     args.ready_flag.touch()
     time.sleep(0.5)
 
-    print(f"[vla] wait arm {args.arm_flag}", flush=True)
-    while not args.arm_flag.exists():
-        time.sleep(0.05)
-    pub.send(build_command_message(start=True, stop=False, planner=True))
-    print("[vla] sent start (planner)", flush=True)
-    time.sleep(0.3)
-    while not args.stream_flag.exists():
-        time.sleep(0.05)
-    pub.send(build_command_message(start=True, stop=False, planner=False))
-    print("[vla] sent start (streamed)", flush=True)
+    if args.dump_only:
+        if not args.gt_proprio_only:
+            raise SystemExit("--dump-only requires --gt-proprio-only")
+        if args.dump_tokens_npz is None:
+            raise SystemExit("--dump-only requires --dump-tokens-npz")
+        print("[vla] dump-only: skip arm/stream waits", flush=True)
+    else:
+        print(f"[vla] wait arm {args.arm_flag}", flush=True)
+        while not args.arm_flag.exists():
+            time.sleep(0.05)
+        pub.send(build_command_message(start=True, stop=False, planner=True))
+        print("[vla] sent start (planner)", flush=True)
+        time.sleep(0.3)
+        while not args.stream_flag.exists():
+            time.sleep(0.05)
+        pub.send(build_command_message(start=True, stop=False, planner=False))
+        print("[vla] sent start (streamed)", flush=True)
 
     zero7 = np.zeros(7, dtype=np.float32)
     period = 1.0 / float(args.control_fps)
@@ -504,6 +523,36 @@ def main() -> None:
                     f"gt[:4]={gt_tokens[min(fi, gt_tokens.shape[0] - 1), :4].tolist()}",
                     flush=True,
                 )
+
+        if args.dump_tokens_npz is not None:
+            out_npz = Path(args.dump_tokens_npz)
+            out_npz.parent.mkdir(parents=True, exist_ok=True)
+            gt_aligned = np.stack(
+                [gt_tokens[min(i, gt_tokens.shape[0] - 1)] for i in range(max_steps)],
+                axis=0,
+            ).astype(np.float32)
+            per = np.linalg.norm(plan_mt - gt_aligned, axis=1)
+            np.savez_compressed(
+                out_npz,
+                tokens=plan_mt,
+                gt_tokens=gt_aligned,
+                bootstrap_n=np.int32(bootstrap_n),
+                exec_h=np.int32(exec_h),
+                action_horizon=np.int32(horizon),
+                l2_per_step=per.astype(np.float32),
+                l2_mean=np.float32(per.mean()),
+                l2_post_boot=np.float32(per[bootstrap_n:].mean() if bootstrap_n < max_steps else 0.0),
+            )
+            print(
+                f"[vla] dumped tokens → {out_npz} shape={plan_mt.shape} "
+                f"L2_mean={float(per.mean()):.4f} L2_post_boot={float(per[bootstrap_n:].mean()):.4f}",
+                flush=True,
+            )
+            if args.dump_only:
+                stop_hold.set()
+                hold_th.join(timeout=2.0)
+                print("[vla] dump-only done", flush=True)
+                return
 
         print(
             f"[vla] precompute done — wait go {args.go_flag} "
