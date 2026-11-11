@@ -11,3 +11,4 @@ logs/
 # this source tree.
 thirdparty/onnxruntime/*.tar.gz
 thirdparty/onnxruntime/*.tar.gz.sha256
+_trt_stale/
