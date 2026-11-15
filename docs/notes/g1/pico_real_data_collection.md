@@ -277,7 +277,7 @@ python gear_sonic/scripts/pico_manager_thread_server.py --robot g1 --manager
 cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 source .venv_data_collection/bin/activate
 python gear_sonic/scripts/run_data_exporter.py \
-  --task-prompt "走到绿色桌子前" \
+  --task-prompt "侧平举抬起右手然后抓取前方绿色桌子上的黄色玩偶，抓起以后放进编织篮里" \
   --camera-host 192.168.123.164 \
   --camera-port 5555 \
   --root-output-dir outputs \

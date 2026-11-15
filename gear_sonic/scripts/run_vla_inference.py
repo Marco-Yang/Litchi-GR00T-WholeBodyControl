@@ -46,6 +46,7 @@ from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.transforms import compute_projected_gravity
 from gear_sonic.utils.data_collection.zmq_state_subscriber import ZMQStateSubscriber
 from gear_sonic.utils.inference.initial_poses import LATENT_INITIAL_MOTION_TOKEN
+from gear_sonic.utils.inference.revo2_action_bridge import Revo2ActionBridge
 from gear_sonic.utils.inference.vla_utils import (
     calculate_latency_compensated_index,
     concat_action,
@@ -151,6 +152,20 @@ class InferenceConfig:
     verbose_timing: bool = False
     """Whether to always print timing info (not just when loop is slow)."""
 
+    # Revo2 real hands (Orin Modbus UDP bridge)
+    revo2_send: bool = False
+    """If True, stream predicted hand joints to Orin ``revo2_modbus_rx`` via UDP.
+
+    Requires Orin RX already listening (e.g. ``bash scripts/start_orin_revo2_rx.sh``).
+    Body still goes through ZMQ → C++; only the Revo2 6D cmds use UDP :19500.
+    """
+
+    revo2_orin_host: str = "192.168.123.164"
+    """Orin IP running ``revo2_modbus_rx``."""
+
+    revo2_udp_port: int = 19500
+    """UDP port of Orin ``revo2_modbus_rx``."""
+
 
 def print_green(x):
     print(f"\033[92m{x}\033[0m")
@@ -242,6 +257,7 @@ def prepare_observation_from_sensors(
     robot_model,
     language_prompt: str,
     log_errors: bool = False,
+    revo2_bridge: Revo2ActionBridge | None = None,
 ):
     """Read sensors and prepare observation for the VLA policy.
 
@@ -262,14 +278,23 @@ def prepare_observation_from_sensors(
 
     cam_img = camera_msg["images"]["ego_view"]
 
-    # Copy index finger data to middle finger (hardware coupling)
-    state_msg["left_hand_q"][5] = state_msg["left_hand_q"][3]
-    state_msg["left_hand_q"][6] = state_msg["left_hand_q"][4]
+    left_hand_q = state_msg["left_hand_q"]
+    right_hand_q = state_msg["right_hand_q"]
+    # No Dex3 DDS with Revo2: fill hand slots from last commanded Revo2 (norm 0..1),
+    # matching how ``run_data_exporter`` recorded Revo2 episodes.
+    if revo2_bridge is not None:
+        left_hand_q, right_hand_q = revo2_bridge.state_hand_vectors()
+    else:
+        # Copy index finger data to middle finger (hardware coupling)
+        left_hand_q = np.asarray(left_hand_q, dtype=np.float64).copy()
+        right_hand_q = np.asarray(right_hand_q, dtype=np.float64).copy()
+        left_hand_q[5] = left_hand_q[3]
+        left_hand_q[6] = left_hand_q[4]
 
     qpos = robot_model.get_configuration_from_actuated_joints(
         body_actuated_joint_values=state_msg["body_q"],
-        left_hand_actuated_joint_values=state_msg["left_hand_q"],
-        right_hand_actuated_joint_values=state_msg["right_hand_q"],
+        left_hand_actuated_joint_values=left_hand_q,
+        right_hand_actuated_joint_values=right_hand_q,
     )
 
     video = {"ego_view": cam_img[np.newaxis, np.newaxis]}
@@ -471,6 +496,18 @@ def main(config: InferenceConfig):
         )
     else:
         print_green("RTC off")
+
+    revo2_bridge: Revo2ActionBridge | None = None
+    if config.revo2_send:
+        revo2_bridge = Revo2ActionBridge(
+            host=config.revo2_orin_host,
+            port=config.revo2_udp_port,
+        )
+        print_green(
+            f"Revo2 hand bridge on → {config.revo2_orin_host}:{config.revo2_udp_port}"
+        )
+    else:
+        print("Revo2 hand bridge off (body-only; pass --revo2-send to drive hands)")
 
     keyboard_listener = ZMQKeyboardSubscriber(
         port=config.keyboard_zmq_port, host=config.keyboard_zmq_host
@@ -676,6 +713,8 @@ def main(config: InferenceConfig):
             action_chunk_index = 0
             last_sent_motion_token = None
             reset_requested = True
+            if revo2_bridge is not None:
+                revo2_bridge.open_all()
             print("Cleared cached action chunk and RTC prefix, reset frame counter")
         elif key == "p":
             pause_loop = not pause_loop
@@ -685,6 +724,8 @@ def main(config: InferenceConfig):
                 action_chunk_index = 0
                 reset_requested = True
                 pending_pose_on_first_action = False
+                if revo2_bridge is not None:
+                    revo2_bridge.open_all()
                 print(
                     "Policy loop paused and RTC prefix cleared "
                     "(C++ loop still running - press 'k' to stop)"
@@ -747,6 +788,7 @@ def main(config: InferenceConfig):
                 robot_model=robot_model,
                 language_prompt=language_prompt_ref[0],
                 log_errors=True,
+                revo2_bridge=revo2_bridge,
             ),
             lambda obs, rtc_options: run_policy_inference_and_process(
                 policy=n1_policy,
@@ -910,6 +952,15 @@ def main(config: InferenceConfig):
                         right_hand_joints=right_hand_joints,
                     )
                     zmq_socket.send(zmq_message)
+                    if revo2_bridge is not None:
+                        cmds = revo2_bridge.send(
+                            left_hand_joints, right_hand_joints
+                        )
+                        if zmq_frame_counter % 50 == 0:
+                            print_green(
+                                f"Revo2 UDP: L={np.round(cmds.get('left', []), 0)} "
+                                f"R={np.round(cmds.get('right', []), 0)}"
+                            )
                     last_sent_motion_token = motion_token.copy()
                     if zmq_frame_counter % 50 == 0:
                         print_green(
@@ -937,6 +988,11 @@ def main(config: InferenceConfig):
     finally:
         inference_stop_event.set()
         inference_worker_thread.join(timeout=1.0)
+        if revo2_bridge is not None:
+            try:
+                revo2_bridge.close()
+            except Exception as e:
+                print(f"[revo2-bridge] close: {e}")
         zmq_socket.close()
         zmq_context.term()
         state_subscriber.close()

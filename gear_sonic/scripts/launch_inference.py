@@ -150,6 +150,16 @@ class InferenceLaunchConfig:
     rtc_ramp_rate: float = 5.0
     """Exponential ramp from the frozen prefix to the freely denoised tail."""
 
+    # Revo2 real hands
+    revo2_send: bool = False
+    """Stream predicted hand joints to Orin revo2_modbus_rx (UDP)."""
+
+    revo2_orin_host: str = "192.168.123.164"
+    """Orin IP for Revo2 UDP."""
+
+    revo2_udp_port: int = 19500
+    """Orin revo2_modbus_rx UDP port."""
+
     # Camera
     camera_host: str = "localhost"
     """Camera server host."""
@@ -419,6 +429,9 @@ def main(config: InferenceLaunchConfig):
         f"--rtc-ramp-rate {config.rtc_ramp_rate} "
         f"--camera-host {config.camera_host} "
         f"--camera-port {config.camera_port}"
+        f"{' --revo2-send' if config.revo2_send else ''}"
+        f" --revo2-orin-host {config.revo2_orin_host}"
+        f" --revo2-udp-port {config.revo2_udp_port}"
     )
 
     print("Starting VLA inference (pane 1)...")

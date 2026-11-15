@@ -273,6 +273,12 @@ VLA_PROPRIO_ARGS+=(
   --rtc-frozen-steps "${RTC_FROZEN_STEPS}"
   --rtc-ramp-rate "${RTC_RAMP_RATE}"
 )
+DUMP_HANDS_NPZ="${DUMP_HANDS_NPZ:-${WORK_DIR}/hands_pred.npz}"
+VLA_DUMP_ARGS=()
+if [[ -n "${DUMP_HANDS_NPZ}" ]]; then
+  VLA_DUMP_ARGS+=(--dump-hands-npz "${DUMP_HANDS_NPZ}")
+  log "will dump predicted hands → ${DUMP_HANDS_NPZ}"
+fi
 (
   cd "${LITCHI_ROOT}"
   PYTHONPATH="${LITCHI_ROOT}:${WBC_ROOT}:${PYTHONPATH:-}" \
@@ -290,7 +296,8 @@ VLA_PROPRIO_ARGS+=(
     --go-flag "${GO_FLAG}" \
     --ready-flag "${READY_FLAG}" \
     --gt-bootstrap-frames "${GT_BOOTSTRAP_FRAMES}" \
-    "${VLA_PROPRIO_ARGS[@]}"
+    "${VLA_PROPRIO_ARGS[@]}" \
+    "${VLA_DUMP_ARGS[@]}"
 ) > "${LOG_DIR}/vla.log" 2>&1 &
 PIDS+=($!)
 wait_log "${LOG_DIR}/vla.log" "bound tcp://" 600 "vla bind" || exit 1

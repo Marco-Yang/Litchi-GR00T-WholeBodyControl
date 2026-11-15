@@ -222,6 +222,15 @@ def main() -> None:
         help="With --gt-proprio-only: precompute + dump tokens, then exit (no ZMQ GO stream).",
     )
     ap.add_argument(
+        "--dump-hands-npz",
+        type=Path,
+        default=None,
+        help=(
+            "Save per-step published left/right hand joints (7D) + source flag "
+            "(0=GT bootstrap/fallback, 1=model pred) to this npz."
+        ),
+    )
+    ap.add_argument(
         "--closed-loop-sequential",
         action="store_true",
         help=(
@@ -696,6 +705,12 @@ def main() -> None:
     t_next = time.monotonic()
     last_infer = -1e9
     vla_started = False
+    dump_hands = args.dump_hands_npz is not None
+    hands_lh = np.zeros((max_steps, 7), dtype=np.float32) if dump_hands else None
+    hands_rh = np.zeros((max_steps, 7), dtype=np.float32) if dump_hands else None
+    hands_src = np.zeros((max_steps,), dtype=np.int8) if dump_hands else None  # 0=GT, 1=pred
+    pred_rh_max = 0.0
+    pred_steps = 0
 
     for step in range(max_steps):
         frame_i["i"] = min(step, n - 1)
@@ -711,6 +726,10 @@ def main() -> None:
                     gt_bq[min(gi, gt_bq.shape[0] - 1)],
                 )
             )
+            if dump_hands:
+                hands_lh[step] = gt_lh[gi]
+                hands_rh[step] = gt_rh[gi]
+                hands_src[step] = 0
             if step == 0 or (step + 1) == bootstrap_n or step % 25 == 0:
                 print(
                     f"[vla] GT bootstrap step={step}/{bootstrap_n} "
@@ -795,6 +814,10 @@ def main() -> None:
                         gt_bq[min(gi, gt_bq.shape[0] - 1)],
                     )
                 )
+                if dump_hands:
+                    hands_lh[step] = gt_lh[gi]
+                    hands_rh[step] = gt_rh[gi]
+                    hands_src[step] = 0
             else:
                 cur = min(int(chunk_idx["i"]), mt.shape[0] - 1)
                 lh_row = lh[cur] if lh is not None and lh.ndim == 2 else zero7
@@ -812,6 +835,20 @@ def main() -> None:
                         gt_bq[min(step, gt_bq.shape[0] - 1)],
                     )
                 )
+                if dump_hands:
+                    hands_lh[step] = np.asarray(lh_row, dtype=np.float32).reshape(7)
+                    hands_rh[step] = np.asarray(rh_row, dtype=np.float32).reshape(7)
+                    hands_src[step] = 1
+                    pred_steps += 1
+                    pred_rh_max = max(pred_rh_max, float(np.max(np.abs(hands_rh[step]))))
+                    if step % 50 == 0:
+                        print(
+                            f"[vla] hand-pred step={step} "
+                            f"Lmax={float(np.max(np.abs(hands_lh[step]))):.1f} "
+                            f"Rmax={float(np.max(np.abs(hands_rh[step]))):.1f} "
+                            f"R={np.round(hands_rh[step][:6], 1).tolist()}",
+                            flush=True,
+                        )
                 chunk_idx["i"] = min(int(chunk_idx["i"]) + 1, horizon - 1)
 
         t_next += period
@@ -822,6 +859,30 @@ def main() -> None:
             t_next = time.monotonic()
 
     stop.set()
+    if dump_hands:
+        out_h = Path(args.dump_hands_npz)
+        out_h.parent.mkdir(parents=True, exist_ok=True)
+        gt_rh_aligned = np.stack(
+            [gt_rh[min(i, gt_rh.shape[0] - 1)] for i in range(max_steps)], axis=0
+        ).astype(np.float32)
+        pred_mask = hands_src == 1
+        np.savez_compressed(
+            out_h,
+            left_hand=hands_lh,
+            right_hand=hands_rh,
+            source=hands_src,
+            gt_right_hand=gt_rh_aligned,
+            bootstrap_n=np.int32(bootstrap_n),
+            control_fps=np.float32(args.control_fps),
+        )
+        pred_rh = hands_rh[pred_mask] if pred_mask.any() else np.zeros((0, 7), dtype=np.float32)
+        print(
+            f"[vla] dumped hands → {out_h} steps={max_steps} pred_steps={int(pred_mask.sum())} "
+            f"pred_R max={float(pred_rh.max()) if pred_rh.size else 0:.1f} "
+            f"mean={float(pred_rh.mean()) if pred_rh.size else 0:.1f} "
+            f"gt_R max={float(gt_rh_aligned.max()):.1f}",
+            flush=True,
+        )
     print("[vla] done", flush=True)
 
 

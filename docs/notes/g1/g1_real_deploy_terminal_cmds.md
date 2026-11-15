@@ -7,13 +7,17 @@
 ```bash
 export REPO="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl"
 export DEPLOY="$REPO/gear_sonic_deploy"
-# VLA 最终导出（含 config.json / safetensors；同目录下另有 checkpoint-7376）
-export VLA_CKPT="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T/checkpoints/walk_towards_green_table_skill1_all_rtc_2cam_origin"
+# VLA 权重（PolicyServer 需要目录内有 config.json + safetensors）
+# skill1（旧，先注释）：
+# export VLA_CKPT="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T/checkpoints/walk_towards_green_table_skill1_all_rtc_2cam_origin"
+# export PROMPT="走到绿色桌子前"
+# skill2 pick_toy（checkpoint-49400）
+export VLA_CKPT="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T/checkpoints/skill2/checkpoint-49400"
 # PolicyServer 用的 Isaac-GR00T（经 $REPO/.deps/Isaac-GR00T 软链）
 export LITCHI_ROOT="$REPO/.deps/Isaac-GR00T"
 export CAMERA_HOST="192.168.123.164"    # G1 Orin 相机
 export POLICY_HOST="127.0.0.1"          # PolicyServer 本机
-export PROMPT="走到绿色桌子前"
+export PROMPT="侧平举抬起右手然后抓取前方绿色桌子上的黄色玩偶，抓起以后放进编织篮里"
 ```
 
 **策略包只用 `policy/sonic_v1_1`，禁止 `policy/release`。**  
@@ -114,7 +118,7 @@ python gear_sonic/scripts/pico_manager_thread_server.py \
 
 ---
 
-## C. 路线二：VLA 真机（origin RTC 权重）
+## C. 路线二：VLA 真机（skill2 pick_toy · origin RTC）
 
 架构：PolicyServer（GPU）+ 相机 ZMQ + C++ deploy + `run_vla_inference`。  
 **RTC 必须与训练一致：`overlap=28 frozen=5 ramp=3.0`，不要用脚本默认 16/8/5。**
@@ -124,11 +128,14 @@ python gear_sonic/scripts/pico_manager_thread_server.py \
 ```bash
 export REPO="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl"
 export DEPLOY="$REPO/gear_sonic_deploy"
-export VLA_CKPT="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T/checkpoints/walk_towards_green_table_skill1_all_rtc_2cam_origin"
+# skill1（旧）：
+# export VLA_CKPT="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T/checkpoints/walk_towards_green_table_skill1_all_rtc_2cam_origin"
+# export PROMPT="走到绿色桌子前"
+export VLA_CKPT="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T/checkpoints/skill2/checkpoint-49400"
 export LITCHI_ROOT="$REPO/.deps/Isaac-GR00T"
 export CAMERA_HOST="192.168.123.164"
 export POLICY_HOST="127.0.0.1"
-export PROMPT="走到绿色桌子前"
+export PROMPT="侧平举抬起右手然后抓取前方绿色桌子上的黄色玩偶，抓起以后放进编织篮里"
 ```
 
 权重自检：
@@ -166,7 +173,9 @@ python gear_sonic/scripts/run_camera_viewer.py --camera-host "$CAMERA_HOST"
 
 ```bash
 export REPO="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl"
-export VLA_CKPT="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T/checkpoints/walk_towards_green_table_skill1_all_rtc_2cam_origin"
+# skill1（旧）：
+# export VLA_CKPT="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T/checkpoints/walk_towards_green_table_skill1_all_rtc_2cam_origin"
+export VLA_CKPT="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T/checkpoints/skill2/checkpoint-49400"
 export LITCHI_ROOT="$REPO/.deps/Isaac-GR00T"
 # 本地已缓存的 Cosmos backbone（避免 HF_HUB_OFFLINE 下再打 huggingface.co）
 export HF_HOME="${HOME}/.cache/huggingface"
@@ -207,13 +216,43 @@ ip -4 -br addr | grep 192.168.123 || { echo 'MISSING G1 control iface'; exit 1; 
 # y → Init Done
 ```
 
+### C3.5 终端 — Revo2 真手接收端（Orin，**VLA 要动手必开**）
+
+> **仿真 validates 视频里手能动 ≠ 真机已接好手。**  
+> MuJoCo 闭环：模型 `hand_joints` → ZMQ → C++ → **仿真里的 Revo2 关节**（本机 `lo`）。  
+> 真机：同一套 `hand_joints` **不会**经 C++ 驱动强脑；必须再走 **UDP → Orin `revo2_modbus_rx` → USB485**。  
+> 缺本终端或 C4 未加 `--revo2-send` 时：身体可动、真手一直张着。数采里 exporter 的 `--revo2-send` 同理。
+
+**工作站**上执行（脚本会 ssh 到 Orin、停冲突的 `brainco_hand.service`、绑 ch343、起 RX）：
+
+```bash
+cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Manus
+bash scripts/start_orin_revo2_rx.sh
+# 预期末尾：
+#   [revo2-mb] left OK ... right OK ...
+#   [rx] listening UDP :19500 → Modbus ...
+#   [orin] receiver ready — publish UDP to 192.168.123.164:19500
+```
+
+另开窗口盯 Orin 日志（可选）：
+
+```bash
+ssh unitree@192.168.123.164 'tail -f /tmp/revo2_modbus_rx.log'
+# 推理跑起来后应周期性出现：
+#   [rx] from <工作站IP> L=[...] R=[...]
+# 抓取段右手数值应到几百～1000；若长期只有 0～几，说明还没进抓取或 C4 没在发
+```
+
+不要并行再开 `run_real_revo2_pico.sh` / 其它往 `:19500` 发指令的脚本（会抢包）。
+
 ### C4. 终端 — VLA inference client
 
 ```bash
 export REPO="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl"
 export CAMERA_HOST="192.168.123.164"
 export POLICY_HOST="127.0.0.1"
-export PROMPT="走到绿色桌子前"
+# skill1（旧）：export PROMPT="走到绿色桌子前"
+export PROMPT="侧平举抬起右手然后抓取前方绿色桌子上的黄色玩偶，抓起以后放进编织篮里"
 
 cd "$REPO"
 source .venv_inference/bin/activate
@@ -234,11 +273,15 @@ python gear_sonic/scripts/run_vla_inference.py \
   --state-zmq-host 127.0.0.1 \
   --state-zmq-port 5557 \
   --action-zmq-host 127.0.0.1 \
-  --action-zmq-port 5556
+  --action-zmq-port 5556 \
+  --revo2-send \
+  --revo2-orin-host 192.168.123.164 \
+  --revo2-udp-port 19500
 ```
 
 > `state`/`action` ZMQ 默认与本机 C++ deploy 同机；若拆机，改成 deploy 机 IP。  
-> C4 默认 **暂停**（`Pausing...`）；必须另开 **C5 键盘发布端**，按 `k` → `i` → `p` 才会动。
+> C4 默认 **暂停**（`Pausing...`）；必须另开 **C5 键盘发布端**，按 `k` → `i` → `p` 才会动。  
+> **Revo2：** 必须先有 **C3.5** `receiver ready`，本命令保留 `--revo2-send`。启动后 C4 应出现 `Revo2 hand bridge on`，约每秒 `Revo2 UDP: L=[...] R=[...]`（抓取段右手应到几百～1000；接近阶段只有个位数是正常的）。暂停 / `i` / 退出会发张开。
 
 ### C5. 终端 — 键盘发布（VLA 真机必开）
 
@@ -297,7 +340,8 @@ C4 预期日志：
 export REPO="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl"
 export CAMERA_HOST="192.168.123.164"
 export POLICY_HOST="127.0.0.1"
-export PROMPT="走到绿色桌子前"
+# skill1（旧）：export PROMPT="走到绿色桌子前"
+export PROMPT="侧平举抬起右手然后抓取前方绿色桌子上的黄色玩偶，抓起以后放进编织篮里"
 
 cd "$REPO"
 source .venv_inference/bin/activate
@@ -314,7 +358,9 @@ python gear_sonic/scripts/launch_inference.py \
   --rtc \
   --rtc-overlap-steps 28 \
   --rtc-frozen-steps 5 \
-  --rtc-ramp-rate 3.0
+  --rtc-ramp-rate 3.0 \
+  --revo2-send \
+  --revo2-orin-host 192.168.123.164
 ```
 
 （若 launcher 未暴露某 RTC 旗标，改用 C4 手写 `run_vla_inference.py` + C5 键盘。）
@@ -322,9 +368,21 @@ python gear_sonic/scripts/launch_inference.py \
 ### C7. 启动顺序与注意
 
 1. 插好 G1 控制网线，确认本机 `192.168.123.x`，`ping 192.168.123.164` / `161`  
-2. **C1** 相机 → **C2** PolicyServer → **C3** deploy（Init Done）→ **C4** inference → **C5** 键盘 → 输入 `k` `i` `p`  
-3. 仿真（`validates` / `run_sim_*`）与真机 **不同时** 开  
-4. 本文件只覆盖身体 VLA；若还要控 Revo2 真手，另开 Orin `revo2_modbus_rx`（见 [`pico_real_data_collection.md`](pico_real_data_collection.md) §9）
+2. **C1** 相机 → **C2** PolicyServer → **C3** deploy（Init Done）  
+3. **C3.5** Revo2 RX（`start_orin_revo2_rx.sh`，须见 `receiver ready`）  
+4. **C4** inference（必须 `--revo2-send`）→ **C5** 键盘 → `k` `i` `p`  
+5. 仿真（`validates` / `run_sim_*`）与真机 **不同时** 开  
+6. 身体：ZMQ → C++；真手：UDP `:19500` → Orin Modbus（[`pico_real_data_collection.md`](pico_real_data_collection.md) §9）  
+
+**为何 validates 视频有抓握、真机却不动手？**
+
+| | MuJoCo 闭环验证 | 真机 |
+|--|----------------|------|
+| 手下发 | ZMQ `hand_joints` → C++ → **仿真手指** | 须 **C3.5 + C4 `--revo2-send`** → Orin |
+| 缺 RX / 无 `--revo2-send` | 不影响仿真手 | 真手永远不收包 |
+| 数值 | 抓取段可达 ~1000 | 接近段常为个位数（死区内像“没动”）；进抓取后应变大 |
+
+真机核对：C4 有 `Revo2 hand bridge on` + `Revo2 UDP: R=[几百…]`；Orin `tail -f /tmp/revo2_modbus_rx.log` 有 `[rx] from ...`。
 
 ---
 
@@ -346,9 +404,10 @@ pkill -INT -x g1_deploy_onnx_ref || pkill -TERM -x g1_deploy_onnx_ref
 | 目的 | 最小终端 |
 |------|----------|
 | 仅遥操 | B1 deploy + B2 pico |
-| VLA | C1 相机 + C2 server + C3 deploy + C4 inference + **C5 键盘**（`k`→`i`→`p`） |
+| VLA | C1 相机 + C2 server + C3 deploy + **C3.5 RX** + C4（`--revo2-send`）+ **C5 键盘**（`k`→`i`→`p`） |
+| Revo2 手 | **C3.5** `bash scripts/start_orin_revo2_rx.sh`（Manus 目录）+ C4 `--revo2-send` → UDP `:19500` |
 | 策略包 | `policy/sonic_v1_1` only（`--cp policy/sonic_v1_1/model` 前缀） |
-| VLA 权重 | `$VLA_CKPT` → `…/Deploy/Gr00T/checkpoints/walk_towards_green_table_skill1_all_rtc_2cam_origin` |
+| VLA 权重 | `$VLA_CKPT` → `…/Deploy/Gr00T/checkpoints/skill2/checkpoint-49400`（skill1 已注释） |
 | PolicyServer | `$LITCHI_ROOT` → `$REPO/.deps/Isaac-GR00T` + `.venv_inference` |
 | origin RTC | `--rtc-overlap-steps 28 --rtc-frozen-steps 5 --rtc-ramp-rate 3.0` |
 | 键盘口 | `tcp://localhost:5580`；`k` 启停，`i` 臂安全就绪，`p` 跑/停策略 |
