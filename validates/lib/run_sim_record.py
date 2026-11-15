@@ -36,6 +36,9 @@ class RecordConfig(SimLoopConfig):
     # GT RSI npz: keys reference_root_xyz / reference_root_quat_wxyz / observation_qpos(body29)
     gt_rsi_npz: str = ""
     standing_root_z: float = 0.793
+    # Dataset motion_token (T,64) for under-hand HUD: token L2 / GT / pred / frame i/N.
+    # Also accepted via env GT_TOKENS_NPZ. Optional HUD_TOTAL_FRAMES overrides denominator.
+    gt_tokens_npz: str = ""
 
 
 def _load_gt_rsi_npz(npz_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -115,6 +118,7 @@ def main(config: RecordConfig) -> None:
         )
 
     if config.record_mp4:
+        gt_tok = (config.gt_tokens_npz or os.environ.get("GT_TOKENS_NPZ", "")).strip()
         rec = SimMp4Recorder(
             sim_env.mj_model,
             Path(config.record_mp4),
@@ -129,6 +133,7 @@ def main(config: RecordConfig) -> None:
             draw_g1_debug_markers=True,
             draw_g1_debug_hud=True,
             camera_host=None,
+            gt_tokens_npz=gt_tok or None,
             # Re-apply standing snap + ensure band stays off when recording starts.
             snap_on_record_start=True,
             keep_elastic_band=False,

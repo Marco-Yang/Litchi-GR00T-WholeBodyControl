@@ -312,17 +312,36 @@ def _composite_top_gt_panel(
     return np.vstack([top, main_bgr])
 
 
+def _fmt_token_preview(tok: np.ndarray | None, n: int = 4) -> str:
+    if tok is None:
+        return "n/a"
+    vals = np.asarray(tok, dtype=np.float64).reshape(-1)
+    if vals.size == 0:
+        return "[]"
+    take = min(int(n), int(vals.size))
+    return "[" + ", ".join(f"{v:+.3f}" for v in vals[:take]) + "]"
+
+
 def _draw_g1_debug_hud(
     frame_bgr: np.ndarray,
     debug_msg: dict | None,
     *,
     latent_mse: float | None = None,
     gt_frame_idx: int | None = None,
+    token_l2: float | None = None,
+    pred_token: np.ndarray | None = None,
+    gt_token: np.ndarray | None = None,
+    frame_i: int | None = None,
+    frame_n: int | None = None,
 ) -> None:
-    if debug_msg is None and latent_mse is None:
+    """Draw SONIC/hand HUD; token L2 + GT/pred + frame i/N sit under L/R hand sim."""
+    has_token_hud = token_l2 is not None or pred_token is not None or gt_token is not None
+    has_frame_hud = frame_i is not None
+    if debug_msg is None and latent_mse is None and not has_token_hud and not has_frame_hud:
         return
     y = 24
-    if latent_mse is not None:
+    # Prefer under-hand token L2 HUD; keep top latent MSE only as fallback.
+    if latent_mse is not None and not has_token_hud:
         cv2.putText(
             frame_bgr,
             f"latent MSE={latent_mse:.4f}"
@@ -335,90 +354,144 @@ def _draw_g1_debug_hud(
             cv2.LINE_AA,
         )
         y += 26
-    if debug_msg is None:
-        return
-    token = debug_msg.get("token_state")
-    if token is not None:
-        token = np.asarray(token, dtype=np.float64).reshape(-1)
-        if token.size > 0:
-            cv2.putText(
-                frame_bgr,
-                f"SONIC token dim={token.size} [0]={token[0]:+.3f}",
-                (8, y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (40, 255, 40),
-                2,
-                cv2.LINE_AA,
-            )
-            y += 22
-            if token.size >= 4:
+    if debug_msg is not None:
+        token = debug_msg.get("token_state")
+        if token is not None:
+            token = np.asarray(token, dtype=np.float64).reshape(-1)
+            if token.size > 0:
                 cv2.putText(
                     frame_bgr,
-                    f"  [1:4]=[{token[1]:+.2f}, {token[2]:+.2f}, {token[3]:+.2f}]",
+                    f"SONIC token dim={token.size} [0]={token[0]:+.3f}",
                     (8, y),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
+                    0.55,
                     (40, 255, 40),
-                    1,
+                    2,
                     cv2.LINE_AA,
                 )
                 y += 22
-    if "base_trans_target" in debug_msg:
-        root = np.asarray(debug_msg["base_trans_target"], dtype=np.float64).reshape(-1)[:3]
+                if token.size >= 4:
+                    cv2.putText(
+                        frame_bgr,
+                        f"  [1:4]=[{token[1]:+.2f}, {token[2]:+.2f}, {token[3]:+.2f}]",
+                        (8, y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (40, 255, 40),
+                        1,
+                        cv2.LINE_AA,
+                    )
+                    y += 22
+        if "base_trans_target" in debug_msg:
+            root = np.asarray(debug_msg["base_trans_target"], dtype=np.float64).reshape(-1)[:3]
+            cv2.putText(
+                frame_bgr,
+                f"SONIC target root z={root[2]:.3f} xy=({root[0]:.2f},{root[1]:.2f})",
+                (8, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 220, 80),
+                1,
+                cv2.LINE_AA,
+            )
+            y += 22
+        for key, label in (
+            ("last_left_hand_action", "L gripper cmd"),
+            ("last_right_hand_action", "R gripper cmd"),
+        ):
+            if key not in debug_msg:
+                continue
+            vals = np.asarray(debug_msg[key], dtype=np.float64).reshape(-1)
+            if vals.size == 0:
+                continue
+            preview = ", ".join(f"{v:+.2f}" for v in vals[:3])
+            cv2.putText(
+                frame_bgr,
+                f"{label} [0:3]=[{preview}] max={np.max(np.abs(vals)):.3f}",
+                (8, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (120, 200, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            y += 20
+        for key, label in (
+            ("left_hand_q", "L hand sim"),
+            ("right_hand_q", "R hand sim"),
+        ):
+            if key not in debug_msg:
+                continue
+            vals = np.asarray(debug_msg[key], dtype=np.float64).reshape(-1)
+            if vals.size == 0:
+                continue
+            preview = ", ".join(f"{v:+.2f}" for v in vals[:3])
+            cv2.putText(
+                frame_bgr,
+                f"{label} [0:3]=[{preview}] max={np.max(np.abs(vals)):.3f}",
+                (8, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (180, 180, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            y += 20
+
+    # Under L/R hand sim: dump-comparable token L2 + GT/pred + frame i/N.
+    if has_token_hud:
+        l2_txt = f"{token_l2:.4f}" if token_l2 is not None else "n/a"
         cv2.putText(
             frame_bgr,
-            f"SONIC target root z={root[2]:.3f} xy=({root[0]:.2f},{root[1]:.2f})",
-            (8, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 220, 80),
-            1,
-            cv2.LINE_AA,
-        )
-        y += 22
-    for key, label in (
-        ("last_left_hand_action", "L gripper cmd"),
-        ("last_right_hand_action", "R gripper cmd"),
-    ):
-        if key not in debug_msg:
-            continue
-        vals = np.asarray(debug_msg[key], dtype=np.float64).reshape(-1)
-        if vals.size == 0:
-            continue
-        preview = ", ".join(f"{v:+.2f}" for v in vals[:3])
-        cv2.putText(
-            frame_bgr,
-            f"{label} [0:3]=[{preview}] max={np.max(np.abs(vals)):.3f}",
+            f"token L2={l2_txt}  (pred vs dataset GT)",
             (8, y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.48,
-            (120, 200, 255),
+            (0, 220, 255),
             1,
             cv2.LINE_AA,
         )
-        y += 20
-    for key, label in (
-        ("left_hand_q", "L hand sim"),
-        ("right_hand_q", "R hand sim"),
-    ):
-        if key not in debug_msg:
-            continue
-        vals = np.asarray(debug_msg[key], dtype=np.float64).reshape(-1)
-        if vals.size == 0:
-            continue
-        preview = ", ".join(f"{v:+.2f}" for v in vals[:3])
+        y += 18
         cv2.putText(
             frame_bgr,
-            f"{label} [0:3]=[{preview}] max={np.max(np.abs(vals)):.3f}",
+            f"GT  [0:4]={_fmt_token_preview(gt_token)}",
             (8, y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (180, 180, 255),
+            0.42,
+            (200, 255, 200),
             1,
             cv2.LINE_AA,
         )
-        y += 20
+        y += 16
+        cv2.putText(
+            frame_bgr,
+            f"pred[0:4]={_fmt_token_preview(pred_token)}",
+            (8, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (200, 255, 200),
+            1,
+            cv2.LINE_AA,
+        )
+        y += 18
+    if has_frame_hud:
+        fi_show = int(frame_i)
+        if frame_n is not None and int(frame_n) > 0:
+            # Clamp display to episode length (record tail / stalled ZMQ can overshoot).
+            fi_show = min(max(fi_show, 0), int(frame_n) - 1)
+            frame_txt = f"frame {fi_show + 1}/{int(frame_n)}"
+        else:
+            frame_txt = f"frame {fi_show + 1}"
+        cv2.putText(
+            frame_bgr,
+            frame_txt,
+            (8, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (255, 255, 180),
+            1,
+            cv2.LINE_AA,
+        )
 
 
 def current_pose_frame(message: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -593,16 +666,31 @@ class SimMp4Recorder:
         self._wrist_gt_video = Path(wrist_gt_video) if wrist_gt_video else None
         self._gt_panel_layout = gt_panel_layout
         self._gt_tokens = None
-        if gt_tokens_npz:
+        self._hud_total_frames: int | None = None
+        _gt_path = gt_tokens_npz or os.environ.get("GT_TOKENS_NPZ", "").strip() or None
+        if _gt_path:
             import numpy as _np
 
-            _path = Path(gt_tokens_npz)
+            _path = Path(_gt_path)
             _data = _np.load(_path)
-            _tok = _data["tokens"] if "tokens" in _data.files else _data[_data.files[0]]
+            # Prefer dataset GT key from dump-only npz; else plain tokens array.
+            if "gt_tokens" in _data.files:
+                _tok = _data["gt_tokens"]
+            elif "tokens" in _data.files:
+                _tok = _data["tokens"]
+            else:
+                _tok = _data[_data.files[0]]
             self._gt_tokens = _np.asarray(_tok, dtype=_np.float32)
             if self._gt_tokens.ndim != 2 or self._gt_tokens.shape[1] != 64:
                 raise ValueError(f"gt_tokens_npz expect (T,64), got {self._gt_tokens.shape}")
-            print(f"[sim_record] GT tokens for latent MSE HUD: {_path} T={self._gt_tokens.shape[0]}")
+            self._hud_total_frames = int(self._gt_tokens.shape[0])
+            print(
+                f"[sim_record] GT tokens for HUD L2: {_path} T={self._gt_tokens.shape[0]}",
+                flush=True,
+            )
+        _tf = os.environ.get("HUD_TOTAL_FRAMES", "").strip()
+        if _tf:
+            self._hud_total_frames = int(_tf)
         # ponytail: top layout reserves panel height only when GT video sources exist;
         # otherwise VideoWriter (H+panel) vs render (H) mismatch yields empty mp4.
         has_gt_panel = bool(ego_gt_video or wrist_gt_video)
@@ -1239,6 +1327,17 @@ class SimMp4Recorder:
         if self._gt_panel_layout == "top" and gt_panels:
             bgr = _composite_top_gt_panel(bgr, gt_panels, panel_h=self._top_panel_h)
         latent_mse = None
+        token_l2 = None
+        pred_token = None
+        gt_token = None
+        # Control-clock frame for HUD (ZMQ frame_index); falls back to record counter.
+        hud_fi = None
+        if self._latest_pose is not None and "frame_index" in self._latest_pose:
+            hud_fi = int(self._ego_frame_index)
+        elif gt_idx is not None and int(gt_idx) >= 0:
+            hud_fi = int(gt_idx)
+        else:
+            hud_fi = max(0, int(self._frames))
         if getattr(self, "_gt_tokens", None) is not None:
             # Prefer commanded pose ZMQ token (always present on v4); g1_debug may omit it.
             tok = None
@@ -1248,16 +1347,27 @@ class SimMp4Recorder:
                 tok = self._latest_g1_debug.get("token_state")
             if tok is not None:
                 tok = np.asarray(tok, dtype=np.float64).reshape(-1)
-                gi = int(gt_idx) if gt_idx is not None and int(gt_idx) >= 0 else -1
+                gi = int(hud_fi) if hud_fi is not None else -1
                 if tok.size >= 64 and 0 <= gi < len(self._gt_tokens):
                     gt = self._gt_tokens[gi].astype(np.float64)
-                    latent_mse = float(np.mean((tok[:64] - gt) ** 2))
+                    pred = tok[:64]
+                    pred_token = pred
+                    gt_token = gt
+                    # Same metric as dump-only OL: L2 over 64-d motion_token.
+                    token_l2 = float(np.linalg.norm(pred - gt))
+                    latent_mse = float(np.mean((pred - gt) ** 2))
+        hud_n = getattr(self, "_hud_total_frames", None)
         if self._draw_g1_debug_hud:
             _draw_g1_debug_hud(
                 bgr,
                 self._latest_g1_debug,
                 latent_mse=latent_mse,
                 gt_frame_idx=int(gt_idx) if gt_idx is not None else None,
+                token_l2=token_l2,
+                pred_token=pred_token,
+                gt_token=gt_token,
+                frame_i=hud_fi,
+                frame_n=hud_n,
             )
         self._writer.write(bgr)
         self._frames += 1

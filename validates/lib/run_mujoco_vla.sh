@@ -193,6 +193,23 @@ np.savez("${GT_RSI_NPZ}",
 print(f"wrote ${GT_RSI_NPZ} L_elbow={body[18]:.3f} R_elbow={body[25]:.3f}")
 PY
 
+# Dataset GT motion_token for under-hand HUD (token L2 / GT / pred / frame i/N).
+GT_TOKENS_NPZ="${GT_TOKENS_NPZ:-${WORK_DIR}/gt_motion_tokens_ep$(printf '%03d' "${EP}").npz}"
+log "build GT motion_token npz → ${GT_TOKENS_NPZ}"
+"${PY}" - <<PY
+import numpy as np, pyarrow.parquet as pq
+from pathlib import Path
+root = Path("${DS}")
+ep = f"{int('${EP}'):06d}"
+table = pq.read_table(root / "data/chunk-000" / f"episode_{ep}.parquet", columns=["action.motion_token"])
+tok = np.stack(table.column("action.motion_token").to_pylist()).astype(np.float32)
+assert tok.ndim == 2 and tok.shape[1] == 64, tok.shape
+np.savez("${GT_TOKENS_NPZ}", gt_tokens=tok, tokens=tok)
+print(f"wrote ${GT_TOKENS_NPZ} shape={tok.shape}")
+PY
+export GT_TOKENS_NPZ
+export HUD_TOTAL_FRAMES="${HUD_TOTAL_FRAMES:-$( "${PY}" -c "import numpy as np; print(int(np.load('${GT_TOKENS_NPZ}')['gt_tokens'].shape[0]))" )}"
+
 log "start WBC sim (ground walk, no elastic band, GT RSI)..."
 (
   cd "${WBC_ROOT}"
@@ -210,6 +227,7 @@ log "start WBC sim (ground walk, no elastic band, GT RSI)..."
     --disable-elastic-band \
     --disable-fall-reset \
     --gt-rsi-npz "${GT_RSI_NPZ}" \
+    --gt-tokens-npz "${GT_TOKENS_NPZ}" \
     --standing-root-z 0.793 \
     --record-mp4 "${OUT_MP4}" \
     --record-start-flag "${RECORD_START}" \
@@ -278,6 +296,9 @@ VLA_DUMP_ARGS=()
 if [[ -n "${DUMP_HANDS_NPZ}" ]]; then
   VLA_DUMP_ARGS+=(--dump-hands-npz "${DUMP_HANDS_NPZ}")
   log "will dump predicted hands → ${DUMP_HANDS_NPZ}"
+fi
+if [[ -n "${DUMP_CL_PROPRIO_NPZ:-}" ]]; then
+  VLA_PROPRIO_ARGS+=(--dump-cl-proprio-npz "${DUMP_CL_PROPRIO_NPZ}")
 fi
 (
   cd "${LITCHI_ROOT}"

@@ -16,7 +16,11 @@ RECORD_TAIL_SLEEP_S="${RECORD_TAIL_SLEEP_S:-2}"
 RECORD_FPS="${RECORD_FPS:-50}"
 DEPLOY_CUDA="${DEPLOY_CUDA_VISIBLE_DEVICES:-1}"
 # DDS: lo drops LowState here; eth1 + forced ENV_TYPE=sim (in run_sim_record).
-NET_IFACE="${NET_IFACE:-eth1}"
+# MuJoCo validates MUST use loopback — never default to eth1 (real G1 risk).
+NET_IFACE="${NET_IFACE:-lo}"
+if [[ "${NET_IFACE}" == "enp11s0" || "${NET_IFACE}" == "eth0" || "${NET_IFACE}" == "eth1" ]]; then
+  echo "WARNING: NET_IFACE=${NET_IFACE} is a robot/control NIC — real G1 may receive LowCmd" >&2
+fi
 
 # Episode wall-time from parquet length (control fps), unless MOTION_SECONDS set.
 if [[ -z "${MOTION_SECONDS:-}" ]]; then
@@ -125,18 +129,41 @@ np.savez("${GT_RSI_NPZ}",
 print(f"wrote ${GT_RSI_NPZ} L_elbow={body[18]:.3f} R_elbow={body[25]:.3f}")
 PY
 
+# Dataset GT motion_token for under-hand HUD (token L2 / GT / pred / frame i/N).
+GT_TOKENS_NPZ="${GT_TOKENS_NPZ:-${WORK_DIR}/gt_motion_tokens_ep$(printf '%03d' "${EP}").npz}"
+log "build GT motion_token npz → ${GT_TOKENS_NPZ}"
+"${PY}" - <<PY
+import numpy as np, pyarrow.parquet as pq
+from pathlib import Path
+root = Path("${DS}")
+ep = f"{int('${EP}'):06d}"
+table = pq.read_table(root / "data/chunk-000" / f"episode_{ep}.parquet", columns=["action.motion_token"])
+tok = np.stack(table.column("action.motion_token").to_pylist()).astype(np.float32)
+assert tok.ndim == 2 and tok.shape[1] == 64, tok.shape
+np.savez("${GT_TOKENS_NPZ}", gt_tokens=tok, tokens=tok)
+print(f"wrote ${GT_TOKENS_NPZ} shape={tok.shape}")
+PY
+export GT_TOKENS_NPZ
+export HUD_TOTAL_FRAMES="${HUD_TOTAL_FRAMES:-$( "${PY}" -c "import numpy as np; print(int(np.load('${GT_TOKENS_NPZ}')['gt_tokens'].shape[0]))" )}"
+
 # 1) Sim
 log "start WBC sim (revo2, ground, GT RSI, NET_IFACE=${NET_IFACE})..."
 (
   cd "${WBC_ROOT}"
+  REVO2_SCENE="${REVO2_SCENE:-${VALIDATE_ROOT}/assets/scene_43dof_revo2_vizclean.xml}"
+  if [[ ! -f "${REVO2_SCENE}" ]]; then
+    REVO2_SCENE="${DEPLOY}/g1/scene_43dof_revo2.xml"
+  fi
   "${SIM_PY}" -u "${VALIDATE_LIB}/run_sim_record.py" \
     --interface "${NET_IFACE}" \
     --no-enable-onscreen \
     --enable-offscreen \
     --revo2-hand \
+    --revo2-scene "${REVO2_SCENE}" \
     --disable-elastic-band \
     --disable-fall-reset \
     --gt-rsi-npz "${GT_RSI_NPZ}" \
+    --gt-tokens-npz "${GT_TOKENS_NPZ}" \
     --standing-root-z 0.793 \
     --record-mp4 "${OUT_MP4}" \
     --record-start-flag "${RECORD_START}" \
@@ -235,7 +262,8 @@ if [[ -n "${local_dis}" && -n "${local_en}" && "${local_dis}" -gt "${local_en}" 
   printf '\n' >&3
   sleep 1
 fi
-wait_log "${LOG_DIR}/sim.log" "deploy lowcmd active" 15 "lowcmd" || true
+# Match VLA validates: wait for deploy streaming loop (not a nonexistent sim "lowcmd" string).
+wait_log "${LOG_DIR}/deploy.log" "Streaming data mean delay" 45 "deploy streaming loop" || true
 local_en=$(grep -n "ZMQ STREAMING MODE: ENABLED" "${LOG_DIR}/deploy.log" | tail -1 | cut -d: -f1)
 local_dis=$(grep -n "ZMQ STREAMING MODE: DISABLED" "${LOG_DIR}/deploy.log" | tail -1 | cut -d: -f1 || true)
 if [[ -n "${local_dis}" && -n "${local_en}" && "${local_dis}" -gt "${local_en}" ]]; then
@@ -274,7 +302,11 @@ xs=[float(r.get("sim_x", r.get("x", 0))) for r in rows]
 ys=[float(r.get("sim_y", r.get("y", 0))) for r in rows]
 zs=[float(r.get("sim_z", r.get("z", 0))) for r in rows]
 span=math.hypot(max(xs)-min(xs), max(ys)-min(ys)) if xs else 0.0
+zmin=min(zs) if zs else float('nan')
 print(f"[root_track] n={len(rows)} xy_span={span:.3f} z=[{min(zs):.3f},{max(zs):.3f}]" if zs else "empty")
+# GT token decode must stay upright; z collapse ⇒ DDS/control failure (do not deliver).
+if zs and zmin < 0.45:
+    raise SystemExit(f"ERROR: robot fell during GT token decode (z_min={zmin:.3f})")
 PY
 fi
 # grab a mid frame for elbow visual check

@@ -231,6 +231,15 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--dump-cl-proprio-npz",
+        type=Path,
+        default=None,
+        help=(
+            "Closed-loop only: each control step, record sim hand_q / body snippet vs "
+            "dataset observation.state hands at the same frame index."
+        ),
+    )
+    ap.add_argument(
         "--closed-loop-sequential",
         action="store_true",
         help=(
@@ -672,6 +681,20 @@ def main() -> None:
     stop = threading.Event()
     frame_i = {"i": 0}
     chunk_idx = {"i": 0}
+    proprio_dump: dict[str, list] | None = None
+    if args.dump_cl_proprio_npz is not None:
+        proprio_dump = {
+            "step": [],
+            "fi": [],
+            "sim_lh": [],
+            "sim_rh": [],
+            "ds_lh": [],
+            "ds_rh": [],
+            "sim_body29": [],
+            "ds_body29": [],
+            "has_msg": [],
+        }
+        print(f"[vla] will dump CL proprio → {args.dump_cl_proprio_npz}", flush=True)
 
     def infer_once() -> None:
         fi = frame_i["i"]
@@ -714,6 +737,33 @@ def main() -> None:
 
     for step in range(max_steps):
         frame_i["i"] = min(step, n - 1)
+        if proprio_dump is not None:
+            fi_d = int(frame_i["i"])
+            msg_d = state_sub.get()
+            st_d = state43[min(fi_d, state43.shape[0] - 1)]
+            proprio_dump["step"].append(step)
+            proprio_dump["fi"].append(fi_d)
+            proprio_dump["ds_lh"].append(st_d[22:29].copy())
+            proprio_dump["ds_rh"].append(st_d[36:43].copy())
+            # dataset body order: legs12 + waist3 + Larm7 + Lhand7 + Rarm7 + Rhand7
+            # compare arms+waist+legs without hands as 29-dof body proxy
+            ds_body = np.concatenate(
+                [st_d[0:22], st_d[29:36]], axis=0
+            ).astype(np.float32)
+            proprio_dump["ds_body29"].append(ds_body)
+            if msg_d is None:
+                proprio_dump["has_msg"].append(0)
+                proprio_dump["sim_lh"].append(np.zeros(7, np.float32))
+                proprio_dump["sim_rh"].append(np.zeros(7, np.float32))
+                proprio_dump["sim_body29"].append(np.zeros(29, np.float32))
+            else:
+                proprio_dump["has_msg"].append(1)
+                proprio_dump["sim_lh"].append(hand7(msg_d, "left_hand_q"))
+                proprio_dump["sim_rh"].append(hand7(msg_d, "right_hand_q"))
+                body = np.asarray(msg_d.get("body_q", np.zeros(29)), dtype=np.float32).reshape(-1)
+                if body.size < 29:
+                    body = np.pad(body, (0, 29 - body.size))
+                proprio_dump["sim_body29"].append(body[:29].copy())
 
         if step < bootstrap_n:
             gi = min(step, gt_tokens.shape[0] - 1)
@@ -881,6 +931,27 @@ def main() -> None:
             f"pred_R max={float(pred_rh.max()) if pred_rh.size else 0:.1f} "
             f"mean={float(pred_rh.mean()) if pred_rh.size else 0:.1f} "
             f"gt_R max={float(gt_rh_aligned.max()):.1f}",
+            flush=True,
+        )
+    if proprio_dump is not None and args.dump_cl_proprio_npz is not None:
+        out_p = Path(args.dump_cl_proprio_npz)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            out_p,
+            step=np.asarray(proprio_dump["step"], dtype=np.int32),
+            fi=np.asarray(proprio_dump["fi"], dtype=np.int32),
+            has_msg=np.asarray(proprio_dump["has_msg"], dtype=np.int32),
+            sim_lh=np.stack(proprio_dump["sim_lh"]).astype(np.float32),
+            sim_rh=np.stack(proprio_dump["sim_rh"]).astype(np.float32),
+            ds_lh=np.stack(proprio_dump["ds_lh"]).astype(np.float32),
+            ds_rh=np.stack(proprio_dump["ds_rh"]).astype(np.float32),
+            sim_body29=np.stack(proprio_dump["sim_body29"]).astype(np.float32),
+            ds_body29=np.stack(proprio_dump["ds_body29"]).astype(np.float32),
+        )
+        n_msg = int(np.asarray(proprio_dump["has_msg"]).sum())
+        print(
+            f"[vla] dumped CL proprio → {out_p} steps={len(proprio_dump['step'])} "
+            f"has_msg={n_msg}",
             flush=True,
         )
     print("[vla] done", flush=True)
