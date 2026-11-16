@@ -44,6 +44,17 @@ PY
     fi
   fi
 fi
+
+# Stock Isaac-GR00T Gr00tPolicy ignores RTC options → hard chunk cuts / stutter.
+# Deploy/Gr00T carries the RTC-capable policy (caches prev action + forwards options).
+_RTC_POLICY_SRC="${WBC_ROOT}/../Gr00T/gr00t/policy/gr00t_policy.py"
+_RTC_POLICY_DST="${LITCHI_ROOT}/gr00t/policy/gr00t_policy.py"
+if [[ -f "${_RTC_POLICY_SRC}" && -f "${_RTC_POLICY_DST}" ]]; then
+  if ! grep -q '_attach_rtc_action' "${_RTC_POLICY_DST}" 2>/dev/null; then
+    cp -f "${_RTC_POLICY_SRC}" "${_RTC_POLICY_DST}"
+    echo "[validates] synced RTC Gr00tPolicy → ${_RTC_POLICY_DST}"
+  fi
+fi
 # site-packages next to PY (conda or venv)
 _PY_PREFIX="$(cd "$(dirname "${PY}")/.." && pwd)"
 if [[ -d "${_PY_PREFIX}/lib/python3.12/site-packages" ]]; then
@@ -111,10 +122,16 @@ mkdir -p "${VALIDATE_VIDEOS}" "${VALIDATE_RUNS}"
 
 burn_label_h264() {
   # burn_label_h264 <in.mp4> <label> [out_h264.mp4]
+  # Optional env LABEL_BOTTOM_MARGIN lifts the tag above a dual-cam strip.
   local src="${1:?}"
   local label="${2:?}"
   local dst="${3:-${VALIDATE_VIDEOS}/$(basename "${src%.mp4}")_h264.mp4}"
-  "${PY}" -u "${VALIDATE_LIB}/burn_bottom_label.py" \
-    --in "${src}" --label "${label}" --out "${dst}" --ffmpeg "${FFMPEG_BIN}"
+  local burn_py="${SIM_PY}"
+  if ! "${burn_py}" -c "import cv2" >/dev/null 2>&1; then
+    burn_py="${PY}"
+  fi
+  "${burn_py}" -u "${VALIDATE_LIB}/burn_bottom_label.py" \
+    --in "${src}" --label "${label}" --out "${dst}" --ffmpeg "${FFMPEG_BIN}" \
+    --bottom-margin "${LABEL_BOTTOM_MARGIN:-0}"
   echo "[validates] labeled h264 → ${dst}"
 }

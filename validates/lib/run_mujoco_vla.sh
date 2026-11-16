@@ -210,6 +210,26 @@ PY
 export GT_TOKENS_NPZ
 export HUD_TOTAL_FRAMES="${HUD_TOTAL_FRAMES:-$( "${PY}" -c "import numpy as np; print(int(np.load('${GT_TOKENS_NPZ}')['gt_tokens'].shape[0]))" )}"
 
+# Dual-cam strip above MuJoCo (dataset ego + head), synced by pose frame_index.
+EP_PAD="$(printf '%06d' "${EP}")"
+EGO_GT_VIDEO="${EGO_GT_VIDEO:-${DS}/videos/chunk-000/observation.images.ego_view/episode_${EP_PAD}.mp4}"
+HEAD_GT_VIDEO="${HEAD_GT_VIDEO:-${DS}/videos/chunk-000/observation.images.head/episode_${EP_PAD}.mp4}"
+GT_PANEL_LAYOUT="${GT_PANEL_LAYOUT:-bottom}"
+SIM_CAM_ARGS=()
+if [[ -f "${EGO_GT_VIDEO}" ]]; then
+  SIM_CAM_ARGS+=(--ego-gt-video "${EGO_GT_VIDEO}")
+  log "ego GT panel ← ${EGO_GT_VIDEO}"
+else
+  log "WARN: missing ego GT video ${EGO_GT_VIDEO}"
+fi
+if [[ -f "${HEAD_GT_VIDEO}" ]]; then
+  SIM_CAM_ARGS+=(--head-gt-video "${HEAD_GT_VIDEO}")
+  log "head GT panel ← ${HEAD_GT_VIDEO}"
+else
+  log "WARN: missing head GT video ${HEAD_GT_VIDEO}"
+fi
+SIM_CAM_ARGS+=(--gt-panel-layout "${GT_PANEL_LAYOUT}")
+
 log "start WBC sim (ground walk, no elastic band, GT RSI)..."
 (
   cd "${WBC_ROOT}"
@@ -234,7 +254,8 @@ log "start WBC sim (ground walk, no elastic band, GT RSI)..."
     --record-stop-flag "${RECORD_STOP}" \
     --record-fps "${RECORD_FPS:-50}" \
     --g1-debug-host 127.0.0.1 \
-    --g1-debug-port 5557
+    --g1-debug-port 5557 \
+    "${SIM_CAM_ARGS[@]}"
 ) > "${LOG_DIR}/sim.log" 2>&1 &
 PIDS+=($!)
 wait_log "${LOG_DIR}/sim.log" "sim loop starting" 120 "sim" || exit 1

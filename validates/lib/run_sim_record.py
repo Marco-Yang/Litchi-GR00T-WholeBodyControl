@@ -39,6 +39,10 @@ class RecordConfig(SimLoopConfig):
     # Dataset motion_token (T,64) for under-hand HUD: token L2 / GT / pred / frame i/N.
     # Also accepted via env GT_TOKENS_NPZ. Optional HUD_TOTAL_FRAMES overrides denominator.
     gt_tokens_npz: str = ""
+    # Dataset dual-cam strip above the MuJoCo view (synced via pose ZMQ frame_index).
+    ego_gt_video: str = ""
+    head_gt_video: str = ""
+    gt_panel_layout: str = "bottom"
 
 
 def _load_gt_rsi_npz(npz_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -119,6 +123,9 @@ def main(config: RecordConfig) -> None:
 
     if config.record_mp4:
         gt_tok = (config.gt_tokens_npz or os.environ.get("GT_TOKENS_NPZ", "")).strip()
+        ego_gt = (config.ego_gt_video or os.environ.get("EGO_GT_VIDEO", "")).strip()
+        head_gt = (config.head_gt_video or os.environ.get("HEAD_GT_VIDEO", "")).strip()
+        panel_layout = (config.gt_panel_layout or os.environ.get("GT_PANEL_LAYOUT", "top")).strip() or "top"
         rec = SimMp4Recorder(
             sim_env.mj_model,
             Path(config.record_mp4),
@@ -133,6 +140,10 @@ def main(config: RecordConfig) -> None:
             draw_g1_debug_markers=True,
             draw_g1_debug_hud=True,
             camera_host=None,
+            ego_gt_video=ego_gt or None,
+            wrist_gt_video=head_gt or None,
+            wrist_gt_label="head",
+            gt_panel_layout=panel_layout if (ego_gt or head_gt) else "inset",
             gt_tokens_npz=gt_tok or None,
             # Re-apply standing snap + ensure band stays off when recording starts.
             snap_on_record_start=True,

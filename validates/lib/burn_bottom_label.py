@@ -18,7 +18,9 @@ import numpy as np
 _DEFAULT_FFMPEG = Path("/home/zhenyu/workspace/code/HumanoidWBM/demo/VLA/.tools/bin/ffmpeg")
 
 
-def _draw_bottom_label(frame: np.ndarray, label: str) -> np.ndarray:
+def _draw_bottom_label(
+    frame: np.ndarray, label: str, *, bottom_margin: int = 0
+) -> np.ndarray:
     out = frame.copy()
     h, w = out.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -29,7 +31,8 @@ def _draw_bottom_label(frame: np.ndarray, label: str) -> np.ndarray:
     box_w = tw + 2 * pad_x
     box_h = th + baseline + 2 * pad_y
     x0 = max(0, (w - box_w) // 2)
-    y1 = h - 12
+    # bottom_margin: keep label above a dual-cam strip under MuJoCo
+    y1 = h - 12 - max(0, int(bottom_margin))
     y0 = max(0, y1 - box_h)
     x1 = min(w, x0 + box_w)
 
@@ -42,7 +45,14 @@ def _draw_bottom_label(frame: np.ndarray, label: str) -> np.ndarray:
     return out
 
 
-def burn(src: Path, label: str, dst: Path, ffmpeg: Path) -> Path:
+def burn(
+    src: Path,
+    label: str,
+    dst: Path,
+    ffmpeg: Path,
+    *,
+    bottom_margin: int = 0,
+) -> Path:
     cap = cv2.VideoCapture(str(src))
     if not cap.isOpened():
         raise SystemExit(f"cannot open {src}")
@@ -84,7 +94,7 @@ def burn(src: Path, label: str, dst: Path, ffmpeg: Path) -> Path:
         ok, fr = cap.read()
         if not ok:
             break
-        labeled = _draw_bottom_label(fr, label)
+        labeled = _draw_bottom_label(fr, label, bottom_margin=bottom_margin)
         proc.stdin.write(labeled.tobytes())
         n += 1
     proc.stdin.close()
@@ -93,7 +103,10 @@ def burn(src: Path, label: str, dst: Path, ffmpeg: Path) -> Path:
     if rc != 0:
         raise SystemExit(f"ffmpeg failed rc={rc} writing {tmp}")
     tmp.replace(dst)
-    print(f"[burn] {dst} frames={n} label={label!r}", flush=True)
+    print(
+        f"[burn] {dst} frames={n} label={label!r} bottom_margin={bottom_margin}",
+        flush=True,
+    )
     return dst
 
 
@@ -103,11 +116,23 @@ def main() -> None:
     ap.add_argument("--label", type=str, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--ffmpeg", type=Path, default=_DEFAULT_FFMPEG)
+    ap.add_argument(
+        "--bottom-margin",
+        type=int,
+        default=0,
+        help="Lift label above bottom N px (e.g. dual-cam strip height)",
+    )
     args = ap.parse_args()
     if not args.ffmpeg.is_file():
         print(f"missing ffmpeg: {args.ffmpeg}", file=sys.stderr)
         raise SystemExit(2)
-    burn(args.inp, args.label, args.out, args.ffmpeg)
+    burn(
+        args.inp,
+        args.label,
+        args.out,
+        args.ffmpeg,
+        bottom_margin=int(args.bottom_margin),
+    )
 
 
 if __name__ == "__main__":

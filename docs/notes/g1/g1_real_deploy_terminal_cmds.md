@@ -121,7 +121,7 @@ python gear_sonic/scripts/pico_manager_thread_server.py \
 ## C. 路线二：VLA 真机（skill2 pick_toy · origin RTC）
 
 架构：PolicyServer（GPU）+ 相机 ZMQ + C++ deploy + `run_vla_inference`。  
-**RTC 必须与训练一致：`overlap=28 frozen=5 ramp=3.0`，不要用脚本默认 16/8/5。**
+**RTC（推荐部署）：** `--rtc-overlap-steps 16 --rtc-frozen-steps 3 --rtc-ramp-rate 3.0`（exec_h=24）。比仿真可用的 `20/4` 更敢纠偏，减轻抓取左偏；可能略增卡顿。训练原值 `28/5/3.0` 更粘阶段；须真正生效（见 C2 同步 RTC policy），不要用未打补丁的 policy（会变成全程 `no RTC` 硬切）。
 
 一次导出环境变量（后续终端可复用或各终端再 export）：
 
@@ -182,6 +182,13 @@ export HF_HOME="${HOME}/.cache/huggingface"
 export GROOT_BACKBONE_PATH="${HF_HOME}/hub/models--nvidia--Cosmos-Reason2-2B/snapshots/9ce19a195e423419c349abfc86fd07178b230561"
 test -d "$GROOT_BACKBONE_PATH" || { echo "MISSING Cosmos local snapshot: $GROOT_BACKBONE_PATH"; exit 1; }
 
+# 关键：上游 Isaac-GR00T 的 Gr00tPolicy 会忽略 RTC options → chunk 硬切、动作卡顿。
+# Deploy/Gr00T 带 RTC 补丁（缓存上一 chunk + 转发 options）；启动 server 前同步进去。
+test -f "$REPO/../Gr00T/gr00t/policy/gr00t_policy.py" \
+  && cp -f "$REPO/../Gr00T/gr00t/policy/gr00t_policy.py" "$LITCHI_ROOT/gr00t/policy/gr00t_policy.py"
+grep -q '_attach_rtc_action' "$LITCHI_ROOT/gr00t/policy/gr00t_policy.py" \
+  || { echo "RTC Gr00tPolicy missing — check Deploy/Gr00T/gr00t/policy/gr00t_policy.py"; exit 1; }
+
 cd "$LITCHI_ROOT"
 source "$REPO/.venv_inference/bin/activate"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 GROOT_HF_LOCAL_FIRST=1
@@ -193,6 +200,11 @@ python gr00t/eval/run_gr00t_server.py \
   --device cuda:0 \
   --port 5550
 ```
+
+C4 跑起来后确认 RTC **真正生效**（不是只打印了参数）：
+
+- C4：`New action chunk (RTC, ...)`（不应长期只有 `no RTC`）  
+- 若仍全是 `no RTC`：多半 server 还在用未打补丁的 `Gr00tPolicy`，重做上面的 `cp` 并重启 C2。
 
 ### C3. 终端 — C++ deploy（与遥操相同，input=zmq）
 
@@ -265,8 +277,8 @@ python gear_sonic/scripts/run_vla_inference.py \
   --action-publish-rate 50 \
   --action-horizon 40 \
   --rtc \
-  --rtc-overlap-steps 28 \
-  --rtc-frozen-steps 5 \
+  --rtc-overlap-steps 16 \
+  --rtc-frozen-steps 3 \
   --rtc-ramp-rate 3.0 \
   --camera-host "$CAMERA_HOST" \
   --camera-port 5555 \
@@ -281,7 +293,9 @@ python gear_sonic/scripts/run_vla_inference.py \
 
 > `state`/`action` ZMQ 默认与本机 C++ deploy 同机；若拆机，改成 deploy 机 IP。  
 > C4 默认 **暂停**（`Pausing...`）；必须另开 **C5 键盘发布端**，按 `k` → `i` → `p` 才会动。  
-> **Revo2：** 必须先有 **C3.5** `receiver ready`，本命令保留 `--revo2-send`。启动后 C4 应出现 `Revo2 hand bridge on`，约每秒 `Revo2 UDP: L=[...] R=[...]`（抓取段右手应到几百～1000；接近阶段只有个位数是正常的）。暂停 / `i` / 退出会发张开。
+> **Revo2：** 必须先有 **C3.5** `receiver ready`，本命令保留 `--revo2-send`。启动后 C4 应出现 `Revo2 hand bridge on`，约每秒 `Revo2 UDP: L=[...] R=[...]`（抓取段右手应到几百～1000；接近阶段只有个位数是正常的）。暂停 / `i` / 退出会发张开。  
+> **RTC（推荐）：** `16/3/3.0`（上例，减轻抓取左偏）。启动后应见 `RTC on: horizon=40, overlap=16, frozen=3, ramp=3.0` 且 `New action chunk (RTC, ...)`。仿真可用档：`20/4/3.0`；中间档：`24/4/3.0`；训练对齐：`28/5/3.0`（更粘）。  
+> **抓取左偏：** 开 RTC 后若仍偏左，到桌前后用 C5：`p`（或 `i`）清前缀 → `t 抓取前方绿色桌子上的黄色玩偶，抓起以后放进编织篮里`（去掉侧平举）→ `p` 再开。关 RTC 不偏但会卡顿，属同一权衡。
 
 ### C5. 终端 — 键盘发布（VLA 真机必开）
 
@@ -356,8 +370,8 @@ python gear_sonic/scripts/launch_inference.py \
   --camera-host "$CAMERA_HOST" \
   --prompt "$PROMPT" \
   --rtc \
-  --rtc-overlap-steps 28 \
-  --rtc-frozen-steps 5 \
+  --rtc-overlap-steps 16 \
+  --rtc-frozen-steps 3 \
   --rtc-ramp-rate 3.0 \
   --revo2-send \
   --revo2-orin-host 192.168.123.164
@@ -409,7 +423,7 @@ pkill -INT -x g1_deploy_onnx_ref || pkill -TERM -x g1_deploy_onnx_ref
 | 策略包 | `policy/sonic_v1_1` only（`--cp policy/sonic_v1_1/model` 前缀） |
 | VLA 权重 | `$VLA_CKPT` → `…/Deploy/Gr00T/checkpoints/skill2/checkpoint-49400`（skill1 已注释） |
 | PolicyServer | `$LITCHI_ROOT` → `$REPO/.deps/Isaac-GR00T` + `.venv_inference` |
-| origin RTC | `--rtc-overlap-steps 28 --rtc-frozen-steps 5 --rtc-ramp-rate 3.0` |
+| 部署 RTC（推荐） | `--rtc-overlap-steps 16 --rtc-frozen-steps 3 --rtc-ramp-rate 3.0`（减左偏；仿真可用 20/4；训练 28/5 更粘） |
 | 键盘口 | `tcp://localhost:5580`；`k` 启停，`i` 臂安全就绪，`p` 跑/停策略 |
 
 安全：物理急停 > 软件 `O` > `pkill -INT`。  

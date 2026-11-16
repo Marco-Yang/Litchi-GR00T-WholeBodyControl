@@ -60,6 +60,8 @@ class ZMQStateSubscriber:
         self._socket.connect(f"tcp://{host}:{port}")
         self._topic = topic
         self._msg = None
+        self._last_msg = None
+        self._last_msg_time = 0.0
         print(f"[ZMQStateSubscriber] Connected to tcp://{host}:{port} (topic: {topic})")
 
     def _poll(self):
@@ -72,13 +74,25 @@ class ZMQStateSubscriber:
         msg = _unpack_msgpack_zmq(raw, self._topic)
         msg = _convert_lists_to_numpy(msg)
         self._msg = msg
+        self._last_msg = msg
+        self._last_msg_time = time.monotonic()
 
-    def get_msg(self, clear: bool = True):
-        """Return the latest state message (or ``None``)."""
+    def get_msg(self, clear: bool = True, max_stale_s: float | None = None):
+        """Return the latest state message (or ``None``).
+
+        When ``max_stale_s`` is set and the socket briefly has nothing new,
+        reuse the last successfully received message if it is younger than
+        ``max_stale_s``. This avoids dropping VLA inference when ``g1_debug``
+        hiccups (which otherwise freezes on the last action chunk).
+        """
         self._poll()
         msg = self._msg
         if clear:
             self._msg = None
+        if msg is None and max_stale_s is not None and self._last_msg is not None:
+            age = time.monotonic() - self._last_msg_time
+            if age <= float(max_stale_s):
+                return self._last_msg
         return msg
 
     def close(self):

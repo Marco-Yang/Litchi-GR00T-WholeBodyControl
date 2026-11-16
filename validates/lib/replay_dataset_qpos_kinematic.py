@@ -60,6 +60,53 @@ def _joint_qpos_map(model: mujoco.MjModel, names: list[str]) -> list[tuple[int, 
     return out
 
 
+def _read_rgb_frame(cap, last: np.ndarray | None) -> np.ndarray | None:
+    if cap is None:
+        return last
+    ok, bgr = cap.read()
+    if not ok:
+        return last
+    import cv2
+
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
+def _stack_dual_cam(
+    main_rgb: np.ndarray,
+    panels: list[tuple[np.ndarray, str]],
+    *,
+    panel_h: int,
+    below: bool = True,
+) -> np.ndarray:
+    import cv2
+
+    main_h, main_w = main_rgb.shape[:2]
+    row = np.zeros((panel_h, main_w, 3), dtype=np.uint8)
+    n = max(len(panels), 1)
+    slot_w = main_w // n
+    for i, (img, label) in enumerate(panels):
+        tile = np.asarray(img)
+        ih, iw = tile.shape[:2]
+        scale = min((slot_w - 8) / max(iw, 1), (panel_h - 24) / max(ih, 1))
+        tw, th = max(1, int(iw * scale)), max(1, int(ih * scale))
+        small = cv2.resize(tile, (tw, th), interpolation=cv2.INTER_AREA)
+        x0 = i * slot_w + (slot_w - tw) // 2
+        y0 = 18 + (panel_h - 18 - th) // 2
+        row[y0 : y0 + th, x0 : x0 + tw] = small
+        if label:
+            cv2.putText(
+                row,
+                label,
+                (i * slot_w + 6, 14),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (220, 220, 220),
+                1,
+                cv2.LINE_AA,
+            )
+    return np.vstack([main_rgb, row] if below else [row, main_rgb])
+
+
 def render(
     ds: Path,
     episode: int,
@@ -72,6 +119,9 @@ def render(
     ffmpeg: Path,
     width: int = 640,
     height: int = 480,
+    dual_cam: bool = True,
+    dual_cam_below: bool = True,
+    cam_panel_h: int = 160,
 ) -> Path:
     state, root_quat, names, fps = _load_episode(ds, episode)
     if fps_override is not None:
@@ -100,6 +150,22 @@ def render(
     cam.elevation = -12.0
     cam.azimuth = 135.0
 
+    ego_cap = head_cap = None
+    ego_last = head_last = None
+    if dual_cam:
+        import cv2
+
+        ep_pad = f"{int(episode):06d}"
+        ego_p = ds / "videos/chunk-000/observation.images.ego_view" / f"episode_{ep_pad}.mp4"
+        head_p = ds / "videos/chunk-000/observation.images.head" / f"episode_{ep_pad}.mp4"
+        if ego_p.is_file():
+            ego_cap = cv2.VideoCapture(str(ego_p))
+            print(f"[qpos_replay] dual-cam ego ← {ego_p}", flush=True)
+        if head_p.is_file():
+            head_cap = cv2.VideoCapture(str(head_p))
+            print(f"[qpos_replay] dual-cam head ← {head_p}", flush=True)
+
+    out_h = height + (cam_panel_h if dual_cam and (ego_cap or head_cap) else 0)
     out_mp4 = Path(out_mp4)
     out_mp4.parent.mkdir(parents=True, exist_ok=True)
     ff = str(ffmpeg) if ffmpeg.is_file() else "ffmpeg"
@@ -107,7 +173,7 @@ def render(
         [
             ff, "-y", "-loglevel", "error",
             "-f", "rawvideo", "-vcodec", "rawvideo",
-            "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
+            "-pix_fmt", "rgb24", "-s", f"{width}x{out_h}", "-r", str(fps), "-i", "-",
             "-an", "-vcodec", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
             str(out_mp4),
         ],
@@ -156,6 +222,18 @@ def render(
             for line in lines:
                 cv2.putText(img, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 80), 1, cv2.LINE_AA)
                 y += 18
+            if dual_cam and (ego_cap is not None or head_cap is not None):
+                panels: list[tuple[np.ndarray, str]] = []
+                ego_last = _read_rgb_frame(ego_cap, ego_last)
+                head_last = _read_rgb_frame(head_cap, head_last)
+                if ego_last is not None:
+                    panels.append((ego_last, f"ego_view (GT f={i})"))
+                if head_last is not None:
+                    panels.append((head_last, f"head (GT f={i})"))
+                if panels:
+                    img = _stack_dual_cam(
+                        img, panels, panel_h=cam_panel_h, below=dual_cam_below
+                    )
             proc.stdin.write(img.tobytes())
         except Exception:
             proc.stdin.write(frame.tobytes())
@@ -163,6 +241,10 @@ def render(
         if i % 50 == 0 or i == t - 1:
             print(f"[qpos_replay] frame {i}/{t - 1}", flush=True)
 
+    if ego_cap is not None:
+        ego_cap.release()
+    if head_cap is not None:
+        head_cap.release()
     proc.stdin.close()
     if proc.wait() != 0:
         raise RuntimeError(f"ffmpeg failed writing {out_mp4}")
@@ -180,6 +262,12 @@ def main() -> None:
     ap.add_argument("--fps", type=float, default=None)
     ap.add_argument("--max-frames", type=int, default=0, help="0 = all frames")
     ap.add_argument("--ffmpeg", type=Path, default=_DEFAULT_FFMPEG)
+    ap.add_argument("--no-dual-cam", action="store_true", help="Disable ego+head strip")
+    ap.add_argument(
+        "--dual-cam-above",
+        action="store_true",
+        help="Put ego+head above MuJoCo (default: below)",
+    )
     args = ap.parse_args()
     render(
         args.dataset,
@@ -190,6 +278,8 @@ def main() -> None:
         fps_override=args.fps,
         max_frames=args.max_frames,
         ffmpeg=args.ffmpeg,
+        dual_cam=not bool(args.no_dual_cam),
+        dual_cam_below=not bool(args.dual_cam_above),
     )
 
 

@@ -283,15 +283,16 @@ def _sync_gt_frame(
     return cap_idx, last_bgr, True
 
 
-def _composite_top_gt_panel(
+def _composite_gt_panel_row(
     main_bgr: np.ndarray,
     panels: list[tuple[np.ndarray, str]],
     *,
     panel_h: int,
+    below: bool = True,
 ) -> np.ndarray:
-    """Stack GT camera row above clean sim view (no overlay on main_bgr)."""
+    """Stack GT camera row above or below clean sim view (no overlay on main_bgr)."""
     main_h, main_w = main_bgr.shape[:2]
-    top = np.zeros((panel_h, main_w, 3), dtype=np.uint8)
+    row = np.zeros((panel_h, main_w, 3), dtype=np.uint8)
     n = max(len(panels), 1)
     slot_w = main_w // n
     for i, (img, label) in enumerate(panels):
@@ -303,13 +304,23 @@ def _composite_top_gt_panel(
         small = cv2.resize(tile, (tw, th), interpolation=cv2.INTER_AREA)
         x0 = i * slot_w + (slot_w - tw) // 2
         y0 = 18 + (panel_h - 18 - th) // 2
-        top[y0 : y0 + th, x0 : x0 + tw] = small
+        row[y0 : y0 + th, x0 : x0 + tw] = small
         if label:
             cv2.putText(
-                top, label, (i * slot_w + 6, 14),
+                row, label, (i * slot_w + 6, 14),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA,
             )
-    return np.vstack([top, main_bgr])
+    return np.vstack([main_bgr, row] if below else [row, main_bgr])
+
+
+def _composite_top_gt_panel(
+    main_bgr: np.ndarray,
+    panels: list[tuple[np.ndarray, str]],
+    *,
+    panel_h: int,
+) -> np.ndarray:
+    """Backward-compatible alias: cameras above sim."""
+    return _composite_gt_panel_row(main_bgr, panels, panel_h=panel_h, below=False)
 
 
 def _fmt_token_preview(tok: np.ndarray | None, n: int = 4) -> str:
@@ -610,6 +621,8 @@ class SimMp4Recorder:
         camera_inset_scale: float = 0.38,
         ego_gt_video: str | Path | None = None,
         wrist_gt_video: str | Path | None = None,
+        wrist_gt_label: str = "left_wrist",
+        ego_gt_label: str = "ego_view",
         gt_panel_layout: str = "inset",
         gt_tokens_npz: str | Path | None = None,
         top_panel_height_ratio: float = 0.32,
@@ -664,6 +677,8 @@ class SimMp4Recorder:
         self._camera_client = None
         self._ego_gt_video = Path(ego_gt_video) if ego_gt_video else None
         self._wrist_gt_video = Path(wrist_gt_video) if wrist_gt_video else None
+        self._ego_gt_label = str(ego_gt_label or "ego_view")
+        self._wrist_gt_label = str(wrist_gt_label or "left_wrist")
         self._gt_panel_layout = gt_panel_layout
         self._gt_tokens = None
         self._hud_total_frames: int | None = None
@@ -691,12 +706,13 @@ class SimMp4Recorder:
         _tf = os.environ.get("HUD_TOTAL_FRAMES", "").strip()
         if _tf:
             self._hud_total_frames = int(_tf)
-        # ponytail: top layout reserves panel height only when GT video sources exist;
+        # Reserve strip height for GT cameras (top or bottom) when sources exist;
         # otherwise VideoWriter (H+panel) vs render (H) mismatch yields empty mp4.
         has_gt_panel = bool(ego_gt_video or wrist_gt_video)
+        self._gt_panel_below = gt_panel_layout == "bottom"
         self._top_panel_h = (
             max(96, int(height * top_panel_height_ratio))
-            if gt_panel_layout == "top" and has_gt_panel
+            if gt_panel_layout in ("top", "bottom") and has_gt_panel
             else 0
         )
         self._ego_cap: cv2.VideoCapture | None = None
@@ -1293,8 +1309,10 @@ class SimMp4Recorder:
             )
             gt_synced = gt_synced or ok
             if ok and self._ego_last_bgr is not None:
-                ego_label = f"ego_view (GT f={gt_idx})" if show_gt_labels else ""
-                if self._gt_panel_layout == "top":
+                ego_label = (
+                    f"{self._ego_gt_label} (GT f={gt_idx})" if show_gt_labels else ""
+                )
+                if self._gt_panel_layout in ("top", "bottom"):
                     gt_panels.append((self._ego_last_bgr, ego_label))
                 else:
                     _composite_ego_inset(
@@ -1313,8 +1331,10 @@ class SimMp4Recorder:
             )
             gt_synced = gt_synced or ok
             if ok and self._wrist_last_bgr is not None:
-                wrist_label = f"left_wrist (GT f={gt_idx})" if show_gt_labels else ""
-                if self._gt_panel_layout == "top":
+                wrist_label = (
+                    f"{self._wrist_gt_label} (GT f={gt_idx})" if show_gt_labels else ""
+                )
+                if self._gt_panel_layout in ("top", "bottom"):
                     gt_panels.append((self._wrist_last_bgr, wrist_label))
                 else:
                     _composite_ego_inset(
@@ -1324,8 +1344,6 @@ class SimMp4Recorder:
                         label=wrist_label,
                         from_rgb=False,
                     )
-        if self._gt_panel_layout == "top" and gt_panels:
-            bgr = _composite_top_gt_panel(bgr, gt_panels, panel_h=self._top_panel_h)
         latent_mse = None
         token_l2 = None
         pred_token = None
@@ -1357,6 +1375,7 @@ class SimMp4Recorder:
                     token_l2 = float(np.linalg.norm(pred - gt))
                     latent_mse = float(np.mean((pred - gt) ** 2))
         hud_n = getattr(self, "_hud_total_frames", None)
+        # Draw HUD on the MuJoCo frame BEFORE stacking ego/head, so camera tiles stay clean.
         if self._draw_g1_debug_hud:
             _draw_g1_debug_hud(
                 bgr,
@@ -1368,6 +1387,13 @@ class SimMp4Recorder:
                 gt_token=gt_token,
                 frame_i=hud_fi,
                 frame_n=hud_n,
+            )
+        if self._gt_panel_layout in ("top", "bottom") and gt_panels:
+            bgr = _composite_gt_panel_row(
+                bgr,
+                gt_panels,
+                panel_h=self._top_panel_h,
+                below=self._gt_panel_below,
             )
         self._writer.write(bgr)
         self._frames += 1

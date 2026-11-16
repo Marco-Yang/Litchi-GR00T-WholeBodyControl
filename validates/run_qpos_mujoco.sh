@@ -10,8 +10,12 @@ OUT="${VALIDATE_VIDEOS}/ep$(printf '%03d' "${EP}")_qpos_mujoco_h264.mp4"
 LABEL="${LABEL:-qpos MuJoCo}"
 
 echo "[qpos] DS=${DS} EP=${EP} MJCF=${MJCF}"
-# Use VLA venv (needs both mujoco + pyarrow); sim venv has no pyarrow/pip.
-"${PY}" -u "${VALIDATE_LIB}/replay_dataset_qpos_kinematic.py" \
+# Prefer sim venv (mujoco+pyarrow+cv2). Fall back to PY if it already has mujoco.
+QPOS_PY="${SIM_PY}"
+if ! "${QPOS_PY}" -c "import mujoco, pyarrow" >/dev/null 2>&1; then
+  QPOS_PY="${PY}"
+fi
+"${QPOS_PY}" -u "${VALIDATE_LIB}/replay_dataset_qpos_kinematic.py" \
   --dataset "${DS}" --episode "${EP}" --out "${RAW}" --mjcf "${MJCF}" --ffmpeg "${FFMPEG_BIN}"
 burn_label_h264 "${RAW}" "${LABEL}" "${OUT}"
 echo "[qpos] → ${OUT}"
