@@ -22,6 +22,9 @@ GT_BOOTSTRAP_FRAMES="${GT_BOOTSTRAP_FRAMES:-10}"
 GT_PROPRIO_ONLY="${GT_PROPRIO_ONLY:-1}"
 PRE_GO_SETTLE_S="${PRE_GO_SETTLE_S:-1}"
 RECORD_TAIL_SLEEP_S="${RECORD_TAIL_SLEEP_S:-2}"
+# Dual-cam GT panel: do not stall-stop mid-episode (default recorder 0.4s truncates
+# when ZMQ frame_index pauses). Shell already ends after MOTION+TAIL.
+export GT_ZMQ_RECORD_STALL_S="${GT_ZMQ_RECORD_STALL_S:-120}"
 CONTROL_FPS="${CONTROL_FPS:-50}"
 EXEC_HORIZON="${EXEC_HORIZON:-12}"
 ACTION_HORIZON="${ACTION_HORIZON:-40}"

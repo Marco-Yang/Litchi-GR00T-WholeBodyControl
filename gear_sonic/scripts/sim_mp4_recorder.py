@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -40,10 +42,34 @@ _G1_REF_RGBA = np.array([1.0, 1.0, 1.0, 0.55], dtype=np.float32)
 _G1_CMD_RGBA = np.array([0.15, 0.95, 0.95, 0.85], dtype=np.float32)
 LOG = logging.getLogger(__name__)
 
+_DEFAULT_FFMPEG = Path("/home/zhenyu/workspace/code/HumanoidWBM/demo/VLA/.tools/bin/ffmpeg")
+
 
 def _env_float(name: str, default: float) -> float:
     value = os.environ.get(name, "").strip()
     return float(value) if value else float(default)
+
+
+def _align_up(n: int, multiple: int = 16) -> int:
+    """Pad dimension up so libx264/yuv420p stays happy (prefer multiples of 16)."""
+    m = max(int(multiple), 1)
+    n = int(n)
+    return n if n % m == 0 else n + (m - n % m)
+
+
+def _resolve_ffmpeg() -> str:
+    candidates = [
+        os.environ.get("FFMPEG_BIN", "").strip(),
+        str(_DEFAULT_FFMPEG),
+        shutil.which("ffmpeg") or "",
+    ]
+    for c in candidates:
+        if c and Path(c).is_file():
+            return c
+    raise RuntimeError(
+        "ffmpeg not found (set FFMPEG_BIN or install project ffmpeg at "
+        f"{_DEFAULT_FFMPEG})"
+    )
 
 
 def _clip_norm(vec: np.ndarray, max_norm: float) -> np.ndarray:
@@ -707,7 +733,8 @@ class SimMp4Recorder:
         if _tf:
             self._hud_total_frames = int(_tf)
         # Reserve strip height for GT cameras (top or bottom) when sources exist;
-        # otherwise VideoWriter (H+panel) vs render (H) mismatch yields empty mp4.
+        # pad total out_h to multiple of 16 so H.264 encode never truncates silently
+        # (OpenCV mp4v at 640x632 previously claimed N frames but only kept ~75%).
         has_gt_panel = bool(ego_gt_video or wrist_gt_video)
         self._gt_panel_below = gt_panel_layout == "bottom"
         self._top_panel_h = (
@@ -715,6 +742,10 @@ class SimMp4Recorder:
             if gt_panel_layout in ("top", "bottom") and has_gt_panel
             else 0
         )
+        if self._top_panel_h > 0:
+            out_h_raw = int(height) + int(self._top_panel_h)
+            out_h_aligned = _align_up(out_h_raw, 16)
+            self._top_panel_h += out_h_aligned - out_h_raw
         self._ego_cap: cv2.VideoCapture | None = None
         self._wrist_cap: cv2.VideoCapture | None = None
         self._root_track_csv = os.environ.get("ROOT_TRACK_CSV")
@@ -852,6 +883,10 @@ class SimMp4Recorder:
         self._renderer = None
         self._cam = None
         self._writer = None
+        self._tmp_mp4: Path | None = None
+        self._frame_w = int(width)
+        self._frame_h = int(height)
+        self._record_fps = float(fps)
         if self._record_video:
             out_h = height + self._top_panel_h
             self._renderer = mujoco.Renderer(model, height=height, width=width)
@@ -888,10 +923,25 @@ class SimMp4Recorder:
                     f"az_fixed={self._cam_az_fixed or 'none'} (front≈offset 90)"
                 )
 
+            # Sim thread must NOT talk to ffmpeg (sync or async): encoding /
+            # tobytes+queue still hitch the GIL → LowState age spikes → fall.
+            # Write a light OpenCV mp4v intermediate at H%16==0 (no silent truncate),
+            # then remux/re-encode to H.264 on close() after physics ends.
+            self._frame_w = int(width)
+            self._frame_h = int(out_h)
+            self._record_fps = float(fps)
+            self._tmp_mp4 = self.output.with_suffix(".mp4v_tmp.mp4")
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            self._writer = cv2.VideoWriter(str(self.output), fourcc, fps, (width, out_h))
+            self._writer = cv2.VideoWriter(
+                str(self._tmp_mp4), fourcc, float(fps), (self._frame_w, self._frame_h)
+            )
             if not self._writer.isOpened():
-                raise RuntimeError(f"Cannot open video writer: {self.output}")
+                raise RuntimeError(f"OpenCV VideoWriter failed to open {self._tmp_mp4}")
+            print(
+                f"[sim_record] OpenCV mp4v interim {self._frame_w}x{self._frame_h}"
+                f"@{self._record_fps:g} → {self._tmp_mp4} (H.264 remux on close)",
+                flush=True,
+            )
         else:
             print("[sim_record] video writer disabled; root_track/logging only")
 
@@ -1395,7 +1445,9 @@ class SimMp4Recorder:
                 panel_h=self._top_panel_h,
                 below=self._gt_panel_below,
             )
-        self._writer.write(bgr)
+        if bgr.shape[0] != self._frame_h or bgr.shape[1] != self._frame_w:
+            bgr = cv2.resize(bgr, (self._frame_w, self._frame_h), interpolation=cv2.INTER_AREA)
+        self._write_frame(bgr)
         self._frames += 1
         if gt_synced:
             self._gt_local_frame += 1
@@ -1437,12 +1489,55 @@ class SimMp4Recorder:
                 )
         return True
 
+    def _write_frame(self, bgr: np.ndarray) -> None:
+        """Write one BGR frame on the sim thread via OpenCV (fast enough not to stall DDS)."""
+        if self._writer is not None:
+            self._writer.write(bgr)
+
+    def _remux_tmp_to_h264(self) -> None:
+        """Re-encode interim mp4v → deliverable H.264 after physics has stopped."""
+        tmp = getattr(self, "_tmp_mp4", None)
+        if tmp is None or not Path(tmp).is_file():
+            return
+        ff = _resolve_ffmpeg()
+        cmd = [
+            ff,
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(tmp),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-movflags",
+            "+faststart",
+            str(self.output),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg remux failed rc={proc.returncode}: {(proc.stderr or '')[-800:]}"
+            )
+        try:
+            Path(tmp).unlink(missing_ok=True)
+        except Exception:
+            pass
+        print(f"[sim_record] remuxed H.264 → {self.output}", flush=True)
+
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         if self._writer is not None:
             self._writer.release()
+            self._writer = None
         if self._root_track_fp is not None:
             self._root_track_fp.close()
             self._root_track_fp = None
@@ -1463,4 +1558,53 @@ class SimMp4Recorder:
             self._wrist_cap = None
         if self._zmq_ctx is not None:
             self._zmq_ctx.term()
-        print(f"[sim_record] saved {self._frames} frames -> {self.output}")
+        # Physics/DDS already stopped — safe to burn CPU on H.264 now.
+        if self._record_video and self._frames > 0:
+            self._remux_tmp_to_h264()
+        # Verify container holds every frame we fed (catch silent truncations).
+        if self._record_video and self._frames > 0 and self.output.is_file():
+            try:
+                ff = Path(_resolve_ffmpeg())
+                probe_bin = ff.parent / "ffprobe"
+                if not probe_bin.is_file():
+                    probe_bin = Path(shutil.which("ffprobe") or "ffprobe")
+                probe = subprocess.run(
+                    [
+                        str(probe_bin),
+                        "-v",
+                        "error",
+                        "-select_streams",
+                        "v:0",
+                        "-count_packets",
+                        "-show_entries",
+                        "stream=nb_read_packets,nb_frames,width,height",
+                        "-of",
+                        "json",
+                        str(self.output),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                    check=False,
+                )
+                if probe.returncode == 0 and probe.stdout.strip():
+                    import json as _json
+
+                    st = (_json.loads(probe.stdout).get("streams") or [{}])[0]
+                    got = st.get("nb_read_packets") or st.get("nb_frames")
+                    if got is not None and int(got) != int(self._frames):
+                        raise RuntimeError(
+                            f"frame count mismatch: wrote {self._frames} but "
+                            f"ffprobe got {got} ({st.get('width')}x{st.get('height')}) "
+                            f"for {self.output}"
+                        )
+                    print(
+                        f"[sim_record] ffprobe OK frames={got} "
+                        f"{st.get('width')}x{st.get('height')}",
+                        flush=True,
+                    )
+            except RuntimeError:
+                raise
+            except Exception as e:
+                print(f"[sim_record] WARN: could not ffprobe-verify frames: {e}", flush=True)
+        print(f"[sim_record] saved {self._frames} frames -> {self.output}", flush=True)
