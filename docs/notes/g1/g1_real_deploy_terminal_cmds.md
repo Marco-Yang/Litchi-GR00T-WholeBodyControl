@@ -118,21 +118,55 @@ python gear_sonic/scripts/pico_manager_thread_server.py \
 
 ---
 
-## C. 路线二：VLA 真机（skill2 pick_toy · origin RTC）
+## C. 路线二：VLA 真机（skill2 pick_toy · origin / hand-split-body）
 
 架构：PolicyServer（GPU）+ 相机 ZMQ + C++ deploy + `run_vla_inference`。  
-**RTC（推荐部署）：** `--rtc-overlap-steps 16 --rtc-frozen-steps 3 --rtc-ramp-rate 3.0`（exec_h=24）。比仿真可用的 `20/4` 更敢纠偏，减轻抓取左偏；可能略增卡顿。训练原值 `28/5/3.0` 更粘阶段；须真正生效（见 C2 同步 RTC policy），不要用未打补丁的 policy（会变成全程 `no RTC` 硬切）。
+**C++ / ZMQ / 真手链路对两个分支相同**；差别只在 VLA 权重（joint vs split action head）和训练对齐的 RTC。
 
-一次导出环境变量（后续终端可复用或各终端再 export）：
+### C0. 分支切换（推荐）
 
 ```bash
-export REPO="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl"
+# 工作站 Litchi 树（本机）:
+export REPO="/home/zhenyu/workspace/code/HumanoidWBM/demo/RL_controller/Litchi-GR00T-WholeBodyControl"
+# Deploy 机若路径不同，改成实际 REPO 后同样 source：
+# export REPO="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl"
+cd "$REPO"
+
+# hand-split-body（本任务）：ckpt=skill2_pick_toy_hand_body_split/…/checkpoint-49400
+#   RTC 训练对齐 o=25 f=6 ramp=3.0；PolicyServer 必须用 Litchi-Isaac-GR00T
+source gear_sonic/scripts/source_deploy_branch.sh hand-split-body
+
+# 切回 origin / promptfix_b32_e4：
+# source gear_sonic/scripts/source_deploy_branch.sh origin
+```
+
+会导出：`DEPLOY_BRANCH` `VLA_CKPT` `LITCHI_ROOT` `RTC_OVERLAP_STEPS` `RTC_FROZEN_STEPS` `RTC_RAMP_RATE` `ACTION_HORIZON`。  
+C4 / launcher 也可加 `--deploy-branch hand-split-body`（或 `origin`）自动套同一套 RTC。
+
+| 分支 | action head | 默认 ckpt | 训练对齐 RTC |
+|------|-------------|-----------|--------------|
+| `origin` | joint | `skill2_pick_toy_promptfix_b32_e4/.../checkpoint-49400` | o=28 f=5 |
+| `hand-split-body` | split body64+hand14 | `skill2_pick_toy_hand_body_split/.../checkpoint-49400` | o=25 f=6 |
+
+**RTC（origin 现场曾用更敢纠偏档）：** `--rtc-overlap-steps 16 --rtc-frozen-steps 3 --rtc-ramp-rate 3.0`。训练原值更粘阶段；须真正生效（见 C2 同步 RTC policy），不要用未打补丁的 policy（会变成全程 `no RTC` 硬切）。
+
+一次导出环境变量（后续终端可复用；**优先用上面 C0**）：
+
+```bash
+export REPO="/home/zhenyu/workspace/code/HumanoidWBM/demo/RL_controller/Litchi-GR00T-WholeBodyControl"
+# Deploy 机备选：
+# export REPO="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl"
 export DEPLOY="$REPO/gear_sonic_deploy"
 # skill1（旧）：
-# export VLA_CKPT="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T/checkpoints/walk_towards_green_table_skill1_all_rtc_2cam_origin"
+# export VLA_CKPT=".../walk_towards_green_table_skill1_all_rtc_2cam_origin"
 # export PROMPT="走到绿色桌子前"
-export VLA_CKPT="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T/checkpoints/skill2/checkpoint-49400"
-export LITCHI_ROOT="$REPO/.deps/Isaac-GR00T"
+# origin skill2：
+# export VLA_CKPT=".../skill2/checkpoint-49400"
+# hand-split-body（本机默认）：
+export VLA_CKPT="/home/zhenyu/workspace/data/demo/outputs/skill2_pick_toy_hand_body_split/skill2_pick_toy_hand_body_split/checkpoint-49400"
+# 必须带 split 支持的 Isaac（不要用无 split 的上游拷贝）
+export LITCHI_ROOT="/home/zhenyu/workspace/code/HumanoidWBM/demo/VLA/Litchi-Isaac-GR00T"
+# Deploy 机若只有 .deps：export LITCHI_ROOT="$REPO/.deps/Isaac-GR00T" 并确认已同步 split 代码
 export CAMERA_HOST="192.168.123.164"
 export POLICY_HOST="127.0.0.1"
 export PROMPT="侧平举抬起右手然后抓取前方绿色桌子上的黄色玩偶，抓起以后放进编织篮里"
@@ -270,16 +304,17 @@ cd "$REPO"
 source .venv_inference/bin/activate
 
 python gear_sonic/scripts/run_vla_inference.py \
+  --deploy-branch hand-split-body \
   --host "$POLICY_HOST" \
   --port 5550 \
   --embodiment-tag unitree_g1_sonic \
   --prompt "$PROMPT" \
   --action-publish-rate 50 \
-  --action-horizon 40 \
+  --action-horizon "${ACTION_HORIZON:-40}" \
   --rtc \
-  --rtc-overlap-steps 16 \
-  --rtc-frozen-steps 3 \
-  --rtc-ramp-rate 3.0 \
+  --rtc-overlap-steps "${RTC_OVERLAP_STEPS:-25}" \
+  --rtc-frozen-steps "${RTC_FROZEN_STEPS:-6}" \
+  --rtc-ramp-rate "${RTC_RAMP_RATE:-3.0}" \
   --camera-host "$CAMERA_HOST" \
   --camera-port 5555 \
   --state-zmq-host 127.0.0.1 \
@@ -294,7 +329,7 @@ python gear_sonic/scripts/run_vla_inference.py \
 > `state`/`action` ZMQ 默认与本机 C++ deploy 同机；若拆机，改成 deploy 机 IP。  
 > C4 默认 **暂停**（`Pausing...`）；必须另开 **C5 键盘发布端**，按 `k` → `i` → `p` 才会动。  
 > **Revo2：** 必须先有 **C3.5** `receiver ready`，本命令保留 `--revo2-send`。启动后 C4 应出现 `Revo2 hand bridge on`，约每秒 `Revo2 UDP: L=[...] R=[...]`（抓取段右手应到几百～1000；接近阶段只有个位数是正常的）。暂停 / `i` / 退出会发张开。  
-> **RTC（推荐）：** `16/3/3.0`（上例，减轻抓取左偏）。启动后应见 `RTC on: horizon=40, overlap=16, frozen=3, ramp=3.0` 且 `New action chunk (RTC, ...)`。仿真可用档：`20/4/3.0`；中间档：`24/4/3.0`；训练对齐：`28/5/3.0`（更粘）。  
+> **RTC：** hand-split-body 训练对齐 `25/6/3.0`；origin 训练对齐 `28/5/3.0`；origin 现场纠偏档可用 `16/3/3.0`。启动后应见 `RTC on: ...` 且 `New action chunk (RTC, ...)`。  
 > **抓取左偏：** 开 RTC 后若仍偏左，到桌前后用 C5：`p`（或 `i`）清前缀 → `t 抓取前方绿色桌子上的黄色玩偶，抓起以后放进编织篮里`（去掉侧平举）→ `p` 再开。关 RTC 不偏但会卡顿，属同一权衡。
 
 ### C5. 终端 — 键盘发布（VLA 真机必开）
@@ -361,6 +396,7 @@ cd "$REPO"
 source .venv_inference/bin/activate
 
 python gear_sonic/scripts/launch_inference.py \
+  --deploy-branch hand-split-body \
   --deploy-checkpoint policy/sonic_v1_1/model \
   --deploy-obs-config policy/sonic_v1_1/observation_config.yaml \
   --deploy-motor-kp-scale 4,10=1.5 \
@@ -370,9 +406,9 @@ python gear_sonic/scripts/launch_inference.py \
   --camera-host "$CAMERA_HOST" \
   --prompt "$PROMPT" \
   --rtc \
-  --rtc-overlap-steps 16 \
-  --rtc-frozen-steps 3 \
-  --rtc-ramp-rate 3.0 \
+  --rtc-overlap-steps "${RTC_OVERLAP_STEPS:-25}" \
+  --rtc-frozen-steps "${RTC_FROZEN_STEPS:-6}" \
+  --rtc-ramp-rate "${RTC_RAMP_RATE:-3.0}" \
   --revo2-send \
   --revo2-orin-host 192.168.123.164
 ```
@@ -421,9 +457,10 @@ pkill -INT -x g1_deploy_onnx_ref || pkill -TERM -x g1_deploy_onnx_ref
 | VLA | C1 相机 + C2 server + C3 deploy + **C3.5 RX** + C4（`--revo2-send`）+ **C5 键盘**（`k`→`i`→`p`） |
 | Revo2 手 | **C3.5** `bash scripts/start_orin_revo2_rx.sh`（Manus 目录）+ C4 `--revo2-send` → UDP `:19500` |
 | 策略包 | `policy/sonic_v1_1` only（`--cp policy/sonic_v1_1/model` 前缀） |
-| VLA 权重 | `$VLA_CKPT` → `…/Deploy/Gr00T/checkpoints/skill2/checkpoint-49400`（skill1 已注释） |
-| PolicyServer | `$LITCHI_ROOT` → `$REPO/.deps/Isaac-GR00T` + `.venv_inference` |
-| 部署 RTC（推荐） | `--rtc-overlap-steps 16 --rtc-frozen-steps 3 --rtc-ramp-rate 3.0`（减左偏；仿真可用 20/4；训练 28/5 更粘） |
+| VLA 权重 | `source …/source_deploy_branch.sh hand-split-body\|origin` → `$VLA_CKPT` |
+| PolicyServer | `$LITCHI_ROOT` → **Litchi-Isaac-GR00T**（split 必备）+ `.venv_inference` |
+| 分支切换 | `--deploy-branch hand-split-body\|origin`（C4/launcher）；C++ 无需改 |
+| 部署 RTC | hand-split 训练对齐 25/6；origin 训练 28/5；origin 纠偏档 16/3 |
 | 键盘口 | `tcp://localhost:5580`；`k` 启停，`i` 臂安全就绪，`p` 跑/停策略 |
 
 安全：物理急停 > 软件 `O` > `pkill -INT`。  

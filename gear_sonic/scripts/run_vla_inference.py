@@ -45,6 +45,11 @@ from gear_sonic.utils.data_collection.keyboard_subscriber import (
 from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.transforms import compute_projected_gravity
 from gear_sonic.utils.data_collection.zmq_state_subscriber import ZMQStateSubscriber
+from gear_sonic.utils.inference.deploy_branch import (
+    finalize_inference_rtc,
+    format_branch_banner,
+    resolve_deploy_branch,
+)
 from gear_sonic.utils.inference.initial_poses import LATENT_INITIAL_MOTION_TOKEN
 from gear_sonic.utils.inference.revo2_action_bridge import Revo2ActionBridge
 from gear_sonic.utils.inference.vla_utils import (
@@ -75,12 +80,18 @@ class InferenceConfig:
     port: int = 5550
     """The port of the Isaac-GR00T PolicyServer."""
 
+    deploy_branch: str | None = None
+    """Preset: ``origin`` or ``hand-split-body``. Applies train-aligned RTC
+    (origin: o=28/f=5; hand-split-body: o=25/f=6). C++/ZMQ protocol unchanged;
+    PolicyServer must load the matching checkpoint via Litchi-Isaac-GR00T.
+    """
+
     # Control
     action_publish_rate: int = 50
     """Rate at which individual actions are published to the C++ control loop (Hz)."""
 
-    action_horizon: int = 40
-    """Action horizon of the VLA policy (number of future actions per inference)."""
+    action_horizon: int | None = None
+    """Action horizon. Default 40, or train-aligned value from ``--deploy-branch``."""
 
     rtc: bool = True
     """Condition each new chunk on the unexecuted tail of the previous chunk.
@@ -90,14 +101,14 @@ class InferenceConfig:
     previous normalized action.
     """
 
-    rtc_overlap_steps: int = 16
-    """Steps from the previous chunk that are inpainted into the new chunk."""
+    rtc_overlap_steps: int | None = None
+    """RTC overlap. Default 16, or train-aligned value from ``--deploy-branch``."""
 
-    rtc_frozen_steps: int = 8
-    """Leading inpainted steps that stay frozen (no denoising)."""
+    rtc_frozen_steps: int | None = None
+    """RTC frozen prefix. Default 8, or train-aligned value from ``--deploy-branch``."""
 
-    rtc_ramp_rate: float = 5.0
-    """Exponential ramp from the frozen prefix to the freely denoised tail."""
+    rtc_ramp_rate: float | None = None
+    """RTC ramp. Default 5.0, or train-aligned value from ``--deploy-branch``."""
 
     rate: float = 1 / 0.4
     """Rate at which we run the forward pass of the VLA policy (Hz).
@@ -455,6 +466,22 @@ def _validate_rtc_config(config: InferenceConfig) -> None:
 
 
 def main(config: InferenceConfig):
+    profile = None
+    if config.deploy_branch:
+        profile = resolve_deploy_branch(config.deploy_branch, require_ckpt=False)
+    finalize_inference_rtc(config, profile=profile)
+    if profile is not None:
+        print_green(format_branch_banner(profile))
+        print_green(
+            f"Effective RTC after resolve: H={config.action_horizon} "
+            f"overlap={config.rtc_overlap_steps} frozen={config.rtc_frozen_steps} "
+            f"ramp={config.rtc_ramp_rate}"
+        )
+        if profile.split_hand_body:
+            print(
+                "[deploy-branch] Ensure PolicyServer --model-path is the "
+                "hand-split-body checkpoint and LITCHI_ROOT is Litchi-Isaac-GR00T."
+            )
     _validate_rtc_config(config)
     pause_loop = True
 

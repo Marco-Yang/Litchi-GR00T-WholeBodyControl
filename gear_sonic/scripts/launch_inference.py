@@ -126,6 +126,9 @@ class InferenceLaunchConfig:
     policy_port: int = 5550
     """Isaac-GR00T PolicyServer port."""
 
+    deploy_branch: str | None = None
+    """Preset ``origin`` or ``hand-split-body`` (train-aligned RTC + banner)."""
+
     embodiment_tag: str = "unitree_g1_sonic"
     """Embodiment tag for policy inference."""
 
@@ -135,20 +138,20 @@ class InferenceLaunchConfig:
     action_publish_rate: int = 50
     """Rate at which individual actions are published to the C++ control loop (Hz)."""
 
-    action_horizon: int = 40
-    """Action horizon of the VLA policy."""
+    action_horizon: int | None = None
+    """Action horizon. Default 40, or from ``--deploy-branch``."""
 
     rtc: bool = True
     """Inpaint the previous chunk's tail into each new chunk."""
 
-    rtc_overlap_steps: int = 16
-    """Steps from the previous chunk inpainted into the new chunk."""
+    rtc_overlap_steps: int | None = None
+    """RTC overlap. Default 16, or from ``--deploy-branch``."""
 
-    rtc_frozen_steps: int = 8
-    """Leading inpainted steps that stay frozen."""
+    rtc_frozen_steps: int | None = None
+    """RTC frozen prefix. Default 8, or from ``--deploy-branch``."""
 
-    rtc_ramp_rate: float = 5.0
-    """Exponential ramp from the frozen prefix to the freely denoised tail."""
+    rtc_ramp_rate: float | None = None
+    """RTC ramp. Default 5.0, or from ``--deploy-branch``."""
 
     # Revo2 real hands
     revo2_send: bool = False
@@ -282,6 +285,18 @@ def _check_pane_alive(pane_index: int) -> bool:
 def main(config: InferenceLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
 
+    from gear_sonic.utils.inference.deploy_branch import (
+        finalize_inference_rtc,
+        format_branch_banner,
+        resolve_deploy_branch,
+    )
+
+    profile = None
+    if config.deploy_branch:
+        profile = resolve_deploy_branch(config.deploy_branch, require_ckpt=False)
+        print(format_branch_banner(profile))
+    finalize_inference_rtc(config, profile=profile)
+
     _check_prerequisites(config)
     _kill_existing_session()
 
@@ -291,6 +306,7 @@ def main(config: InferenceLaunchConfig):
     print("  SONIC VLA Inference Launcher")
     print("=" * 60)
     print(f"  Mode:            {'Simulation' if config.sim else 'Real Robot'}")
+    print(f"  Deploy branch:   {config.deploy_branch or '(none)'}")
     print(f"  PolicyServer:    {config.policy_host}:{config.policy_port}")
     print(f"  Embodiment:      {config.embodiment_tag}")
     print(f"  Prompt:          {config.prompt}")
@@ -429,6 +445,7 @@ def main(config: InferenceLaunchConfig):
         f"--rtc-ramp-rate {config.rtc_ramp_rate} "
         f"--camera-host {config.camera_host} "
         f"--camera-port {config.camera_port}"
+        f"{f' --deploy-branch {config.deploy_branch}' if config.deploy_branch else ''}"
         f"{' --revo2-send' if config.revo2_send else ''}"
         f" --revo2-orin-host {config.revo2_orin_host}"
         f" --revo2-udp-port {config.revo2_udp_port}"
