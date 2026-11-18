@@ -294,7 +294,11 @@ def _sync_gt_frame(
     target_idx: int,
     last_bgr: np.ndarray | None,
 ) -> tuple[int, np.ndarray | None, bool]:
-    """Advance GT video sequentially; seek only on backward jumps."""
+    """Advance GT video sequentially; seek only on backward jumps.
+
+    Past EOF: keep returning the last decoded frame (``ok=True`` if we have one)
+    so the dual-cam strip never disappears / stretches MuJoCo to fill the hole.
+    """
     if cap is None or target_idx < 0:
         return cap_idx, last_bgr, False
     if target_idx < cap_idx:
@@ -303,7 +307,8 @@ def _sync_gt_frame(
     while cap_idx <= target_idx:
         ok, bgr = cap.read()
         if not ok:
-            return cap_idx, last_bgr, False
+            # Freeze on last good frame for the rest of the episode / record tail.
+            return cap_idx, last_bgr, last_bgr is not None
         last_bgr = bgr
         cap_idx += 1
     return cap_idx, last_bgr, True
@@ -1438,13 +1443,22 @@ class SimMp4Recorder:
                 frame_i=hud_fi,
                 frame_n=hud_n,
             )
-        if self._gt_panel_layout in ("top", "bottom") and gt_panels:
-            bgr = _composite_gt_panel_row(
-                bgr,
-                gt_panels,
-                panel_h=self._top_panel_h,
-                below=self._gt_panel_below,
-            )
+        if self._gt_panel_layout in ("top", "bottom") and self._top_panel_h > 0:
+            if gt_panels:
+                bgr = _composite_gt_panel_row(
+                    bgr,
+                    gt_panels,
+                    panel_h=self._top_panel_h,
+                    below=self._gt_panel_below,
+                )
+            else:
+                # Keep reserved strip (black) so MuJoCo never stretches into panel space.
+                pad = np.zeros((self._top_panel_h, bgr.shape[1], 3), dtype=np.uint8)
+                bgr = (
+                    np.vstack([bgr, pad])
+                    if self._gt_panel_below
+                    else np.vstack([pad, bgr])
+                )
         if bgr.shape[0] != self._frame_h or bgr.shape[1] != self._frame_w:
             bgr = cv2.resize(bgr, (self._frame_w, self._frame_h), interpolation=cv2.INTER_AREA)
         self._write_frame(bgr)

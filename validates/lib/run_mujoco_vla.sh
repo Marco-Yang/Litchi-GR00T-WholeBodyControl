@@ -323,6 +323,11 @@ if [[ -n "${DUMP_HANDS_NPZ}" ]]; then
 fi
 if [[ -n "${DUMP_CL_PROPRIO_NPZ:-}" ]]; then
   VLA_PROPRIO_ARGS+=(--dump-cl-proprio-npz "${DUMP_CL_PROPRIO_NPZ}")
+  log "will dump CL proprio → ${DUMP_CL_PROPRIO_NPZ}"
+fi
+if [[ -n "${DUMP_CL_TOKENS_NPZ:-}" ]]; then
+  VLA_PROPRIO_ARGS+=(--dump-cl-tokens-npz "${DUMP_CL_TOKENS_NPZ}")
+  log "will dump CL tokens → ${DUMP_CL_TOKENS_NPZ}"
 fi
 (
   cd "${LITCHI_ROOT}"

@@ -240,6 +240,15 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--dump-cl-tokens-npz",
+        type=Path,
+        default=None,
+        help=(
+            "Closed-loop only: each control step, save published 64-d motion_token vs "
+            "dataset GT token at the same step (source 0=GT bootstrap/fallback, 1=pred)."
+        ),
+    )
+    ap.add_argument(
         "--closed-loop-sequential",
         action="store_true",
         help=(
@@ -736,6 +745,9 @@ def main() -> None:
     hands_lh = np.zeros((max_steps, 7), dtype=np.float32) if dump_hands else None
     hands_rh = np.zeros((max_steps, 7), dtype=np.float32) if dump_hands else None
     hands_src = np.zeros((max_steps,), dtype=np.int8) if dump_hands else None  # 0=GT, 1=pred
+    dump_cl_tokens = args.dump_cl_tokens_npz is not None
+    cl_tok = np.zeros((max_steps, 64), dtype=np.float32) if dump_cl_tokens else None
+    cl_tok_src = np.zeros((max_steps,), dtype=np.int8) if dump_cl_tokens else None  # 0=GT, 1=pred
     pred_rh_max = 0.0
     pred_steps = 0
 
@@ -784,6 +796,9 @@ def main() -> None:
                 hands_lh[step] = gt_lh[gi]
                 hands_rh[step] = gt_rh[gi]
                 hands_src[step] = 0
+            if dump_cl_tokens:
+                cl_tok[step] = gt_tokens[gi]
+                cl_tok_src[step] = 0
             if step == 0 or (step + 1) == bootstrap_n or step % 25 == 0:
                 print(
                     f"[vla] GT bootstrap step={step}/{bootstrap_n} "
@@ -872,6 +887,9 @@ def main() -> None:
                     hands_lh[step] = gt_lh[gi]
                     hands_rh[step] = gt_rh[gi]
                     hands_src[step] = 0
+                if dump_cl_tokens:
+                    cl_tok[step] = gt_tokens[gi]
+                    cl_tok_src[step] = 0
             else:
                 cur = min(int(chunk_idx["i"]), mt.shape[0] - 1)
                 lh_row = lh[cur] if lh is not None and lh.ndim == 2 else zero7
@@ -903,6 +921,9 @@ def main() -> None:
                             f"R={np.round(hands_rh[step][:6], 1).tolist()}",
                             flush=True,
                         )
+                if dump_cl_tokens:
+                    cl_tok[step] = np.asarray(mt[cur], dtype=np.float32).reshape(64)
+                    cl_tok_src[step] = 1
                 chunk_idx["i"] = min(int(chunk_idx["i"]) + 1, horizon - 1)
 
         t_next += period
@@ -956,6 +977,33 @@ def main() -> None:
         print(
             f"[vla] dumped CL proprio → {out_p} steps={len(proprio_dump['step'])} "
             f"has_msg={n_msg}",
+            flush=True,
+        )
+    if dump_cl_tokens and args.dump_cl_tokens_npz is not None:
+        out_t = Path(args.dump_cl_tokens_npz)
+        out_t.parent.mkdir(parents=True, exist_ok=True)
+        gt_aligned = np.stack(
+            [gt_tokens[min(i, gt_tokens.shape[0] - 1)] for i in range(max_steps)], axis=0
+        ).astype(np.float32)
+        np.savez_compressed(
+            out_t,
+            tokens=cl_tok,
+            gt_tokens=gt_aligned,
+            source=cl_tok_src,
+            bootstrap_n=np.int32(bootstrap_n),
+            control_fps=np.float32(args.control_fps),
+        )
+        pred_mask = cl_tok_src == 1
+        if pred_mask.any():
+            l2 = np.linalg.norm(cl_tok[pred_mask] - gt_aligned[pred_mask], axis=-1)
+            l2_mean = float(l2.mean())
+            l2_late = float(l2[max(0, l2.size - 100) :].mean()) if l2.size else 0.0
+        else:
+            l2_mean = l2_late = 0.0
+        print(
+            f"[vla] dumped CL tokens → {out_t} steps={max_steps} "
+            f"pred_steps={int(pred_mask.sum())} L2_pred_mean={l2_mean:.4f} "
+            f"L2_pred_last100_mean={l2_late:.4f}",
             flush=True,
         )
     print("[vla] done", flush=True)
