@@ -35,28 +35,50 @@ class DeployBranchProfile:
     vla_ckpt: Path
     litchi_root: Path
     description: str
+    rtc_execution_horizon: int = 15
+    num_inference_timesteps: int = 4
+    rtc_client_enabled: bool = False
+
+    @property
+    def inference_rate(self) -> float:
+        """Client re-query rate (Hz) when RTC overlap is 0: publish_hz / exec_h."""
+        exec_h = max(1, int(self.rtc_execution_horizon))
+        return 50.0 / float(exec_h)
 
 
-# Train-aligned RTC (same as MuJoCo validates for that ckpt family).
+# Deploy RTC for the active origin ckpt (skill25). Client uses NO overlap
+# inpainting (o=0/f=0); re-query every rtc_execution_horizon steps via --rate.
 _BRANCH_SPECS: Mapping[str, dict] = {
     "origin": {
-        "aliases": ("origin", "joint", "promptfix"),
+        "aliases": (
+            "origin",
+            "joint",
+            "skill25",
+            "skill2.5",
+            "promptfix",
+            "b64",
+            "b64-e4",
+        ),
         "split_hand_body": False,
         "action_horizon": 40,
-        "rtc_overlap_steps": 28,
-        "rtc_frozen_steps": 5,
+        # skill2_pick_toy_new_rtc_s15_d8_o6_f6_true_e4/checkpoint-10952
+        # train-aligned: o=6 f=6 ramp=3.0 exec_h=15 max_delay=8 denoise=4.
+        "rtc_overlap_steps": 6,
+        "rtc_frozen_steps": 6,
         "rtc_ramp_rate": 3.0,
-        "description": "joint action head (origin / promptfix_b32_e4)",
+        "rtc_execution_horizon": 15,
+        "num_inference_timesteps": 4,
+        "rtc_client_enabled": True,
+        "description": "joint action head (skill2_pick_toy_new_rtc_s15_d8_o6_f6_true_e4)",
         "ckpt_candidates": (
-            _WORKSPACE
-            / "data/demo/outputs/skill2_pick_toy_promptfix_b32_e4"
-            / "skill2_pick_toy_promptfix_b32_e4/checkpoint-49400",
-            _REPO_ROOT.parent
-            / "Gr00T/checkpoints/skill2/checkpoint-49400",
             Path(
                 "/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T"
-                "/checkpoints/skill2/checkpoint-49400"
+                "/checkpoints/skill2_pick_toy_new_rtc_s15_d8_o6_f6_true_e4"
+                "/checkpoint-10952"
             ),
+            _REPO_ROOT.parent
+            / "Gr00T/checkpoints/skill2_pick_toy_new_rtc_s15_d8_o6_f6_true_e4"
+            / "checkpoint-10952",
         ),
     },
     "hand-split-body": {
@@ -72,6 +94,9 @@ _BRANCH_SPECS: Mapping[str, dict] = {
         "rtc_overlap_steps": 25,
         "rtc_frozen_steps": 6,
         "rtc_ramp_rate": 3.0,
+        "rtc_execution_horizon": 15,
+        "num_inference_timesteps": 4,
+        "rtc_client_enabled": True,
         "description": "Phi0-style split hand/body action head",
         "ckpt_candidates": (
             _WORKSPACE
@@ -222,6 +247,9 @@ def resolve_deploy_branch(
         vla_ckpt=ckpt,
         litchi_root=_resolve_litchi_root(litchi_root, require_split=split),
         description=str(spec["description"]),
+        rtc_execution_horizon=int(spec.get("rtc_execution_horizon", 15)),
+        num_inference_timesteps=int(spec.get("num_inference_timesteps", 4)),
+        rtc_client_enabled=bool(spec.get("rtc_client_enabled", True)),
     )
 
 
@@ -294,7 +322,11 @@ def format_branch_banner(profile: DeployBranchProfile) -> str:
         f"  RTC H={profile.action_horizon} "
         f"overlap={profile.rtc_overlap_steps} "
         f"frozen={profile.rtc_frozen_steps} "
-        f"ramp={profile.rtc_ramp_rate}"
+        f"ramp={profile.rtc_ramp_rate} "
+        f"exec_h={profile.rtc_execution_horizon} "
+        f"denoise_steps={profile.num_inference_timesteps} "
+        f"client_rtc={'on' if profile.rtc_client_enabled else 'off'} "
+        f"rate≈{profile.inference_rate:.4f}"
     )
 
 
@@ -309,5 +341,9 @@ def shell_exports(profile: DeployBranchProfile) -> str:
         f"export RTC_OVERLAP_STEPS={profile.rtc_overlap_steps}",
         f"export RTC_FROZEN_STEPS={profile.rtc_frozen_steps}",
         f"export RTC_RAMP_RATE={profile.rtc_ramp_rate}",
+        f"export RTC_EXECUTION_HORIZON={profile.rtc_execution_horizon}",
+        f"export NUM_INFERENCE_TIMESTEPS={profile.num_inference_timesteps}",
+        f"export RTC_CLIENT_ENABLED={'1' if profile.rtc_client_enabled else '0'}",
+        f"export INFERENCE_RATE={profile.inference_rate}",
     ]
     return "\n".join(lines)

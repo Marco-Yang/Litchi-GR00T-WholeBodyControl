@@ -110,11 +110,13 @@ class InferenceConfig:
     rtc_ramp_rate: float | None = None
     """RTC ramp. Default 5.0, or train-aligned value from ``--deploy-branch``."""
 
-    rate: float = 1 / 0.4
+    rate: float | None = None
     """Rate at which we run the forward pass of the VLA policy (Hz).
 
-    Used only when RTC is off. With RTC, the next chunk starts when
-    ``action_horizon - rtc_overlap_steps`` actions have been executed.
+    Used only when RTC is off. Default ``50 / rtc_execution_horizon`` from
+    ``--deploy-branch`` (skill25: 50/15), else ``1/0.4``. With RTC, the next
+    chunk starts when ``action_horizon - rtc_overlap_steps`` actions have been
+    executed.
     """
 
     # Camera
@@ -454,12 +456,16 @@ def _validate_rtc_config(config: InferenceConfig) -> None:
     if not config.rtc:
         return
     if not (
-        0 <= config.rtc_frozen_steps < config.rtc_overlap_steps <= config.action_horizon
+        0
+        <= config.rtc_frozen_steps
+        <= config.rtc_overlap_steps
+        <= config.action_horizon
+        and config.rtc_overlap_steps > 0
         and config.rtc_ramp_rate > 0
     ):
         raise ValueError(
-            "RTC requires 0 <= rtc_frozen_steps < rtc_overlap_steps <= action_horizon "
-            "and rtc_ramp_rate > 0, got "
+            "RTC requires 0 <= rtc_frozen_steps <= rtc_overlap_steps <= action_horizon, "
+            "overlap > 0, and rtc_ramp_rate > 0, got "
             f"frozen={config.rtc_frozen_steps}, overlap={config.rtc_overlap_steps}, "
             f"horizon={config.action_horizon}, ramp={config.rtc_ramp_rate}"
         )
@@ -470,12 +476,23 @@ def main(config: InferenceConfig):
     if config.deploy_branch:
         profile = resolve_deploy_branch(config.deploy_branch, require_ckpt=False)
     finalize_inference_rtc(config, profile=profile)
+    # o=0 cannot re-trigger under RTC (index never reaches H-0 while capped at H-1).
+    if int(config.rtc_overlap_steps) == 0:
+        config.rtc = False
+    elif profile is not None and profile.rtc_client_enabled:
+        # Keep CLI --no-rtc if user explicitly disabled; otherwise train-aligned on.
+        pass
+    if config.rate is None:
+        config.rate = (
+            float(profile.inference_rate) if profile is not None else (1.0 / 0.4)
+        )
     if profile is not None:
         print_green(format_branch_banner(profile))
         print_green(
             f"Effective RTC after resolve: H={config.action_horizon} "
             f"overlap={config.rtc_overlap_steps} frozen={config.rtc_frozen_steps} "
-            f"ramp={config.rtc_ramp_rate}"
+            f"ramp={config.rtc_ramp_rate} rate={config.rate:.4f} "
+            f"client_rtc={'on' if config.rtc else 'off'}"
         )
         if profile.split_hand_body:
             print(

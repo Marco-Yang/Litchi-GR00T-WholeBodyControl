@@ -420,11 +420,15 @@ def main() -> None:
     rtc_frozen = int(args.rtc_frozen_steps)
     rtc_ramp = float(args.rtc_ramp_rate)
     if use_rtc:
-        if not (0 <= rtc_frozen < rtc_overlap <= horizon and rtc_ramp > 0):
+        if not (
+            0 <= rtc_frozen <= rtc_overlap <= horizon
+            and rtc_overlap > 0
+            and rtc_ramp > 0
+        ):
             raise SystemExit(
-                "RTC requires 0 <= rtc_frozen_steps < rtc_overlap_steps <= action_horizon "
-                f"and rtc_ramp_rate > 0; got frozen={rtc_frozen} overlap={rtc_overlap} "
-                f"horizon={horizon} ramp={rtc_ramp}"
+                "RTC requires 0 <= rtc_frozen_steps <= rtc_overlap_steps <= action_horizon, "
+                f"overlap > 0, and rtc_ramp_rate > 0; got frozen={rtc_frozen} "
+                f"overlap={rtc_overlap} horizon={horizon} ramp={rtc_ramp}"
             )
         print(
             f"[vla] RTC ON H={horizon} overlap={rtc_overlap} frozen={rtc_frozen} "

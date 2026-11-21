@@ -1115,16 +1115,24 @@ if(A3_TA_PROTO_AVAILABLE)
 endif()
 
 # test executable:
-include(FetchContent)
-
-# Download and make GoogleTest available
-FetchContent_Declare(
-  googletest
-  URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
-)
-FetchContent_MakeAvailable(googletest)
-
-find_package(GTest REQUIRED)
+# Prefer system GTest (libgtest-dev). Avoid FetchContent URL download — GitHub
+# is often unreachable on this deploy host and leaves a 0-byte zip.
+find_package(GTest QUIET)
+if(NOT GTest_FOUND)
+  include(FetchContent)
+  set(_gs_gtest_local
+    "${CMAKE_CURRENT_BINARY_DIR}/../../_deps/googletest-src")
+  if(EXISTS "${_gs_gtest_local}/CMakeLists.txt")
+    FetchContent_Declare(googletest SOURCE_DIR "${_gs_gtest_local}")
+  else()
+    FetchContent_Declare(
+      googletest
+      URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+    )
+  endif()
+  FetchContent_MakeAvailable(googletest)
+  find_package(GTest REQUIRED)
+endif()
 
 file(GLOB_RECURSE TEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/*.cpp)
 list(APPEND TEST_SRCS

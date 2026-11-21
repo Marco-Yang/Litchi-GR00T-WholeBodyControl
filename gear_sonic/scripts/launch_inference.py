@@ -153,6 +153,9 @@ class InferenceLaunchConfig:
     rtc_ramp_rate: float | None = None
     """RTC ramp. Default 5.0, or from ``--deploy-branch``."""
 
+    rate: float | None = None
+    """VLA forward rate (Hz) when RTC is off. Default 50/exec_h from branch."""
+
     # Revo2 real hands
     revo2_send: bool = False
     """Stream predicted hand joints to Orin revo2_modbus_rx (UDP)."""
@@ -296,6 +299,13 @@ def main(config: InferenceLaunchConfig):
         profile = resolve_deploy_branch(config.deploy_branch, require_ckpt=False)
         print(format_branch_banner(profile))
     finalize_inference_rtc(config, profile=profile)
+    if int(config.rtc_overlap_steps) == 0:
+        config.rtc = False
+    if config.rate is None:
+        if profile is not None:
+            config.rate = float(profile.inference_rate)
+        else:
+            config.rate = 1.0 / 0.4
 
     _check_prerequisites(config)
     _kill_existing_session()
@@ -319,7 +329,10 @@ def main(config: InferenceLaunchConfig):
             f"ramp={config.rtc_ramp_rate}"
         )
     else:
-        print("  RTC:             off")
+        print(
+            f"  RTC:             off (rate={config.rate:.4f} Hz, "
+            f"≈ exec every {50.0 / float(config.rate):.1f} steps @50Hz)"
+        )
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
     print(f"  Data exporter:   {'Yes' if config.data_exporter else 'No'}")
     if config.data_exporter:
@@ -443,6 +456,7 @@ def main(config: InferenceLaunchConfig):
         f"--rtc-overlap-steps {config.rtc_overlap_steps} "
         f"--rtc-frozen-steps {config.rtc_frozen_steps} "
         f"--rtc-ramp-rate {config.rtc_ramp_rate} "
+        f"--rate {config.rate} "
         f"--camera-host {config.camera_host} "
         f"--camera-port {config.camera_port}"
         f"{f' --deploy-branch {config.deploy_branch}' if config.deploy_branch else ''}"
