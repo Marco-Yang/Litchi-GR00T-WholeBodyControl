@@ -4,8 +4,8 @@
 
 **用法：** C1–C5 / B1–B2 **每个代码块自包含**，新开终端直接整段粘贴即可，不必先做「公共环境」。
 
-当前 VLA 默认：`…/skill2_pick_toy_new_rtc_s15_d8_o6_f6_true_e4/checkpoint-10952`。  
-**部署 RTC = 训练：** `--rtc`，`H=40 o=6 f=6 ramp=3.0`；`exec_h=15`；denoise=`4`。客户端约每 `H-o=34` 步重推。  
+当前 VLA 默认：`…/skill2_pick_toy_new_rtc_s15_d8_o12_f6_true_e4/checkpoint-10952`。  
+**部署 RTC = 训练：** `--rtc`，`H=40 o=12 f=6 ramp=3.0`；`exec_h=15`；denoise=`4`。客户端约每 `H-o=28` 步重推。  
 **策略包只用 `policy/sonic_v1_1`**（`--cp policy/sonic_v1_1/model` 是文件前缀，不是 `model/` 目录）。真机须有 `192.168.123.x`；`lo` 只给仿真。
 
 ---
@@ -79,17 +79,17 @@ python gear_sonic/scripts/pico_manager_thread_server.py \
 
 ---
 
-## C. 路线二：VLA 真机（skill2_pick_toy_new_rtc_s15_d8_o6_f6_true_e4 · origin / hand-split-body）
+## C. 路线二：VLA 真机（skill2_pick_toy_new_rtc_s15_d8_o12_f6_true_e4 · origin / hand-split-body）
 
 架构：PolicyServer（GPU）+ 相机 ZMQ + C++ deploy + `run_vla_inference`。  
 **C++ / ZMQ / 真手链路对两个分支相同**；差别只在 VLA 权重（joint vs split action head）和 RTC 数字。  
-**origin 当前 ckpt：** `skill2_pick_toy_new_rtc_s15_d8_o6_f6_true_e4/checkpoint-10952`。  
-**部署 RTC = 训练：** `H=40, overlap=6, frozen=6, ramp=3.0`（`exec_h=15`）；`num_inference_timesteps=4` 由 ckpt 载入。  
-须开 `--rtc`；约每 `34` 步（`H-o`）出新 chunk。下面各终端块自包含，**直接粘贴**。
+**origin 当前 ckpt：** `skill2_pick_toy_new_rtc_s15_d8_o12_f6_true_e4/checkpoint-10952`（`rtc_training=true`）。  
+**部署 RTC = 训练：** `H=40, overlap=12, frozen=6, ramp=3.0`（`exec_h=15`，`max_delay=8`）；`num_inference_timesteps=4` 由 ckpt 载入。  
+须开 `--rtc`；约每 `28` 步（`H-o`）出新 chunk。下面各终端块自包含，**直接粘贴**。
 
 | 分支 | action head | 本机默认 ckpt | 部署客户端 |
 |------|-------------|---------------|------------|
-| `origin` | joint | `…/skill2_pick_toy_new_rtc_s15_d8_o6_f6_true_e4/checkpoint-10952` | **`--rtc` H=40 o=6 f=6 ramp=3.0；denoise=4** |
+| `origin` | joint | `…/skill2_pick_toy_new_rtc_s15_d8_o12_f6_true_e4/checkpoint-10952` | **`--rtc` H=40 o=12 f=6 ramp=3.0；denoise=4** |
 | `hand-split-body` | split body64+hand14 | `…/skill2_hand_body_split` 或 zhenyu outputs | `--rtc` o=25 f=6 |
 
 ### C1. 终端 — 相机（在 Orin `192.168.123.164`）
@@ -118,16 +118,16 @@ python gear_sonic/scripts/run_camera_viewer.py --camera-host "$CAMERA_HOST"
 
 ```bash
 export REPO="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl"
-export VLA_CKPT="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T/checkpoints/skill2_pick_toy_new_rtc_s15_d8_o6_f6_true_e4/checkpoint-10952"
+export VLA_CKPT="/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T/checkpoints/skill2_pick_toy_new_rtc_s15_d8_o12_f6_true_e4/checkpoint-10952"
 export LITCHI_ROOT="$REPO/.deps/Isaac-GR00T"
 # 本地已缓存的 Cosmos backbone（避免 HF_HUB_OFFLINE 下再打 huggingface.co）
 export HF_HOME="${HOME}/.cache/huggingface"
 export GROOT_BACKBONE_PATH="${HF_HOME}/hub/models--nvidia--Cosmos-Reason2-2B/snapshots/9ce19a195e423419c349abfc86fd07178b230561"
 test -d "$GROOT_BACKBONE_PATH" || { echo "MISSING Cosmos local snapshot: $GROOT_BACKBONE_PATH"; exit 1; }
-# denoise steps 来自 ckpt config.json（应为 4）
-python3 -c "import json; c=json.load(open('$VLA_CKPT/config.json')); assert c.get('num_inference_timesteps')==4; print('denoise OK', c['num_inference_timesteps'])"
+# 训练 RTC 对齐检查：o=12 f=6 ramp=3.0 exec_h=15 denoise=4
+python3 -c "import json; c=json.load(open('$VLA_CKPT/config.json')); assert c.get('rtc_training') is True; assert c.get('rtc_overlap_steps')==12; assert c.get('rtc_frozen_steps')==6; assert float(c.get('rtc_ramp_rate'))==3.0; assert c.get('rtc_execution_horizon')==15; assert c.get('num_inference_timesteps')==4; print('train RTC OK', {k:c[k] for k in ['rtc_overlap_steps','rtc_frozen_steps','rtc_ramp_rate','rtc_execution_horizon','num_inference_timesteps']})"
 
-# 同步 RTC 补丁 Policy（训练对齐 o=6/f=6）
+# 同步 RTC 补丁 Policy（支持 soft ramp：f=6 < o=12）
 test -f "$REPO/../Gr00T/gr00t/policy/gr00t_policy.py" \
   && cp -f "$REPO/../Gr00T/gr00t/policy/gr00t_policy.py" "$LITCHI_ROOT/gr00t/policy/gr00t_policy.py"
 grep -q '_attach_rtc_action' "$LITCHI_ROOT/gr00t/policy/gr00t_policy.py" \
@@ -145,7 +145,7 @@ python gr00t/eval/run_gr00t_server.py \
   --port 5550
 ```
 
-C4 应见：`RTC on: horizon=40, overlap=6, frozen=6, ramp=3.0`，以及 `New action chunk (RTC, ...)`（首块可为 `no RTC`）。
+C4 应见：`RTC on: horizon=40, overlap=12, frozen=6, ramp=3.0`，以及 `New action chunk (RTC, ...)`（首块可为 `no RTC`）。
 
 ### C3. 终端 — C++ deploy（与遥操相同，input=zmq）
 
@@ -207,7 +207,7 @@ export CAMERA_HOST="192.168.123.164"
 export POLICY_HOST="127.0.0.1"
 export PROMPT="侧平举抬起右手然后抓取前方绿色桌子上的黄色玩偶，抓起以后放进编织篮里"
 export ACTION_HORIZON=40
-export RTC_OVERLAP_STEPS=6
+export RTC_OVERLAP_STEPS=12
 export RTC_FROZEN_STEPS=6
 export RTC_RAMP_RATE=3.0
 
@@ -215,7 +215,7 @@ cd "$REPO"
 source .venv_inference/bin/activate
 pgrep -af 'run_sim_loop|run_sim_record|run_mujoco_vla' && echo 'STOP SIM FIRST' || echo 'OK no sim'
 
-# o6_f6_true_e4/10952：训练对齐 RTC o=6/f=6/ramp=3.0
+# o12_f6_true_e4/10952：训练对齐 RTC o=12/f=6/ramp=3.0
 python gear_sonic/scripts/run_vla_inference.py \
   --deploy-branch origin \
   --host "$POLICY_HOST" \
@@ -242,7 +242,7 @@ python gear_sonic/scripts/run_vla_inference.py \
 > `state`/`action` ZMQ 默认与本机 C++ deploy 同机；若拆机，改成 deploy 机 IP。  
 > C4 默认 **暂停**（`Pausing...`）；必须另开 **C5 键盘发布端**，按 `k` → `i` → `p` 才会动。  
 > **Revo2：** 必须先有 **C3.5** `receiver ready`，本命令保留 `--revo2-send`。  
-> **RTC（= 训练）：** `RTC on: horizon=40, overlap=6, frozen=6, ramp=3.0`；后续应为 `New action chunk (RTC, ...)`。denoise=4 由 ckpt 载入。
+> **RTC（= 训练）：** `RTC on: horizon=40, overlap=12, frozen=6, ramp=3.0`；后续应为 `New action chunk (RTC, ...)`。denoise=4 由 ckpt 载入。
 
 ### C5. 终端 — 键盘发布（VLA 真机必开）
 
@@ -317,7 +317,7 @@ python gear_sonic/scripts/launch_inference.py \
   --camera-host "$CAMERA_HOST" \
   --prompt "$PROMPT" \
   --rtc \
-  --rtc-overlap-steps 6 \
+  --rtc-overlap-steps 12 \
   --rtc-frozen-steps 6 \
   --rtc-ramp-rate 3.0 \
   --revo2-send \
@@ -368,10 +368,10 @@ pkill -INT -x g1_deploy_onnx_ref || pkill -TERM -x g1_deploy_onnx_ref
 | VLA | C1 相机 + C2 server + C3 deploy + **C3.5 RX** + C4（`--revo2-send`）+ **C5 键盘**（`k`→`i`→`p`） |
 | Revo2 手 | **C3.5** `bash scripts/start_orin_revo2_rx.sh`（Manus 目录）+ C4 `--revo2-send` → UDP `:19500` |
 | 策略包 | `policy/sonic_v1_1` only（`--cp policy/sonic_v1_1/model` 前缀） |
-| VLA 权重 | origin：`…/skill2_pick_toy_new_rtc_s15_d8_o6_f6_true_e4/checkpoint-10952` |
+| VLA 权重 | origin：`…/skill2_pick_toy_new_rtc_s15_d8_o12_f6_true_e4/checkpoint-10952` |
 | PolicyServer | origin：`$REPO/.deps/Isaac-GR00T`；hand-split 须 **Litchi-Isaac-GR00T** + `.venv_inference` |
 | 分支切换 | `--deploy-branch origin\|hand-split-body`（C4/launcher）；C++ / Revo2 / 相机链路不变 |
-| 部署 RTC | **origin = 训练：`--rtc` H=40 o=6 f=6 ramp=3.0；denoise=4** |
+| 部署 RTC | **origin = 训练：`--rtc` H=40 o=12 f=6 ramp=3.0；denoise=4** |
 | 键盘口 | `tcp://localhost:5580`；`k` 启停，`i` 臂安全就绪，`p` 跑/停策略 |
 
 安全：物理急停 > 软件 `O` > `pkill -INT`。  

@@ -1,0 +1,31 @@
+{
+  "default_skill_id": "1",
+  "policy_host": "127.0.0.1",
+  "policy_port": 5550,
+  "standby_port": 5551,
+  "supervisor_host": "127.0.0.1",
+  "supervisor_port": 5590,
+  "skills": [
+    {
+      "id": "1",
+      "name": "skill1_walk",
+      "label": "走到绿桌",
+      "checkpoint": "/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T/checkpoints/skill1_walk_towards_green_table_nortc_true_e4/checkpoint-3852",
+      "prompt": "走到绿色桌子前"
+    },
+    {
+      "id": "2",
+      "name": "skill2_pick_toy",
+      "label": "抓玩偶放篮",
+      "checkpoint": "/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T/checkpoints/skill2_pick_toy_new_nortc_true_e4/checkpoint-10952",
+      "prompt": "侧平举抬起右手然后抓取前方绿色桌子上的黄色玩偶，抓起以后放进编织篮里"
+    },
+    {
+      "id": "3",
+      "name": "skill3_pick_basket",
+      "label": "拎篮转向黑箱",
+      "checkpoint": "/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T/checkpoints/skill3_pict_basket/skill3_pick_basket_nortc_true_e4/checkpoint-5336",
+      "prompt": "拿起装黄色玩偶的篮子，后退，转向朝向黑色箱子的方向"
+    }
+  ]
+}

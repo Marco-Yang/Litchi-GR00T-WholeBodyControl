@@ -26,6 +26,7 @@ import pyrealsense2 as rs
 import zmq
 
 DEFAULT_WRIST_STATUS_FILE = "/tmp/g1_wrist_status.json"
+FRAME_TIMEOUT_MS = 2000
 
 
 def read_wrist_status(path, max_age_s=3.0):
@@ -57,49 +58,81 @@ def encode_jpeg_b64(rgb_image, quality=80):
 
 
 class ColorCam(object):
-    def __init__(self, serial, width=640, height=480, fps=30):
+    def __init__(self, name, serial, width, height, fps, stop):
+        self.name = name
         self.serial = serial
-        self.pipe = rs.pipeline()
-        cfg = rs.config()
-        cfg.enable_device(serial)
-        cfg.enable_stream(rs.stream.color, width, height, rs.format.rgb8, fps)
-        self.profile = self.pipe.start(cfg)
+        self.width = width
+        self.height = height
+        self.fps = fps
         self.lock = threading.Lock()
         self.frame = None
-        self.stamp = 0.0
-        self._stop = False
-        self._err = None
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self.stamp = None
+        self._stop = stop
+        self.error = "starting"
+        self._thread = threading.Thread(target=self._loop, name=name)
         self._thread.start()
 
+    def _read_frames(self, pipe):
+        while not self._stop.is_set():
+            frames = pipe.wait_for_frames(FRAME_TIMEOUT_MS)
+            color = frames.get_color_frame()
+            if not color:
+                raise RuntimeError("frameset has no color frame")
+            # Keep SDK-owned buffers out of the publisher and the next pipeline.
+            img = np.asanyarray(color.get_data()).copy()
+            with self.lock:
+                first_frame = self.frame is None
+                self.frame = img
+                self.stamp = time.time()
+                self.error = None
+            if first_frame:
+                print("[g1-cam] %s SN=%s streaming" % (self.name, self.serial), flush=True)
+
     def _loop(self):
-        while not self._stop:
+        retry_delay = 0.0
+        while not self._stop.is_set():
+            pipe = None
+            started = False
             try:
-                frames = self.pipe.wait_for_frames(2000)
-                color = frames.get_color_frame()
-                if not color:
-                    continue
-                img = np.asanyarray(color.get_data())
+                # start() can block the Orin's Python runtime for 15s when the
+                # selected serial is absent. Wait for USB enumeration ourselves.
+                ctx = rs.context()
+                if not any(d.get_info(rs.camera_info.serial_number) == self.serial
+                           for d in ctx.devices):
+                    raise RuntimeError("device not present on USB")
+                pipe = rs.pipeline(ctx)
+                cfg = rs.config()
+                cfg.enable_device(self.serial)
+                cfg.enable_stream(rs.stream.color, self.width, self.height, rs.format.rgb8, self.fps)
+                pipe.start(cfg)
+                started = True
+                self._read_frames(pipe)
+            except Exception as exc:
                 with self.lock:
-                    self.frame = img
-                    self.stamp = time.time()
-            except Exception as e:
-                self._err = str(e)
-                time.sleep(0.05)
+                    if self.frame is not None:
+                        retry_delay = 0.0
+                    self.frame = self.stamp = None
+                    self.error = str(exc)
+                if not self._stop.is_set():
+                    print("[g1-cam] %s SN=%s: %s; reopening in %.1fs"
+                          % (self.name, self.serial, exc, retry_delay), flush=True)
+            finally:
+                if started:
+                    try:
+                        pipe.stop()
+                    except RuntimeError as exc:
+                        print("[g1-cam] %s stop: %s" % (self.name, exc), flush=True)
+                del pipe
+            if self._stop.wait(retry_delay):
+                break
+            retry_delay = min(5.0, max(1.0, 2 * retry_delay))
 
     def latest(self):
         with self.lock:
-            if self.frame is None:
-                return None, None
-            return self.frame.copy(), self.stamp
+            return self.frame, self.stamp
 
-    def close(self):
-        self._stop = True
-        self._thread.join(timeout=2.0)
-        try:
-            self.pipe.stop()
-        except Exception:
-            pass
+    def join(self):
+        self._thread.join()
 
 
 def main():
@@ -124,93 +157,75 @@ def main():
     )
     args = ap.parse_args()
 
-    print("[g1-dual-rgb] devices:")
-    for d in rs.context().devices:
-        print(
-            " ",
-            d.get_info(rs.camera_info.serial_number),
-            d.get_info(rs.camera_info.name),
-            "usb",
-            d.get_info(rs.camera_info.usb_type_descriptor),
-        )
+    if min(args.fps, args.width, args.height) <= 0:
+        ap.error("fps, width and height must be positive")
+    if args.ego_sn == args.head_sn:
+        ap.error("ego and head must use different serial numbers")
 
-    ego = ColorCam(args.ego_sn, args.width, args.height, args.fps)
-    head = ColorCam(args.head_sn, args.width, args.height, args.fps)
-    print("[g1-dual-rgb] started ego=%s head=%s" % (args.ego_sn, args.head_sn))
-
-    ctx = zmq.Context()
-    sock = ctx.socket(zmq.PUB)
-    sock.setsockopt(zmq.SNDHWM, 20)
-    sock.setsockopt(zmq.LINGER, 0)
-    sock.bind("tcp://*:%d" % args.port)
-    print("[g1-dual-rgb] PUB tcp://*:%d" % args.port)
-
-    stop = {"v": False}
+    stop = threading.Event()
 
     def _sig(*_a):
-        stop["v"] = True
+        stop.set()
 
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
 
+    cameras = {}
+    with zmq.Context() as ctx, ctx.socket(zmq.PUB) as sock:
+        sock.setsockopt(zmq.SNDHWM, 20)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.bind("tcp://*:%d" % args.port)
+        print("[g1-dual-rgb] PUB tcp://*:%d" % args.port, flush=True)
+        try:
+            for name, serial in (("ego_view", args.ego_sn), ("head", args.head_sn)):
+                cameras[name] = ColorCam(name, serial, args.width, args.height, args.fps, stop)
+            publish(sock, cameras, args, stop)
+        finally:
+            stop.set()
+            for cam in cameras.values():
+                cam.join()
+    print("[g1-dual-rgb] stopped")
+    return 0
+
+
+def publish(sock, cameras, args, stop):
     interval = 1.0 / float(args.fps)
-    t0 = time.monotonic()
-    idx = 0
     sent = 0
     dropped = 0
-    fps_t = time.monotonic()
+    previous_sent = 0
+    last_status = time.monotonic()
+    target = last_status
 
-    while not stop["v"]:
-        target = t0 + (idx + 1) * interval
-        ego_img, ego_t = ego.latest()
-        head_img, head_t = head.latest()
-        if ego_img is not None and head_img is not None:
-            payload = {
-                "timestamps": {"ego_view": ego_t, "head": head_t},
-                "images": {
-                    "ego_view": encode_jpeg_b64(ego_img, args.jpeg_quality),
-                    "head": encode_jpeg_b64(head_img, args.jpeg_quality),
-                },
-            }
+    while not stop.is_set():
+        payload = {"timestamps": {}, "images": {}}
+        for name, cam in cameras.items():
+            img, stamp = cam.latest()
+            if img is not None:
+                payload["images"][name] = encode_jpeg_b64(img, args.jpeg_quality)
+                payload["timestamps"][name] = stamp
+        if payload["images"]:
             try:
                 sock.send(msgpack.packb(payload, use_bin_type=True), flags=zmq.NOBLOCK)
                 sent += 1
             except zmq.Again:
                 dropped += 1
-            idx += 1
-            if sent % 30 == 0:
-                now = time.monotonic()
-                line = (
-                    "[g1-cam] sent=%d dropped=%d fps=%.1f ego_err=%s head_err=%s"
-                    % (
-                        sent,
-                        dropped,
-                        30.0 / max(1e-6, now - fps_t),
-                        ego._err,
-                        head._err,
-                    )
-                )
-                wrist = read_wrist_status(args.wrist_status_file)
-                if wrist is not None:
-                    wl, wr, wfps = wrist
-                    line += " | wrist_fps=%s left_err=%s right_err=%s" % (wfps, wl, wr)
-                elif args.show_wrist_status:
-                    line += " | wrist_fps=- left_err=offline right_err=offline"
-                print(line)
-                fps_t = now
 
-        sleep_t = target - time.monotonic()
-        if sleep_t > 0:
-            time.sleep(sleep_t)
-        else:
-            idx += 1  # keep cadence if late
+        now = time.monotonic()
+        if now - last_status >= 1.0:
+            fps = (sent - previous_sent) / (now - last_status)
+            line = ("[g1-cam] sent=%d dropped=%d fps=%.1f ego_err=%s head_err=%s"
+                    % (sent, dropped, fps, cameras["ego_view"].error, cameras["head"].error))
+            wrist = read_wrist_status(args.wrist_status_file)
+            if wrist is not None:
+                wl, wr, wfps = wrist
+                line += " | wrist_fps=%s left_err=%s right_err=%s" % (wfps, wl, wr)
+            elif args.show_wrist_status:
+                line += " | wrist_fps=- left_err=offline right_err=offline"
+            print(line, flush=True)
+            previous_sent, last_status = sent, now
 
-    ego.close()
-    head.close()
-    sock.close()
-    ctx.term()
-    print("[g1-dual-rgb] stopped")
-    return 0
+        target = max(target + interval, now)
+        stop.wait(max(0.0, target - time.monotonic()))
 
 
 if __name__ == "__main__":

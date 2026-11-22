@@ -46,8 +46,8 @@ class DeployBranchProfile:
         return 50.0 / float(exec_h)
 
 
-# Deploy RTC for the active origin ckpt (skill25). Client uses NO overlap
-# inpainting (o=0/f=0); re-query every rtc_execution_horizon steps via --rate.
+# Active origin: train-RTC ckpt; deploy RTC matches training.
+# Re-query every H-o steps under --rtc (not --rate).
 _BRANCH_SPECS: Mapping[str, dict] = {
     "origin": {
         "aliases": (
@@ -58,26 +58,32 @@ _BRANCH_SPECS: Mapping[str, dict] = {
             "promptfix",
             "b64",
             "b64-e4",
+            "nortc",
+            "r2",
         ),
         "split_hand_body": False,
         "action_horizon": 40,
-        # skill2_pick_toy_new_rtc_s15_d8_o6_f6_true_e4/checkpoint-10952
-        # train-aligned: o=6 f=6 ramp=3.0 exec_h=15 max_delay=8 denoise=4.
-        "rtc_overlap_steps": 6,
+        # skill2_pick_toy_new_rtc_s15_d8_o12_f6_true_e4/checkpoint-10952
+        # train: o=12 f=6 ramp=3.0 exec_h=15 max_delay=8 denoise=4.
+        "rtc_overlap_steps": 12,
         "rtc_frozen_steps": 6,
         "rtc_ramp_rate": 3.0,
         "rtc_execution_horizon": 15,
         "num_inference_timesteps": 4,
         "rtc_client_enabled": True,
-        "description": "joint action head (skill2_pick_toy_new_rtc_s15_d8_o6_f6_true_e4)",
+        "description": (
+            "joint action head "
+            "(skill2_pick_toy_new_rtc_s15_d8_o12_f6_true_e4) "
+            "+ train-aligned RTC o=12/f=6/ramp=3.0"
+        ),
         "ckpt_candidates": (
             Path(
                 "/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T"
-                "/checkpoints/skill2_pick_toy_new_rtc_s15_d8_o6_f6_true_e4"
+                "/checkpoints/skill2_pick_toy_new_rtc_s15_d8_o12_f6_true_e4"
                 "/checkpoint-10952"
             ),
             _REPO_ROOT.parent
-            / "Gr00T/checkpoints/skill2_pick_toy_new_rtc_s15_d8_o6_f6_true_e4"
+            / "Gr00T/checkpoints/skill2_pick_toy_new_rtc_s15_d8_o12_f6_true_e4"
             / "checkpoint-10952",
         ),
     },

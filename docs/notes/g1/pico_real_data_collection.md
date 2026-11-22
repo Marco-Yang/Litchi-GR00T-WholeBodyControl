@@ -161,24 +161,40 @@ bash gear_sonic_deploy/scripts/g1_camera_rgb_server.sh
 
 # 四路：外加参数 wrist（再启 left/right_wrist → :5558）
 # 需强脑插入端在线（ttyACM0/1 + Abham HHW001/HHW002）
-bash gear_sonic_deploy/scripts/g1_camera_rgb_server.sh wrist
+# bash gear_sonic_deploy/scripts/g1_camera_rgb_server.sh wrist
 ```
 
 ### 3.3 工作站：相机监控（可选，与数采无关）
 
-一条命令：订 `:5555` + `:5558`，**有几路显示几路**（最多 2×2）：
+当前数采订阅 Orin 的 `:5555`，查看主视角和头部画面。
 
 ```bash
 cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 source .venv_data_collection/bin/activate
 # 若 imshow 报 GUI not implemented：先卸 opencv-python-headless
 python gear_sonic/scripts/run_camera_viewer.py \
-  --camera-host 192.168.123.164
+  --camera-host 192.168.123.164 --camera-ports 5555
 ```
 
 ---
 
 ## 4. 真机数采启动顺序
+
+**打开数采网页**
+
+在工作站启动服务
+
+```bash
+/home/user/YZY/HumanoidWBM/G1-Data-Station/start.sh
+```
+
+另开终端打开网页
+
+```bash
+xdg-open http://127.0.0.1:8786/
+```
+
+网址　<http://127.0.0.1:8786/>
 
 安全：吊带；物理急停有人盯；**已关掉** `run_sim_loop.py`。
 
@@ -193,22 +209,21 @@ python gear_sonic/scripts/run_camera_viewer.py \
 | 5 | 工作站终端 3 | data exporter `--hand-type revo2`（§4.5） |
 | 6 | 工作站 | CPU 绑核（§4.6；三端起来后执行） |
 
-### 4.1 机器人 — Camera（ego + head + **左右腕**）
+### 4.1 机器人 — Camera（ego + head）
 
-按 **§3.2**，Revo2 数采默认开四路：`ego_view`/`head` → `:5555`，`left_wrist`/`right_wrist`（Abham）→ `:5558`：
+当前 Revo2 数采使用主视角 `ego_view` 和头部 `head`，两路图像均由 Orin 的 `:5555` 发布。
 
 ```bash
-# Orin（需腕部 Abham HHW002/HHW001 在线）
-bash gear_sonic_deploy/scripts/g1_camera_rgb_server.sh wrist
+# Orin
+bash gear_sonic_deploy/scripts/g1_camera_rgb_server.sh
 ```
 
-工作站确认四路画面（有什么显示什么）：
+在工作站确认两路画面。
 
 ```bash
 cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
 source .venv_data_collection/bin/activate
-python gear_sonic/scripts/run_camera_viewer.py --camera-host 192.168.123.164
-# viewer 会订 :5555 + :5558；应看到 ego_view / head / left_wrist / right_wrist
+python gear_sonic/scripts/run_camera_viewer.py --camera-host 192.168.123.164 --camera-ports 5555
 ```
 
 ### 4.2 机器人 — Revo2 Modbus 接收端（`revo2_modbus_rx`）
@@ -269,9 +284,9 @@ python gear_sonic/scripts/pico_manager_thread_server.py --robot g1 --manager
 | `g1_camera_rgb_server.sh` | `ego_view` + `head` |
 | `g1_camera_rgb_server.sh wrist` | 上表 + `left_wrist` + `right_wrist` |
 
-强制开关（一般不用）：`--record-wrist-cameras` / `--no-record-wrist-cameras`，`--record-head-camera` / `--no-record-head-camera`。
+当前工作台使用 `--record-wrist-cameras False`，只在 `:5555` 探测头部画面。
 
-**推荐命令（Revo2；相机自动；默认 Origin / live token）：**
+**当前数采命令（Revo2，双路相机，默认 Origin / live token）**
 
 ```bash
 cd /home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl
@@ -280,6 +295,7 @@ python gear_sonic/scripts/run_data_exporter.py \
   --task-prompt "侧平举抬起右手然后抓取前方绿色桌子上的黄色玩偶，抓起以后放进编织篮里" \
   --camera-host 192.168.123.164 \
   --camera-port 5555 \
+  --record-wrist-cameras False \
   --root-output-dir outputs \
   --hand-type revo2 \
   --revo2-pose ../Manus/config/revo2_grasp_pose_02.json \
@@ -289,7 +305,7 @@ python gear_sonic/scripts/run_data_exporter.py \
 
 启动日志应出现：
 
-- `[Camera] recording → ego_view, head`（或带腕部的四路）
+- `[Camera] recording → ego_view, head`
 - **`[motion_token] episode-end rewrite DISABLED — disk keeps live token_state`**（默认 live；必看）
 
 若要开环 mode-2 监督，显式加 `--rewrite-motion-token-supervised`，日志变为 `rewrite ENABLED ... disk tokens = open-loop mode2`。
@@ -370,11 +386,9 @@ outputs/<dataset>/
 ├── data/chunk-000/episode_*.parquet
 ├── videos/chunk-000/observation.images.ego_view/episode_*.mp4
 ├── videos/chunk-000/observation.images.head/episode_*.mp4
-├── videos/chunk-000/observation.images.left_wrist/episode_*.mp4   # Abham 左腕
-├── videos/chunk-000/observation.images.right_wrist/episode_*.mp4  # Abham 右腕
 └── meta/
     ├── info.json
-    ├── modality.json      # GR00T 需要；含 video.left_wrist / right_wrist
+    ├── modality.json      # GR00T 使用的视频及动作映射
     ├── episodes.jsonl
     ├── tasks.jsonl
     └── episodes_stats.jsonl

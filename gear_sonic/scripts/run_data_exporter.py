@@ -105,14 +105,14 @@ class SonicDataExporterConfig:
 
     record_wrist_cameras: Optional[bool] = None
     """Wrist video: ``None``/omit = auto-detect :5558; ``True`` force on; ``False`` force off
-    (``--no-record-wrist-cameras``)."""
+    (``--record-wrist-cameras False``)."""
 
     wrist_camera_port: int = 5558
     """ZMQ port for left_wrist + right_wrist (Orin Abham server)."""
 
     record_head_camera: Optional[bool] = None
     """Head video: ``None``/omit = auto-detect ``head`` on :5555; ``True`` force on;
-    ``False`` force off (``--no-record-head-camera``)."""
+    ``False`` force off (``--record-head-camera False``)."""
 
     camera_probe_timeout_s: float = 2.0
     """Seconds to wait for a camera ZMQ frame when auto-detecting streams."""
@@ -166,6 +166,7 @@ def probe_zmq_image_keys(host: str, port: int, timeout_s: float = 2.0) -> set[st
 
     Does not JPEG-decode; only inspects ``images`` dict keys (Orin dual/wrist servers).
     """
+    print(f"[Camera] probing {host}:{port} (timeout={timeout_s:.1f}s) ...")
     ctx = zmq.Context()
     sock = ctx.socket(zmq.SUB)
     sock.setsockopt(zmq.LINGER, 0)
@@ -211,12 +212,6 @@ def resolve_camera_recording_flags(
 
     ego_keys: set[str] = set()
     wrist_keys: set[str] = set()
-    if auto_head or auto_wrist:
-        print(
-            f"[Camera] probing streams on {config.camera_host}:"
-            f"{config.camera_port} / :{config.wrist_camera_port} "
-            f"(timeout={timeout:.1f}s) ..."
-        )
     if auto_head:
         ego_keys = probe_zmq_image_keys(config.camera_host, config.camera_port, timeout)
         print(f"[Camera] :{config.camera_port} keys={sorted(ego_keys) or '—'}")

@@ -20,6 +20,9 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
        Does NOT send LATENT_INITIAL_MOTION_TOKEN (that token bends the arms and
        then slamming into the first VLA action on ``p`` shocks the motors).
   t  -> change prompt at runtime (publisher sends ``prompt:<text>``; also drops the RTC prefix)
+  1/2/3 -> multi-skill switch (requires ``--skills-config`` + running
+       ``run_skill_server_supervisor.py``). Reloads PolicyServer ckpt + prompt,
+       pauses; press ``i`` then ``p`` to continue.
   [  -> toggle left hand open/closed (only used if explicitly publishing init pose)
   ]  -> toggle right hand open/closed (only used if explicitly publishing init pose)
   c  -> start recording (handled by data exporter if running)
@@ -28,6 +31,7 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
 """
 
 from dataclasses import dataclass
+import json
 import queue
 import threading
 import time
@@ -52,6 +56,7 @@ from gear_sonic.utils.inference.deploy_branch import (
 )
 from gear_sonic.utils.inference.initial_poses import LATENT_INITIAL_MOTION_TOKEN
 from gear_sonic.utils.inference.revo2_action_bridge import Revo2ActionBridge
+from gear_sonic.utils.inference.skill_registry import SkillRegistry, load_skill_registry
 from gear_sonic.utils.inference.vla_utils import (
     calculate_latency_compensated_index,
     concat_action,
@@ -155,6 +160,25 @@ class InferenceConfig:
     prompt: str = "demo"
     """The language prompt for the VLA policy."""
 
+    skills_config: str | None = None
+    """Optional multi-skill JSON (see ``gear_sonic/config/multi_skill_nortc_skills.json``).
+
+    Enables keyboard ``1``/``2``/``3`` to hot-switch via dual-buffer
+    ``run_skill_server_supervisor.py`` (warm promote of standby port, then
+    background prefetch of the cyclic next skill). Initial prompt defaults to
+    the registry default skill unless ``--prompt`` is also set to a non-``demo``
+    value.
+    """
+
+    skill_supervisor_host: str | None = None
+    """Override supervisor host from skills JSON."""
+
+    skill_supervisor_port: int | None = None
+    """Override supervisor REP port from skills JSON (default 5590)."""
+
+    skill_switch_timeout_s: float = 360.0
+    """Max seconds to wait for supervisor (warm promote is near-instant; cold path may reload)."""
+
     # Initial pose
     initial_pose_blend_duration: float = 1.0
     """Duration (seconds) for smooth interpolation to initial pose. The robot
@@ -182,6 +206,43 @@ class InferenceConfig:
 
 def print_green(x):
     print(f"\033[92m{x}\033[0m")
+
+
+def _request_skill_switch(
+    host: str,
+    port: int,
+    skill_id: str,
+    timeout_s: float,
+) -> dict:
+    """Ask dual-buffer supervisor to promote/load ``skill_id``; reply includes ``policy_port``."""
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.REQ)
+    sock.setsockopt(zmq.LINGER, 0)
+    timeout_ms = max(1000, int(float(timeout_s) * 1000))
+    sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
+    sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
+    sock.connect(f"tcp://{host}:{port}")
+    payload = json.dumps({"cmd": "switch", "skill_id": str(skill_id)}, ensure_ascii=False)
+    try:
+        sock.send_string(payload)
+        raw = sock.recv_string()
+        return json.loads(raw)
+    finally:
+        sock.close(0)
+        ctx.term()
+
+
+def _resolve_skill_key(key: str, registry: SkillRegistry | None) -> str | None:
+    """Map keyboard message to a skill id, or None if not a skill switch."""
+    if registry is None:
+        return None
+    msg = (key or "").strip()
+    if msg.startswith("skill:"):
+        sid = msg.split(":", 1)[1].strip()
+        return sid if sid in registry.skills else None
+    if msg in registry.skills:
+        return msg
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +563,45 @@ def main(config: InferenceConfig):
     _validate_rtc_config(config)
     pause_loop = True
 
+    skill_registry: SkillRegistry | None = None
+    active_skill_id: str | None = None
+    supervisor_host = "127.0.0.1"
+    supervisor_port = 5590
+    if config.skills_config:
+        skill_registry = load_skill_registry(config.skills_config)
+        supervisor_host = str(
+            config.skill_supervisor_host or skill_registry.supervisor_host
+        )
+        supervisor_port = int(
+            config.skill_supervisor_port or skill_registry.supervisor_port
+        )
+        # Align policy endpoint with registry unless user overrode host/port.
+        if config.host in ("localhost", "127.0.0.1"):
+            config.host = skill_registry.policy_host
+        if config.port == 5550:
+            config.port = skill_registry.policy_port
+        default_skill = skill_registry.get(skill_registry.default_skill_id)
+        active_skill_id = default_skill.id
+        if config.prompt in ("demo", "", None):
+            config.prompt = default_skill.prompt
+        print_green(
+            "Multi-skill enabled: "
+            + ", ".join(
+                f"{sid}={skill_registry.get(sid).label}"
+                for sid in skill_registry.ordered_ids()
+            )
+        )
+        print_green(
+            f"Skill supervisor {supervisor_host}:{supervisor_port}; "
+            f"dual-buffer ports active={skill_registry.policy_port}/"
+            f"standby={skill_registry.standby_port}; "
+            f"default skill={active_skill_id} prompt={config.prompt!r}"
+        )
+        print(
+            "Keyboard: press 1 / 2 / 3 to hot-switch (warm promote if standby "
+            "already holds that skill; then i → p)."
+        )
+
     robot_model = instantiate_g1_robot_model(waist_location="lower_and_upper_body")
 
     # Isaac-GR00T PolicyClient
@@ -704,11 +804,59 @@ def main(config: InferenceConfig):
 
     PROMPT_MSG_PREFIX = "prompt:"
 
+    def _hard_restart_from_current_pose(*, call_policy_reset: bool, reason: str) -> None:
+        """Drop all chunk / RTC / last-action residuals; next step uses live proprio.
+
+        Clears client-side ``cached_action_chunk`` (current + would-be prev chunk),
+        zeros ``last_sent_motion_token``, bumps ``rtc_epoch`` so in-flight results
+        are discarded, drains inference queues, and optionally calls
+        ``PolicyClient.reset()`` so the server drops ``_prev_action_pred`` / last_action.
+        Observation proprio is always rebuilt from the latest LowState (no client
+        proprio history buffer); after this, the next ``p`` cold-starts the new skill
+        from the robot's current pose.
+        """
+        nonlocal cached_action_chunk, action_chunk_index, last_inference_time
+        nonlocal zmq_frame_counter, last_sent_motion_token, pending_pose_on_first_action
+        nonlocal reset_requested
+
+        pending_pose_on_first_action = False
+        cached_action_chunk = None
+        action_chunk_index = 0
+        last_inference_time = 0.0
+        zmq_frame_counter = 0
+        # Explicit zero last_action (not None): no residual token / no blend from old skill.
+        last_sent_motion_token = np.zeros(64, dtype=np.float32)
+
+        with policy_lock:
+            rtc_epoch[0] += 1
+            _drain_queue(inference_queue)
+            _drain_queue(result_queue)
+            if call_policy_reset:
+                try:
+                    n1_policy.reset()
+                    print_green(
+                        f"Hard restart ({reason}): cleared action chunk / prev chunk / "
+                        "last_action=0 + PolicyServer reset()"
+                    )
+                except Exception as e:
+                    print(f"Warning: policy reset failed during hard restart: {e}")
+            else:
+                print_green(
+                    f"Hard restart ({reason}): cleared action chunk / prev chunk / "
+                    "last_action=0 (server reset deferred)"
+                )
+        # Ensure the main-loop reset path does not double-bump epoch unnecessarily;
+        # state is already clean. Keep false after an immediate hard restart.
+        reset_requested = False
+        if revo2_bridge is not None:
+            revo2_bridge.open_all()
+
     def check_keyboard_input():
         nonlocal pause_loop, cpp_loop_running, cpp_mode, pending_pose_on_first_action
         nonlocal initial_pose_left_hand_closed, initial_pose_right_hand_closed
         nonlocal cached_action_chunk, action_chunk_index, last_inference_time
         nonlocal zmq_frame_counter, last_sent_motion_token, reset_requested
+        nonlocal active_skill_id
 
         key = keyboard_listener.read_msg()
         if key is None:
@@ -728,6 +876,74 @@ def main(config: InferenceConfig):
                 )
             else:
                 print("Received empty prompt change -- ignoring.")
+            return
+
+        skill_id = _resolve_skill_key(key, skill_registry)
+        if skill_id is not None:
+            assert skill_registry is not None
+            if skill_id == active_skill_id:
+                print(f"Already on skill {skill_id} ({skill_registry.get(skill_id).label})")
+                return
+            target = skill_registry.get(skill_id)
+            print_green(
+                f"Switching to skill {skill_id} ({target.label}) — "
+                "hard restart; requesting dual-buffer promote..."
+            )
+            pause_loop = True
+            # Drop old-skill residuals BEFORE promote so nothing from the previous
+            # checkpoint can be published while ports flip.
+            _hard_restart_from_current_pose(
+                call_policy_reset=False,
+                reason=f"pre-switch drop skill={active_skill_id}",
+            )
+            if cpp_loop_running and cpp_mode == "POSE":
+                if send_cpp_control_command(start=True, planner=True):
+                    print("Returned to PLANNER stand during skill switch")
+            try:
+                reply = _request_skill_switch(
+                    supervisor_host,
+                    supervisor_port,
+                    skill_id,
+                    config.skill_switch_timeout_s,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"ERROR: skill switch request failed: {exc}")
+                return
+            if not reply.get("ok"):
+                print(f"ERROR: skill switch rejected: {reply}")
+                return
+            # Dual-buffer: active skill may now live on the other TCP port.
+            new_host = str(reply.get("policy_host") or config.host)
+            new_port = int(reply.get("policy_port") or config.port)
+            if new_host != n1_policy.host or int(new_port) != int(n1_policy.port):
+                print_green(
+                    f"PolicyClient reconnect {n1_policy.host}:{n1_policy.port} "
+                    f"→ {new_host}:{new_port} "
+                    f"(warm={bool(reply.get('warm'))})"
+                )
+                n1_policy.host = new_host
+                n1_policy.port = int(new_port)
+                config.host = new_host
+                config.port = int(new_port)
+            n1_policy._init_socket()
+            if not n1_policy.ping():
+                print("ERROR: PolicyServer not reachable after skill switch")
+                return
+            language_prompt_ref[0] = str(reply.get("prompt") or target.prompt)
+            active_skill_id = skill_id
+            # Explicit reset on the promoted server so next get_action is cold
+            # from current live proprio (no old-skill action history).
+            _hard_restart_from_current_pose(
+                call_policy_reset=True,
+                reason=f"post-switch skill={skill_id}",
+            )
+            prefetch_id = reply.get("prefetch_skill_id") or reply.get("standby_skill_id")
+            print_green(
+                f"Skill READY (hard restart): {skill_id} ({target.label}) "
+                f"port={new_port} warm={bool(reply.get('warm'))} "
+                f"prefetch→{prefetch_id} "
+                f'prompt="{language_prompt_ref[0]}" — press i then p to run'
+            )
             return
 
         if key == "c":
