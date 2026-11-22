@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Boot dual-buffer multi-skill PolicyServer supervisor (skill1/2/3 nortc).
-# Keeps two servers warm (active + standby); switch promotes standby instantly
-# then background-kills the old active and prefetches the cyclic next skill.
+# Boot shared-VLM multi-skill PolicyServer (skill1/2/3 nortc).
+# One Cosmos backbone + all action_heads resident; keyboard switch is a head swap.
 set -euo pipefail
 
 REPO="${REPO:-/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Litchi-GR00T-WholeBodyControl}"
@@ -26,21 +25,18 @@ test -f "$SKILLS_CONFIG" || {
 export REPO LITCHI_ROOT HF_HOME GROOT_BACKBONE_PATH
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 GROOT_HF_LOCAL_FIRST=1
 export NO_ALBUMENTATIONS_UPDATE=1
-# Do NOT inherit conda/ROS PYTHONPATH into the supervisor; child sanitizes further.
 unset PYTHONHOME PYTHONSTARTUP || true
-export PYTHONPATH="$LITCHI_ROOT"
+export PYTHONPATH="$LITCHI_ROOT:$REPO"
 
 cd "$REPO"
 # shellcheck disable=SC1091
 source "$REPO/.venv_inference/bin/activate"
 
-# Prefer the venv interpreter explicitly (avoid conda/base shadowing `python`).
 PY="${REPO}/.venv_inference/bin/python"
 "$PY" -c "import numpy, torch; print('launcher preflight OK', numpy.__version__)"
 
-exec "$PY" gear_sonic/scripts/run_skill_server_supervisor.py \
+exec "$PY" gear_sonic/scripts/run_shared_vlm_skill_server.py \
   --skills-config "$SKILLS_CONFIG" \
   --litchi-root "$LITCHI_ROOT" \
-  --python-bin "$PY" \
   --device cuda:0 \
   "$@"

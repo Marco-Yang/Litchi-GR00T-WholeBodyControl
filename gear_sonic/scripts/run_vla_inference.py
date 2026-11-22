@@ -20,18 +20,19 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
        Does NOT send LATENT_INITIAL_MOTION_TOKEN (that token bends the arms and
        then slamming into the first VLA action on ``p`` shocks the motors).
   t  -> change prompt at runtime (publisher sends ``prompt:<text>``; also drops the RTC prefix)
-  1/2/3 -> multi-skill switch (requires ``--skills-config`` + running
-       ``run_skill_server_supervisor.py``). Reloads PolicyServer ckpt + prompt,
-       pauses; press ``i`` then ``p`` to continue.
+  1/2/3 -> multi-skill switch (requires ``--skills-config`` + shared-VLM
+       server). Swaps action_head + stats, hard-restarts, then auto ``i``+``p``
+       (PLANNER stand → resume VLA) so you need not press i/p manually.
   [  -> toggle left hand open/closed (only used if explicitly publishing init pose)
   ]  -> toggle right hand open/closed (only used if explicitly publishing init pose)
   c  -> start recording (handled by data exporter if running)
-  s  -> stop recording success (handled by data exporter)
-  f  -> stop recording failure (handled by data exporter)
+  s  -> stop agent-video recording and save session (VLA keeps running)
+  f  -> stop recording failure (handled by data exporter if running)
 """
 
 from dataclasses import dataclass
 import json
+from pathlib import Path
 import queue
 import threading
 import time
@@ -56,6 +57,7 @@ from gear_sonic.utils.inference.deploy_branch import (
 )
 from gear_sonic.utils.inference.initial_poses import LATENT_INITIAL_MOTION_TOKEN
 from gear_sonic.utils.inference.revo2_action_bridge import Revo2ActionBridge
+from gear_sonic.utils.inference.agent_skill_video_recorder import AgentSkillVideoRecorder
 from gear_sonic.utils.inference.skill_registry import SkillRegistry, load_skill_registry
 from gear_sonic.utils.inference.vla_utils import (
     calculate_latency_compensated_index,
@@ -163,11 +165,11 @@ class InferenceConfig:
     skills_config: str | None = None
     """Optional multi-skill JSON (see ``gear_sonic/config/multi_skill_nortc_skills.json``).
 
-    Enables keyboard ``1``/``2``/``3`` to hot-switch via dual-buffer
-    ``run_skill_server_supervisor.py`` (warm promote of standby port, then
-    background prefetch of the cyclic next skill). Initial prompt defaults to
-    the registry default skill unless ``--prompt`` is also set to a non-``demo``
-    value.
+    Enables keyboard ``1``/``2``/``3`` to hot-switch via shared-VLM
+    ``run_shared_vlm_skill_server.py`` (one backbone, resident action heads;
+    switch is a pointer swap on a single policy port). Initial prompt defaults
+    to the registry default skill unless ``--prompt`` is also set to a
+    non-``demo`` value.
     """
 
     skill_supervisor_host: str | None = None
@@ -176,8 +178,24 @@ class InferenceConfig:
     skill_supervisor_port: int | None = None
     """Override supervisor REP port from skills JSON (default 5590)."""
 
-    skill_switch_timeout_s: float = 360.0
-    """Max seconds to wait for supervisor (warm promote is near-instant; cold path may reload)."""
+    skill_switch_timeout_s: float = 30.0
+    """Max seconds to wait for shared-VLM skill switch (should be near-instant)."""
+
+    record_agent_video: bool = False
+    """If True, record ego/head camera video for agent skill-switch training.
+
+    Starts on the first policy resume (``p``), stamps each skill switch, and
+    saves MP4 + ``skill_events.json`` under ``--agent-video-dir`` on exit.
+    Default off.
+    """
+
+    agent_video_dir: str = (
+        "/home/user/YZY/HumanoidWBM/RL_controller/Deploy/Gr00T/agents/video"
+    )
+    """Output root for agent training videos (one ``session_*`` subdir per run)."""
+
+    agent_video_fps: float = 10.0
+    """Sampling rate for the agent camera MP4."""
 
     # Initial pose
     initial_pose_blend_duration: float = 1.0
@@ -214,7 +232,7 @@ def _request_skill_switch(
     skill_id: str,
     timeout_s: float,
 ) -> dict:
-    """Ask dual-buffer supervisor to promote/load ``skill_id``; reply includes ``policy_port``."""
+    """Ask shared-VLM server to swap action_head for ``skill_id`` (single policy port)."""
     ctx = zmq.Context()
     sock = ctx.socket(zmq.REQ)
     sock.setsockopt(zmq.LINGER, 0)
@@ -332,6 +350,7 @@ def prepare_observation_from_sensors(
     language_prompt: str,
     log_errors: bool = False,
     revo2_bridge: Revo2ActionBridge | None = None,
+    on_camera_msg=None,
 ):
     """Read sensors and prepare observation for the VLA policy.
 
@@ -343,6 +362,11 @@ def prepare_observation_from_sensors(
         if log_errors:
             print("[DEBUG] prepare_observation: waiting for camera msg..", flush=True)
         return None
+    if on_camera_msg is not None:
+        try:
+            on_camera_msg(camera_msg)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[agent-video] on_camera_msg failed: {exc}", flush=True)
 
     state_msg = state_subscriber.get_msg()
     if state_msg is None:
@@ -592,14 +616,25 @@ def main(config: InferenceConfig):
             )
         )
         print_green(
-            f"Skill supervisor {supervisor_host}:{supervisor_port}; "
-            f"dual-buffer ports active={skill_registry.policy_port}/"
-            f"standby={skill_registry.standby_port}; "
+            f"Skill control {supervisor_host}:{supervisor_port}; "
+            f"shared-VLM policy port={skill_registry.policy_port}; "
             f"default skill={active_skill_id} prompt={config.prompt!r}"
         )
         print(
-            "Keyboard: press 1 / 2 / 3 to hot-switch (warm promote if standby "
-            "already holds that skill; then i → p)."
+            "Keyboard: press 1 / 2 / 3 to hot-switch action_head "
+            "(shared VLM; auto i+p resume after switch)."
+        )
+
+    agent_video_recorder: AgentSkillVideoRecorder | None = None
+    if config.record_agent_video:
+        agent_video_recorder = AgentSkillVideoRecorder(
+            output_dir=Path(config.agent_video_dir).expanduser(),
+            fps=float(config.agent_video_fps),
+        )
+        print_green(
+            f"Agent video recording ENABLED → {config.agent_video_dir} "
+            f"@ {config.agent_video_fps:.1f} FPS "
+            "(starts on first 'p' resume; stamps on skill switch; saves on exit)"
         )
 
     robot_model = instantiate_g1_robot_model(waist_location="lower_and_upper_body")
@@ -887,11 +922,10 @@ def main(config: InferenceConfig):
             target = skill_registry.get(skill_id)
             print_green(
                 f"Switching to skill {skill_id} ({target.label}) — "
-                "hard restart; requesting dual-buffer promote..."
+                "hard restart; requesting shared-VLM action_head swap..."
             )
             pause_loop = True
-            # Drop old-skill residuals BEFORE promote so nothing from the previous
-            # checkpoint can be published while ports flip.
+            # Drop old-skill residuals before the head swap.
             _hard_restart_from_current_pose(
                 call_policy_reset=False,
                 reason=f"pre-switch drop skill={active_skill_id}",
@@ -912,44 +946,77 @@ def main(config: InferenceConfig):
             if not reply.get("ok"):
                 print(f"ERROR: skill switch rejected: {reply}")
                 return
-            # Dual-buffer: active skill may now live on the other TCP port.
-            new_host = str(reply.get("policy_host") or config.host)
-            new_port = int(reply.get("policy_port") or config.port)
-            if new_host != n1_policy.host or int(new_port) != int(n1_policy.port):
-                print_green(
-                    f"PolicyClient reconnect {n1_policy.host}:{n1_policy.port} "
-                    f"→ {new_host}:{new_port} "
-                    f"(warm={bool(reply.get('warm'))})"
-                )
-                n1_policy.host = new_host
-                n1_policy.port = int(new_port)
-                config.host = new_host
-                config.port = int(new_port)
+            # Shared-VLM keeps a single policy port; just refresh the REQ socket.
             n1_policy._init_socket()
             if not n1_policy.ping():
                 print("ERROR: PolicyServer not reachable after skill switch")
                 return
+            prev_skill_id = active_skill_id
             language_prompt_ref[0] = str(reply.get("prompt") or target.prompt)
             active_skill_id = skill_id
-            # Explicit reset on the promoted server so next get_action is cold
-            # from current live proprio (no old-skill action history).
             _hard_restart_from_current_pose(
                 call_policy_reset=True,
                 reason=f"post-switch skill={skill_id}",
             )
-            prefetch_id = reply.get("prefetch_skill_id") or reply.get("standby_skill_id")
+            if agent_video_recorder is not None and agent_video_recorder.active:
+                agent_video_recorder.mark_skill_switch(
+                    from_skill_id=prev_skill_id,
+                    to_skill_id=skill_id,
+                    prompt=language_prompt_ref[0],
+                    mono_time=time.monotonic(),
+                )
+            # Auto i+p: already in PLANNER / cleared above; resume VLA immediately.
+            # Equivalent to the old manual sequence: 2 → i → p.
+            if not cpp_loop_running:
+                print(
+                    "Note: C++ loop not running — skill swapped but press 'k' "
+                    "then 'p' to move"
+                )
+                pause_loop = True
+            else:
+                if cpp_mode != "PLANNER":
+                    if send_cpp_control_command(start=True, planner=True):
+                        print("Auto-i: returned to PLANNER stand before resume")
+                pending_pose_on_first_action = True
+                pause_loop = False
+                if agent_video_recorder is not None and not agent_video_recorder.active:
+                    agent_video_recorder.start(
+                        skill_id=active_skill_id,
+                        prompt=language_prompt_ref[0],
+                        mono_time=time.monotonic(),
+                    )
+                print_green(
+                    f"Skill READY + auto i/p: {skill_id} ({target.label}) "
+                    f"port={config.port} warm={bool(reply.get('warm', True))} "
+                    f"mode={reply.get('mode', 'shared-vlm')} "
+                    f'prompt="{language_prompt_ref[0]}" — VLA resumed'
+                )
+                return
             print_green(
                 f"Skill READY (hard restart): {skill_id} ({target.label}) "
-                f"port={new_port} warm={bool(reply.get('warm'))} "
-                f"prefetch→{prefetch_id} "
-                f'prompt="{language_prompt_ref[0]}" — press i then p to run'
+                f"port={config.port} warm={bool(reply.get('warm', True))} "
+                f"mode={reply.get('mode', 'shared-vlm')} "
+                f'prompt="{language_prompt_ref[0]}"'
             )
             return
 
         if key == "c":
             print("Keyboard: 'c' (start recording -- handled by data exporter)")
         elif key == "s":
-            print("Keyboard: 's' (stop recording success -- handled by data exporter)")
+            # End agent-video session without killing the VLA process.
+            if agent_video_recorder is not None and agent_video_recorder.active:
+                try:
+                    session = agent_video_recorder.stop(mono_time=time.monotonic())
+                    print_green(
+                        f"Agent video STOPPED by 's' → saved {session}"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[agent-video] stop via 's' failed: {exc}")
+            else:
+                print(
+                    "Keyboard: 's' — no active agent-video session "
+                    "(enable --record-agent-video; starts on first 'p')"
+                )
         elif key == "f":
             print("Keyboard: 'f' (stop recording failure -- handled by data exporter)")
         elif key == "i":
@@ -997,6 +1064,12 @@ def main(config: InferenceConfig):
                         "Will switch to POSE when the first policy action is ready "
                         "(staying in PLANNER stand until then)"
                     )
+                if agent_video_recorder is not None and not agent_video_recorder.active:
+                    agent_video_recorder.start(
+                        skill_id=active_skill_id,
+                        prompt=language_prompt_ref[0],
+                        mono_time=time.monotonic(),
+                    )
                 print("Policy loop resumed")
         elif key == "k":
             if cpp_loop_running:
@@ -1032,6 +1105,31 @@ def main(config: InferenceConfig):
     result_queue = queue.Queue(maxsize=1)
     inference_stop_event = threading.Event()
     inference_busy_event = threading.Event()
+    camera_lock = threading.Lock()
+
+    def _on_camera_msg_for_agent_video(camera_msg) -> None:
+        if agent_video_recorder is None or not agent_video_recorder.active:
+            return
+        agent_video_recorder.maybe_write_camera_msg(
+            camera_msg,
+            mono_time=time.monotonic(),
+        )
+
+    def _prepare_observation_locked():
+        with camera_lock:
+            return prepare_observation_from_sensors(
+                camera_subscriber=camera_subscriber,
+                state_subscriber=state_subscriber,
+                robot_model=robot_model,
+                language_prompt=language_prompt_ref[0],
+                log_errors=True,
+                revo2_bridge=revo2_bridge,
+                on_camera_msg=(
+                    _on_camera_msg_for_agent_video
+                    if agent_video_recorder is not None
+                    else None
+                ),
+            )
 
     inference_worker_thread = threading.Thread(
         target=_inference_worker_loop,
@@ -1042,14 +1140,7 @@ def main(config: InferenceConfig):
             inference_busy_event,
             policy_lock,
             rtc_epoch,
-            lambda: prepare_observation_from_sensors(
-                camera_subscriber=camera_subscriber,
-                state_subscriber=state_subscriber,
-                robot_model=robot_model,
-                language_prompt=language_prompt_ref[0],
-                log_errors=True,
-                revo2_bridge=revo2_bridge,
-            ),
+            _prepare_observation_locked,
             lambda obs, rtc_options: run_policy_inference_and_process(
                 policy=n1_policy,
                 observation=obs,
@@ -1079,6 +1170,15 @@ def main(config: InferenceConfig):
                     except Exception as e:
                         print(f"Warning: policy reset failed: {e}")
                 reset_requested = False
+
+            if agent_video_recorder is not None and agent_video_recorder.active:
+                # Steady FPS sampling on the main loop (inference path also feeds frames).
+                with camera_lock:
+                    cam_msg = camera_subscriber.read()
+                agent_video_recorder.maybe_write_camera_msg(
+                    cam_msg,
+                    mono_time=time.monotonic(),
+                )
 
             if pause_loop:
                 print("Pausing...", end="", flush=True)
@@ -1246,6 +1346,11 @@ def main(config: InferenceConfig):
         print("VLA inference loop terminated by user")
 
     finally:
+        if agent_video_recorder is not None and agent_video_recorder.active:
+            try:
+                agent_video_recorder.stop(mono_time=time.monotonic())
+            except Exception as e:
+                print(f"[agent-video] stop failed: {e}")
         inference_stop_event.set()
         inference_worker_thread.join(timeout=1.0)
         if revo2_bridge is not None:
