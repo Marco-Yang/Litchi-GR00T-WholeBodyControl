@@ -14,7 +14,7 @@ PRE_GO_SETTLE_S="${PRE_GO_SETTLE_S:-1}"
 RECORD_TAIL_SLEEP_S="${RECORD_TAIL_SLEEP_S:-2}"
 # Match smpl_v3 / qpos kinematic clock (override with RECORD_FPS=30 to match VLA mp4).
 RECORD_FPS="${RECORD_FPS:-50}"
-DEPLOY_CUDA="${DEPLOY_CUDA_VISIBLE_DEVICES:-1}"
+DEPLOY_CUDA="${DEPLOY_CUDA_VISIBLE_DEVICES:-0}"
 # DDS: lo drops LowState here; eth1 + forced ENV_TYPE=sim (in run_sim_record).
 # MuJoCo validates MUST use loopback — never default to eth1 (real G1 risk).
 NET_IFACE="${NET_IFACE:-lo}"
@@ -60,7 +60,7 @@ DEPLOY_FIFO="${WORK_DIR}/.deploy_fifo"
 rm -f "${RECORD_START}" "${RECORD_STOP}" "${ARM_FLAG}" "${STREAM_FLAG}" \
   "${READY_FLAG}" "${GO_FLAG}" "${DEPLOY_FIFO}"
 
-ORT="/home/zhenyu/workspace/code/HumanoidWBM/demo/VLA/deps/onnxruntime-linux-x64-1.16.3/lib"
+ORT="${ORT_LIB:-${HOME}/.local/onnxruntime/lib}"
 DDS="${DEPLOY}/thirdparty/unitree_sdk2/thirdparty/lib/x86_64"
 export LD_LIBRARY_PATH="\
 ${ORT}:\
@@ -70,7 +70,6 @@ ${GROOT_VENV_SP}/nvidia/cublas/lib:\
 ${GROOT_VENV_SP}/nvidia/cudnn/lib:\
 ${GROOT_VENV_SP}/nvidia/cuda_nvrtc/lib:\
 ${GROOT_VENV_SP}/pyzmq.libs:\
-/home/zhenyu/workspace/code/HumanoidWBM/demo/VLA/deps/libzmq:\
 ${DDS}:\
 ${TOOLS}/lib:\
 ${LD_LIBRARY_PATH:-}"

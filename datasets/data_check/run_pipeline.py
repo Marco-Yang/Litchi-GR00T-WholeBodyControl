@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 import shutil
 import sys
@@ -147,9 +148,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Skip post-Isaac metric screening / drop (metrics still written)",
     )
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--max-mpjpe-l", type=float, help="Override the local joint position error limit (mm)")
+    p.add_argument("--max-joint-mse-l", type=float, help="Override the local joint angle MSE limit (rad²)")
     p.add_argument("--cpu-analyze", action="store_true")
     p.add_argument("--python", type=str, default="")
     args = p.parse_args(argv)
+    tracking_limits = {key: value for key in ("max_mpjpe_l", "max_joint_mse_l")
+                       if (value := getattr(args, key)) is not None}
+    if any(not math.isfinite(value) or value < 0 for value in tracking_limits.values()):
+        p.error("tracking error limits must be finite and nonnegative")
 
     work = args.work_dir.resolve()
     mode2_dir = work / "mode2"
@@ -302,6 +309,7 @@ def main(argv: list[str] | None = None) -> int:
                     dataset=args.dataset,
                     metrics_path=metrics_path,
                     work_dir=work,
+                    thresholds=tracking_limits,
                     keep_failed=bool(args.keep_isaac_fail),
                     dry_run=False,
                 )

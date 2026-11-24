@@ -35,8 +35,27 @@ source "$REPO/.venv_inference/bin/activate"
 PY="${REPO}/.venv_inference/bin/python"
 "$PY" -c "import numpy, torch; print('launcher preflight OK', numpy.__version__)"
 
+# Boundary-judge vision tokens for agent --observe (disable: PUBLISH_BOUNDARY_VISION=0)
+CAMERA_HOST="${CAMERA_HOST:-192.168.123.164}"
+BOUNDARY_VISION_PORT="${BOUNDARY_VISION_PORT:-5591}"
+BOUNDARY_VISION_HZ="${BOUNDARY_VISION_HZ:-5}"
+PUBLISH_BOUNDARY_VISION="${PUBLISH_BOUNDARY_VISION:-1}"
+
+EXTRA_ARGS=()
+if [[ "${PUBLISH_BOUNDARY_VISION}" == "1" ]]; then
+  EXTRA_ARGS+=(
+    --publish-boundary-vision
+    --camera-host "$CAMERA_HOST"
+    --boundary-vision-port "$BOUNDARY_VISION_PORT"
+    --boundary-vision-hz "$BOUNDARY_VISION_HZ"
+  )
+else
+  EXTRA_ARGS+=(--no-publish-boundary-vision)
+fi
+
 exec "$PY" gear_sonic/scripts/run_shared_vlm_skill_server.py \
   --skills-config "$SKILLS_CONFIG" \
   --litchi-root "$LITCHI_ROOT" \
   --device cuda:0 \
+  "${EXTRA_ARGS[@]}" \
   "$@"

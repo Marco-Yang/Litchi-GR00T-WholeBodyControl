@@ -12,11 +12,14 @@
 |------|------|------|
 | PolicyServer（共享 VLM） | `5550` | `get_action` / `reset`（单端口） |
 | Skill 控制 | `5590` | C4 发 `switch` / 查 `status` |
+| Boundary vision tokens | `5591` | C2 内 **训练同构 VisionEncoder** PUB（`boundary_vision`）；agent `--observe` 订阅，避免第二份视觉塔 |
 | 相机 | `5555` | Orin RGB（ego + head） |
 | Action ZMQ | `5556` | C4 → C++ |
 | State ZMQ | `5557` | C++ → C4 |
 | 键盘 | `5580` | C5 → C4 |
 | Revo2 UDP | `19500` | C4 → Orin 真手 |
+
+C2 默认开启 `--publish-boundary-vision`（`launch_multi_skill_nortc.sh`）；关闭：`PUBLISH_BOUNDARY_VISION=0`。应见日志：`[boundary-vision] publishing on tcp://*:5591`。
 
 技能表（`gear_sonic/config/multi_skill_nortc_skills.json`）：
 
@@ -186,16 +189,28 @@ python gear_sonic/scripts/run_vla_inference.py \
 | 按 `s` | **结束并保存** 本段视频（VLA 可继续跑） |
 | C4 Ctrl-C 退出 | 若仍在录，也会 stop 并保存 |
 
-**输出文件：**
+**输出文件（同一时间轴：`t_sec` + `frame_index`）：**
 
 ```text
 …/Gr00T/agents/video/session_YYYYMMDD_HHMMSS/
   cameras.mp4          # ego_view + head 横拼
-  skill_events.json    # start / skill_switch / stop + 元数据
+  robot_state.npz      # 与每一视频帧对齐的完整 g1_debug 侧本体状态
+  skill_events.json    # start / skill_switch / stop（与视频同一 t_sec/frame_index）
 ```
 
+`robot_state.npz` 对齐 [pico 真机数采](pico_real_data_collection.md) exporter 的 **g1_debug 侧**字段（无 Pico/SMPL teleop）：
+
+| 类别 | 字段 |
+|------|------|
+| 时间轴 | `t_sec`, `frame_index`, `skill_id`, `wall_time_utc`, `camera_ego_timestamp` |
+| 观测 | `qpos`(=observation.state), `eef_state`, `body_q`/`body_dq`, 左右手 `*_q`/`*_dq`, `base_quat`, `base_ang_vel`, `body_torso_*`, `projected_gravity`, `init_base_quat`, `cpp_rotation_offset`, `delta_heading` |
+| 动作/潜变量 | `last_action`, `last_*_hand_action`, `action_wbc`, `token_state`(=motion_token) |
+| 元数据 | `state_index`, `ros_timestamp` |
+
+本体状态来自工作站 C++ deploy 的 `g1_debug` ZMQ（与 VLA / 数采同源），**不是**再 SSH 到 Orin，以便和相机帧对齐。
+
 开启后 C4 启动时应见：`Agent video recording ENABLED → …`；  
-按 `s` 后应见：`Agent video STOPPED by 's' → saved …`。
+按 `s` 后应见：`Agent video STOPPED by 's' → saved …`（含 `robot_state=` 路径）。
 
 ### C5 · 键盘
 

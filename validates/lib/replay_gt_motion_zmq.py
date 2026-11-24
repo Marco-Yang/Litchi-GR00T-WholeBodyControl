@@ -12,7 +12,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import zmq
 
-WBC = Path("/home/zhenyu/workspace/code/HumanoidWBM/demo/RL_controller/Litchi-GR00T-WholeBodyControl")
+WBC = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(WBC))
 
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (  # noqa: E402

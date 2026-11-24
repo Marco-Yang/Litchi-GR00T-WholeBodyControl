@@ -40,6 +40,13 @@ class SharedVlmServerConfig:
     supervisor_port: int | None = None
     strict: bool = True
     verify_backbone_identical: bool = True
+    # Boundary-judge vision tokens (training-identical VisionEncoder), PUB for observe.
+    publish_boundary_vision: bool = True
+    boundary_vision_port: int = 5591
+    camera_host: str = "192.168.123.164"
+    camera_port: int = 5555
+    boundary_vision_hz: float = 5.0
+    boundary_vision_ckpt: str | None = None
 
 
 def _prepare_env(litchi_root: Path) -> None:
@@ -145,6 +152,28 @@ def main(config: SharedVlmServerConfig) -> None:
         verify_backbone_identical=config.verify_backbone_identical,
     )
 
+    vision_pub = None
+    if config.publish_boundary_vision:
+        from gear_sonic.utils.inference.boundary_vision_publisher import (
+            BoundaryVisionPublisher,
+            BoundaryVisionPublisherConfig,
+        )
+
+        # Default: skill1 ckpt (same visual weights as all nortc skills).
+        default_skill = registry.get(registry.default_skill_id)
+        vision_ckpt = config.boundary_vision_ckpt or str(default_skill.checkpoint)
+        vision_pub = BoundaryVisionPublisher(
+            BoundaryVisionPublisherConfig(
+                camera_host=config.camera_host,
+                camera_port=int(config.camera_port),
+                pub_bind=f"tcp://*:{int(config.boundary_vision_port)}",
+                vision_checkpoint=vision_ckpt,
+                device=config.device,
+                hz=float(config.boundary_vision_hz),
+            )
+        )
+        vision_pub.start()
+
     control_thread = threading.Thread(
         target=_serve_control,
         args=(policy, supervisor_port),
@@ -158,7 +187,11 @@ def main(config: SharedVlmServerConfig) -> None:
         f"device={config.device}",
         flush=True,
     )
-    PolicyServer.start_server(policy, port=policy_port, host=config.host)
+    try:
+        PolicyServer.start_server(policy, port=policy_port, host=config.host)
+    finally:
+        if vision_pub is not None:
+            vision_pub.close()
 
 
 if __name__ == "__main__":

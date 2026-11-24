@@ -40,6 +40,7 @@ import time
 import numpy as np
 import tyro
 import zmq
+from scipy.spatial.transform import Rotation as R
 
 from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 from gear_sonic.data.robot_model.instantiation.g1 import instantiate_g1_robot_model
@@ -343,6 +344,138 @@ def get_action_field(action_dict: dict, key: str):
 # ---------------------------------------------------------------------------
 
 
+def _hand_q_from_state(state_msg: dict, revo2_bridge: Revo2ActionBridge | None):
+    """Resolve left/right hand joint vectors the same way as VLA observation."""
+    left_hand_q = state_msg["left_hand_q"]
+    right_hand_q = state_msg["right_hand_q"]
+    if revo2_bridge is not None:
+        return revo2_bridge.state_hand_vectors()
+    left_hand_q = np.asarray(left_hand_q, dtype=np.float64).copy()
+    right_hand_q = np.asarray(right_hand_q, dtype=np.float64).copy()
+    # Copy index finger data to middle finger (hardware coupling)
+    left_hand_q[5] = left_hand_q[3]
+    left_hand_q[6] = left_hand_q[4]
+    return left_hand_q, right_hand_q
+
+
+def _f32_1d(x, default_len: int = 0) -> np.ndarray:
+    if x is None:
+        return np.zeros((default_len,), dtype=np.float32)
+    return np.asarray(x, dtype=np.float32).reshape(-1)
+
+
+def _scalar_f32(x, default: float = 0.0) -> np.ndarray:
+    if x is None:
+        return np.asarray([default], dtype=np.float32)
+    arr = np.asarray(x).reshape(-1)
+    return np.asarray([float(arr[0])], dtype=np.float32)
+
+
+def _qpos_from_state_msg(state_msg: dict, robot_model, revo2_bridge: Revo2ActionBridge | None):
+    """Build full qpos from ``g1_debug`` body/hand joints (same as inference)."""
+    left_hand_q, right_hand_q = _hand_q_from_state(state_msg, revo2_bridge)
+    qpos = robot_model.get_configuration_from_actuated_joints(
+        body_actuated_joint_values=state_msg["body_q"],
+        left_hand_actuated_joint_values=left_hand_q,
+        right_hand_actuated_joint_values=right_hand_q,
+    )
+    return (
+        np.asarray(qpos, dtype=np.float32),
+        np.asarray(state_msg["body_q"], dtype=np.float32).reshape(-1),
+        np.asarray(left_hand_q, dtype=np.float32).reshape(-1),
+        np.asarray(right_hand_q, dtype=np.float32).reshape(-1),
+        np.asarray(state_msg.get("base_quat", []), dtype=np.float32).reshape(-1),
+    )
+
+
+def _agent_proprio_from_state_msg(
+    state_msg: dict, robot_model, revo2_bridge: Revo2ActionBridge | None
+) -> dict[str, np.ndarray]:
+    """Mirror pico data-exporter g1_debug fields for agent-video ``robot_state.npz``.
+
+    Same sources as ``run_data_exporter._add_data_frame_sonic`` /
+    ``_add_cpp_state_features`` (qpos, eef, gravity, token_state, last_action, …).
+    Pico/SMPL teleop is omitted (not available during VLA agent runs).
+    """
+    left_hand_q, right_hand_q = _hand_q_from_state(state_msg, revo2_bridge)
+    body_q = state_msg["body_q"]
+    qpos = robot_model.get_configuration_from_actuated_joints(
+        body_actuated_joint_values=body_q,
+        left_hand_actuated_joint_values=left_hand_q,
+        right_hand_actuated_joint_values=right_hand_q,
+    )
+
+    # Hand actions: Revo2 uses commanded state (like exporter); else g1_debug.
+    if revo2_bridge is not None:
+        left_hand_act = np.asarray(left_hand_q, dtype=np.float32)
+        right_hand_act = np.asarray(right_hand_q, dtype=np.float32)
+    else:
+        left_hand_act = _f32_1d(state_msg.get("last_left_hand_action"))
+        right_hand_act = _f32_1d(state_msg.get("last_right_hand_action"))
+
+    last_action = state_msg.get("last_action")
+    if last_action is not None:
+        action_wbc = robot_model.get_configuration_from_actuated_joints(
+            body_actuated_joint_values=last_action,
+            left_hand_actuated_joint_values=left_hand_act,
+            right_hand_actuated_joint_values=right_hand_act,
+        )
+        action_wbc = np.asarray(action_wbc, dtype=np.float32)
+    else:
+        action_wbc = np.zeros((0,), dtype=np.float32)
+
+    robot_model.cache_forward_kinematics(qpos)
+    eef_parts = []
+    for side in ("left", "right"):
+        placement = robot_model.frame_placement(
+            robot_model.supplemental_info.hand_frame_names[side]
+        )
+        pos = placement.translation[:3]
+        quat = R.from_matrix(placement.rotation).as_quat(scalar_first=True)
+        eef_parts.append(np.concatenate([pos, quat]))
+    eef_state = np.concatenate(eef_parts).astype(np.float32)
+
+    base_quat = _f32_1d(state_msg.get("base_quat"))
+    if base_quat.shape[0] == 4:
+        projected_gravity = compute_projected_gravity(base_quat.astype(np.float64))
+    else:
+        projected_gravity = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+
+    cpp_offset = state_msg.get("init_ref_data_root_rot_array")
+    if cpp_offset is None:
+        cpp_offset = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+    init_base = state_msg.get("init_base_quat")
+    if init_base is None:
+        init_base = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+    return {
+        "qpos": np.asarray(qpos, dtype=np.float32).reshape(-1),
+        "eef_state": eef_state.reshape(-1),
+        "action_wbc": action_wbc.reshape(-1),
+        "body_q": _f32_1d(body_q),
+        "body_dq": _f32_1d(state_msg.get("body_dq")),
+        "left_hand_q": np.asarray(left_hand_q, dtype=np.float32).reshape(-1),
+        "right_hand_q": np.asarray(right_hand_q, dtype=np.float32).reshape(-1),
+        "left_hand_dq": _f32_1d(state_msg.get("left_hand_dq")),
+        "right_hand_dq": _f32_1d(state_msg.get("right_hand_dq")),
+        "base_quat": base_quat,
+        "base_ang_vel": _f32_1d(state_msg.get("base_ang_vel")),
+        "body_torso_quat": _f32_1d(state_msg.get("body_torso_quat")),
+        "body_torso_ang_vel": _f32_1d(state_msg.get("body_torso_ang_vel")),
+        "projected_gravity": np.asarray(projected_gravity, dtype=np.float32).reshape(-1),
+        "init_base_quat": _f32_1d(init_base),
+        "cpp_rotation_offset": _f32_1d(cpp_offset),
+        "delta_heading": _scalar_f32(state_msg.get("delta_heading")),
+        "last_action": _f32_1d(last_action),
+        "last_left_hand_action": _f32_1d(left_hand_act),
+        "last_right_hand_action": _f32_1d(right_hand_act),
+        "token_state": _f32_1d(state_msg.get("token_state")),
+        "state_index": _scalar_f32(state_msg.get("index")),
+        "ros_timestamp": _scalar_f32(state_msg.get("ros_timestamp")),
+    }
+
+
 def prepare_observation_from_sensors(
     camera_subscriber,
     state_subscriber,
@@ -350,23 +483,20 @@ def prepare_observation_from_sensors(
     language_prompt: str,
     log_errors: bool = False,
     revo2_bridge: Revo2ActionBridge | None = None,
-    on_camera_msg=None,
 ):
     """Read sensors and prepare observation for the VLA policy.
 
     Returns:
         observation dict, or None if sensor data not yet available.
+
+    Note: agent-video recording samples camera+proprio on the main loop
+    (aligned FPS), not inside this helper.
     """
     camera_msg = camera_subscriber.read()
     if camera_msg is None:
         if log_errors:
             print("[DEBUG] prepare_observation: waiting for camera msg..", flush=True)
         return None
-    if on_camera_msg is not None:
-        try:
-            on_camera_msg(camera_msg)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[agent-video] on_camera_msg failed: {exc}", flush=True)
 
     state_msg = state_subscriber.get_msg()
     if state_msg is None:
@@ -376,23 +506,8 @@ def prepare_observation_from_sensors(
 
     cam_img = camera_msg["images"]["ego_view"]
 
-    left_hand_q = state_msg["left_hand_q"]
-    right_hand_q = state_msg["right_hand_q"]
-    # No Dex3 DDS with Revo2: fill hand slots from last commanded Revo2 (norm 0..1),
-    # matching how ``run_data_exporter`` recorded Revo2 episodes.
-    if revo2_bridge is not None:
-        left_hand_q, right_hand_q = revo2_bridge.state_hand_vectors()
-    else:
-        # Copy index finger data to middle finger (hardware coupling)
-        left_hand_q = np.asarray(left_hand_q, dtype=np.float64).copy()
-        right_hand_q = np.asarray(right_hand_q, dtype=np.float64).copy()
-        left_hand_q[5] = left_hand_q[3]
-        left_hand_q[6] = left_hand_q[4]
-
-    qpos = robot_model.get_configuration_from_actuated_joints(
-        body_actuated_joint_values=state_msg["body_q"],
-        left_hand_actuated_joint_values=left_hand_q,
-        right_hand_actuated_joint_values=right_hand_q,
+    qpos, _body_q, _lh, _rh, _quat = _qpos_from_state_msg(
+        state_msg, robot_model, revo2_bridge
     )
 
     video = {"ego_view": cam_img[np.newaxis, np.newaxis]}
@@ -1107,14 +1222,6 @@ def main(config: InferenceConfig):
     inference_busy_event = threading.Event()
     camera_lock = threading.Lock()
 
-    def _on_camera_msg_for_agent_video(camera_msg) -> None:
-        if agent_video_recorder is None or not agent_video_recorder.active:
-            return
-        agent_video_recorder.maybe_write_camera_msg(
-            camera_msg,
-            mono_time=time.monotonic(),
-        )
-
     def _prepare_observation_locked():
         with camera_lock:
             return prepare_observation_from_sensors(
@@ -1124,11 +1231,6 @@ def main(config: InferenceConfig):
                 language_prompt=language_prompt_ref[0],
                 log_errors=True,
                 revo2_bridge=revo2_bridge,
-                on_camera_msg=(
-                    _on_camera_msg_for_agent_video
-                    if agent_video_recorder is not None
-                    else None
-                ),
             )
 
     inference_worker_thread = threading.Thread(
@@ -1172,13 +1274,29 @@ def main(config: InferenceConfig):
                 reset_requested = False
 
             if agent_video_recorder is not None and agent_video_recorder.active:
-                # Steady FPS sampling on the main loop (inference path also feeds frames).
+                # Steady FPS sampling on the main loop (camera + g1_debug proprio aligned).
                 with camera_lock:
                     cam_msg = camera_subscriber.read()
-                agent_video_recorder.maybe_write_camera_msg(
-                    cam_msg,
-                    mono_time=time.monotonic(),
-                )
+                    state_msg = state_subscriber.get_msg(clear=False, max_stale_s=0.5)
+                if cam_msg is not None and state_msg is not None:
+                    try:
+                        proprio = _agent_proprio_from_state_msg(
+                            state_msg, robot_model, revo2_bridge
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[agent-video] proprio build failed: {exc}", flush=True)
+                    else:
+                        agent_video_recorder.maybe_write_sample(
+                            cam_msg,
+                            mono_time=time.monotonic(),
+                            proprio=proprio,
+                        )
+                elif cam_msg is not None:
+                    # Still advance video if state briefly missing (empty proprio row).
+                    agent_video_recorder.maybe_write_sample(
+                        cam_msg,
+                        mono_time=time.monotonic(),
+                    )
 
             if pause_loop:
                 print("Pausing...", end="", flush=True)
